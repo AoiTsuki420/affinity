@@ -91,9 +91,14 @@ def resolve_lora_layers(
     raise ValueError(f"未知的 LoRA 层策略: {policy!r}（支持 all / last_k / explicit）")
 
 
-# 覆盖 ESM-2 / BERT(MoLFormer 系) / T5 三套已知命名。
+# 覆盖 ESM-2 / BERT(MoLFormer 系) / T5 三套已知命名，外加 spec §6.1 点名的裸末段形式。
 # ESMC-6B 的 remote code 命名由 tools/probe_backbone_modules.py 确认；
 # 若出现未覆盖的名字，调用方通过 suffixes 参数注入，不要改这里。
+#
+# spec §6.1 的草图还列了裸 q / k / v / o 与裸 dense，这里是**故意不加**的：单字母末段名
+# 与裸 dense 会命中无关模块，而 SelfAttention.q / q_proj / attention.self.query 和
+# out_proj / attention.output.dense 已经覆盖真实的 ESM-2 / BERT / T5 路径。若探针在
+# 集群上发现确实需要它们，用 --lora_target_suffixes 注入，不要往这里加。
 DEFAULT_LORA_SUFFIXES: tuple[str, ...] = (
     # ESM-2 / BERT 风格
     "attention.self.query",
@@ -102,6 +107,11 @@ DEFAULT_LORA_SUFFIXES: tuple[str, ...] = (
     "attention.output.dense",
     "intermediate.dense",
     "output.dense",
+    # 裸末段形式：backbone 把 qkv 直接挂在 attn 下（layers.0.attn.query）时，
+    # 上面的 attention.self.* 复合名够不着。
+    "query",
+    "key",
+    "value",
     # T5 风格
     "SelfAttention.q",
     "SelfAttention.k",
@@ -110,6 +120,10 @@ DEFAULT_LORA_SUFFIXES: tuple[str, ...] = (
     "DenseReluDense.wi_0",
     "DenseReluDense.wi_1",
     "DenseReluDense.wo",
+    # 裸末段形式：T5 系 FFN 挂在别的前缀下（layer.1.mlp.wi_0）时用。
+    "wi_0",
+    "wi_1",
+    "wo",
     # LLaMA / 通用 projector 风格
     "q_proj",
     "k_proj",
@@ -117,6 +131,9 @@ DEFAULT_LORA_SUFFIXES: tuple[str, ...] = (
     "o_proj",
     "out_proj",
     "Wqkv",
+    # 通用 MLP 命名（spec §6.1 列入）。
+    "fc1",
+    "fc2",
 )
 
 # 前导的 (?:^|\.) 不可省：层容器可能是根级属性（如 `layers.0.mixer`），

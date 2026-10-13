@@ -229,7 +229,9 @@ def test_discover_raises_and_lists_real_leaf_names_when_nothing_matches():
     with pytest.raises(AssertionError) as excinfo:
         discover_lora_targets(_Weird(), layers=[0])
     message = str(excinfo.value)
-    assert "my_custom_proj" in message
+    leaf_lines = [line for line in message.splitlines() if "Linear 末段名" in line]
+    assert len(leaf_lines) == 1, f"诊断信息缺少唯一的末段名清单行:\n{message}"
+    assert "my_custom_proj" in leaf_lines[0]
 
 
 def test_discover_respects_custom_suffixes_from_probe():
@@ -252,3 +254,45 @@ def test_discover_min_hits_enforced():
 
     with pytest.raises(AssertionError):
         discover_lora_targets(_Empty(), layers=[0], min_hits=1)
+
+
+from models.plm_backbones import DEFAULT_LORA_SUFFIXES
+
+
+def test_default_suffixes_cover_spec_required_leaf_forms():
+    """spec §6.1 要求默认白名单覆盖这些末段名；集合包含式断言让任何一条被删都立刻变红。"""
+    required = {"query", "key", "value", "wi_0", "wi_1", "wo", "fc1", "fc2"}
+    assert required <= set(DEFAULT_LORA_SUFFIXES)
+
+
+def test_discover_matches_spec_required_bare_leaf_forms():
+    """上面那 8 条必须真的能被 endswith 命中，而不只是躺在元组里。"""
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.query = nn.Linear(8, 8)
+            self.attn.key = nn.Linear(8, 8)
+            self.attn.value = nn.Linear(8, 8)
+            self.mlp = nn.Module()
+            self.mlp.wi_0 = nn.Linear(8, 32)
+            self.mlp.wi_1 = nn.Linear(8, 32)
+            self.mlp.wo = nn.Linear(32, 8)
+            self.fc1 = nn.Linear(8, 8)
+            self.fc2 = nn.Linear(8, 8)
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_Layer() for _ in range(2)])
+
+    targets = discover_lora_targets(_Model(), layers=[0, 1])
+    assert targets == sorted(
+        f"layers.{i}.{leaf}"
+        for i in range(2)
+        for leaf in (
+            "attn.query", "attn.key", "attn.value",
+            "mlp.wi_0", "mlp.wi_1", "mlp.wo",
+            "fc1", "fc2",
+        )
+    )
