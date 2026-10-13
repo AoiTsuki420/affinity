@@ -166,6 +166,21 @@ def test_barron_loss_type_runs():
     assert "barron" in logs or "huber" in logs
 
 
+def _canonical_barron(r, alpha, scale=1.0):
+    """Barron (CVPR 2019) 的独立实现，逐项对应
+
+    main_train_predictor_multigpu.py:247-260 的 _barron_loss_per_sample。
+    这里用纯 Python 标量重写一遍，使测试不依赖被测模块自身的公式。
+    """
+    r2 = (r / max(scale, 1e-8)) ** 2
+    if abs(alpha - 2.0) < 1e-6:
+        return 0.5 * r2
+    if abs(alpha) < 1e-6:
+        return math.log1p(0.5 * r2)
+    beta = abs(alpha - 2.0)
+    return (beta / alpha) * ((r2 / beta + 1.0) ** (alpha / 2.0) - 1.0)
+
+
 def test_barron_degenerates_to_l2_and_l1_limits():
     """alpha=2 必须精确等于 L2，alpha=0 必须精确等于 log1p(r^2/2)。"""
     error = torch.tensor([0.3, -1.7, 2.5])
@@ -173,11 +188,55 @@ def test_barron_degenerates_to_l2_and_l1_limits():
     assert torch.allclose(
         _barron_loss(error, 0.0, 1.0), torch.log1p(0.5 * error ** 2)
     )
-    # alpha=1（默认）落在两者之间，且 scale 真的参与缩放。
+
+
+def test_barron_alpha_one_is_sqrt_not_squared_error():
+    """默认 alpha=1 必须是 sqrt(1+r^2)-1（次二次），而不是退化成 r^2。
+
+    判别性断言：beta=alpha=1 时 canonical 化简为 sqrt(1+r^2)-1。
+    """
+    for r in (0.5, -1.3, 2.0):
+        error = torch.tensor([r])
+        got = float(_barron_loss(error, 1.0, 1.0))
+        expected = math.sqrt(1.0 + r * r) - 1.0
+        assert abs(got - expected) < 1e-6
+        # 明确排除 r^2 —— 旧公式 f=1 时恰好返回 r^2。
+        assert abs(got - r * r) > 1e-3
+
+
+def test_barron_matches_canonical_form_for_non_special_alpha():
+    """非特殊 alpha 必须逐值等于 canonical 形式，防止再次出现公式分歧。"""
+    error = torch.tensor([0.5, -1.3, 2.0])
+    for alpha in (1.5, 3.0, -1.0):
+        expected = torch.tensor(
+            [_canonical_barron(float(r), alpha) for r in error]
+        )
+        got = _barron_loss(error, alpha, 1.0)
+        assert torch.allclose(got, expected, atol=1e-6), (alpha, got, expected)
+        # 稳健损失必须非负。
+        assert bool((got >= 0.0).all())
+
+
+def test_barron_scale_invariance_and_large_error_growth():
+    """scale 参与缩放；alpha=1 在大误差下渐近线性（这才是稳健性的来源）。
+
+    注意 alpha=0 分支是 log1p，只按对数增长；真正渐近 |r| 的是 alpha=1 的
+    sqrt(1+r^2)-1。alpha=2 才是二次增长。
+    """
+    error = torch.tensor([0.3, -1.7, 2.5])
     mid = _barron_loss(error, 1.0, 1.0)
-    assert bool((mid > 0.5 * error ** 2).all())
     scaled = _barron_loss(error * 3.0, 1.0, 3.0)
     assert torch.allclose(scaled, mid, atol=1e-6)
+
+    # alpha=1：大误差下约等于 |r|（线性增长 = 稳健）。
+    # 容差取 10.0：float32 在 r=1e6 处只能给到约 1e-6 的相对精度，
+    # 但该容差已足以区分线性（~1e6）与二次（~1e12）增长。
+    big = torch.tensor([1.0e6])
+    assert abs(float(_barron_loss(big, 1.0, 1.0)) - 1.0e6) < 10.0
+    # alpha=2：同样的大误差会给出二次爆炸。
+    assert float(_barron_loss(big, 2.0, 1.0)) > 1.0e11
+    # alpha=0：只按对数增长，远小于 |r|。
+    assert float(_barron_loss(big, 0.0, 1.0)) < 30.0
 
 
 def test_barron_regression_term_reaches_total_and_gradients():

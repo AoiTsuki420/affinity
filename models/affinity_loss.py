@@ -14,14 +14,21 @@ _LOG_VAR_MAX = 10.0
 
 
 def _barron_loss(error: torch.Tensor, alpha: float, scale: float) -> torch.Tensor:
-    """Barron 稳健损失（CVPR 2019），alpha=2 退化为 L2，alpha=0 近似 L1。"""
-    scaled = (error / scale) ** 2
-    if abs(alpha - 2.0) < 1e-6:
-        return 0.5 * scaled
-    if abs(alpha) < 1e-6:
-        return torch.log1p(0.5 * scaled)
-    factor = abs(alpha - 2.0) / alpha
-    return (torch.pow(1.0 + scaled / factor, factor) - 1.0) * factor
+    """Barron 稳健损失（CVPR 2019），alpha=2 退化为 L2，alpha=0 近似 L1。
+
+    逐行对应 main_train_predictor_multigpu.py:247-260 的 _barron_loss_per_sample：
+    分母先取 max(scale, 1e-8)，alpha=2 / alpha=0 两个特例单独处理，其余情况用
+    (beta/alpha) * ((r2/beta + 1)^(alpha/2) - 1)，其中 beta = |alpha - 2|。
+    """
+    c = max(float(scale), 1e-8)
+    a = float(alpha)
+    r2 = (error / c) ** 2
+    if abs(a - 2.0) < 1e-6:
+        return 0.5 * r2
+    if abs(a) < 1e-6:
+        return torch.log1p(0.5 * r2)
+    beta = abs(a - 2.0)
+    return (beta / a) * (torch.pow(r2 / beta + 1.0, a / 2.0) - 1.0)
 
 
 def affinity_loss(
