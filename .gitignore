@@ -23,3 +23,6 @@ checkpoints/
 .superpowers/
 .piptmp/
 pytest-cache-files-*/
+probe-mode-dir/
+probe-scratch-*/
+tmp????????/
