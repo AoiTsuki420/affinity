@@ -2,9 +2,11 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
+import torch
 
-from data_affinity import AffinityScaler
+from data_affinity import AffinityDataset, AffinityScaler
 
 
 @pytest.fixture()
@@ -74,3 +76,83 @@ def test_save_and_load_round_trip(scratch_dir):
 
     reloaded = AffinityScaler.load(str(path))
     np.testing.assert_allclose(reloaded.transform(y), scaler.transform(y), atol=1e-6)
+
+
+def _frame(**overrides):
+    data = {
+        "pdb_id": ["1a", "1b", "1c"],
+        "Sequence": ["MKTAYIAK", "MKTAYIAL", "MKTAYIAM"],
+        "Smiles": ["CCO", "CCC", "CCN"],
+        "pKaffinity": [4.0, 6.0, 8.0],
+        "affinity_type": ["Kd", "Ki", "IC50"],
+    }
+    data.update(overrides)
+    return pd.DataFrame(data)
+
+
+def test_dataset_returns_three_tuple():
+    dataset = AffinityDataset(_frame())
+    item = dataset[0]
+    assert len(item) == 3
+    seq, smi, y = item
+    assert seq == "MKTAYIAK"
+    assert smi == "CCO"
+    assert isinstance(y, torch.Tensor)
+
+
+def test_dataset_drops_rows_with_non_finite_labels():
+    frame = _frame()
+    frame.loc[1, "pKaffinity"] = float("nan")
+    dataset = AffinityDataset(frame)
+    assert len(dataset) == 2
+    assert list(dataset.df["pdb_id"]) == ["1a", "1c"]
+
+
+def test_dataset_raises_when_label_column_missing():
+    with pytest.raises(ValueError) as excinfo:
+        AffinityDataset(_frame().drop(columns=["pKaffinity"]))
+    assert "pKaffinity" in str(excinfo.value)
+
+
+def test_dataset_raises_when_no_valid_rows():
+    frame = _frame()
+    frame["pKaffinity"] = float("nan")
+    with pytest.raises(ValueError):
+        AffinityDataset(frame)
+
+
+def test_dataset_accepts_sequence_and_smiles_column_aliases():
+    frame = _frame().rename(columns={"Sequence": "sequence", "Smiles": "SMILES"})
+    dataset = AffinityDataset(frame)
+    seq, smi, _ = dataset[0]
+    assert seq == "MKTAYIAK"
+    assert smi == "CCO"
+
+
+def test_dataset_applies_scaler():
+    frame = _frame()
+    scaler = AffinityScaler().fit(frame["pKaffinity"].to_numpy())
+    dataset = AffinityDataset(frame, scaler=scaler)
+    _, _, y = dataset[0]
+    expected = scaler.transform(frame["pKaffinity"].to_numpy())[0]
+    assert abs(float(y) - float(expected)) < 1e-5
+
+
+def test_dataset_without_scaler_returns_raw_label():
+    dataset = AffinityDataset(_frame())
+    _, _, y = dataset[2]
+    assert abs(float(y) - 8.0) < 1e-5
+
+
+def test_dataset_return_source_flag():
+    dataset = AffinityDataset(_frame(), return_source=True)
+    item = dataset[0]
+    assert len(item) == 4
+    assert item[3] == "Kd"
+
+
+def test_dataset_respects_custom_label_column():
+    frame = _frame().rename(columns={"pKaffinity": "pKd"})
+    dataset = AffinityDataset(frame, label_col="pKd")
+    _, _, y = dataset[1]
+    assert abs(float(y) - 6.0) < 1e-5

@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 
 class AffinityScaler:
@@ -60,3 +63,72 @@ class AffinityScaler:
         scaler.mean_ = float(payload["mean"])
         scaler.scale_ = float(payload["scale"])
         return scaler
+
+
+class AffinityDataset(Dataset):
+    """PDBbind 亲和力数据集：单标签列，可选 source（亲和力类型）。"""
+
+    SEQ_COLUMNS = ("Sequence", "sequence", "Protein Sequence", "protein_sequence")
+    SMI_COLUMNS = ("Smiles", "SMILES", "smiles", "Substrate SMILES", "Substrate_SMILES")
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        *,
+        label_col: str = "pKaffinity",
+        scaler: AffinityScaler | None = None,
+        supervised: bool = True,
+        return_source: bool = False,
+        source_col: str = "affinity_type",
+    ):
+        if label_col not in df.columns:
+            raise ValueError(
+                f"AffinityDataset 缺少标签列 {label_col!r}；"
+                f"实际列: {sorted(df.columns)}"
+            )
+
+        labels = pd.to_numeric(df[label_col], errors="coerce").to_numpy(dtype=np.float64)
+        finite = np.isfinite(labels)
+        if not finite.any():
+            raise ValueError(
+                f"标签列 {label_col!r} 里没有任何有限值，共 {len(df)} 行。"
+            )
+
+        self.df = df.loc[finite].reset_index(drop=True)
+        raw_labels = labels[finite]
+
+        self.scaler = scaler
+        if scaler is not None:
+            self.labels = scaler.transform(raw_labels).astype(np.float32)
+        else:
+            self.labels = raw_labels.astype(np.float32)
+
+        self.seq_col = self._first_present(df, self.SEQ_COLUMNS, "蛋白序列")
+        self.smi_col = self._first_present(df, self.SMI_COLUMNS, "配体 SMILES")
+
+        self.return_source = bool(return_source)
+        self.source_col = source_col
+        if self.return_source and source_col not in df.columns:
+            raise ValueError(f"return_source=True 但缺少列 {source_col!r}")
+
+        self.supervised = bool(supervised)
+
+    @staticmethod
+    def _first_present(df: pd.DataFrame, candidates, what: str) -> str:
+        for name in candidates:
+            if name in df.columns:
+                return name
+        raise ValueError(f"找不到{what}列，尝试过 {candidates}；实际列: {sorted(df.columns)}")
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, index: int):
+        row = self.df.iloc[index]
+        seq = str(row[self.seq_col])
+        smi = str(row[self.smi_col])
+        label = torch.tensor(float(self.labels[index]), dtype=torch.float32)
+
+        if self.return_source:
+            return seq, smi, label, str(row[self.source_col])
+        return seq, smi, label
