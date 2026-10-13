@@ -344,6 +344,36 @@ def _add_macro_metrics(metric_dict, task_names):
                 vals.append(float(v))
         metric_dict[f"macro_{k}"] = float(np.mean(vals)) if vals else float("nan")
 
+def _compute_affinity_metrics(y_true, y_pred, sigma=None):
+    """亲和力任务指标：MAE / RMSE / Pearson / Spearman / R2，可选 NLL。"""
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true, y_pred = y_true[valid], y_pred[valid]
+
+    metrics = {"n": int(y_true.size)}
+    if y_true.size == 0:
+        metrics.update({"mae": float("nan"), "rmse": float("nan"),
+                        "pearson": float("nan"), "spearman": float("nan"),
+                        "r2": float("nan")})
+        return metrics
+
+    metrics["mae"] = float(np.abs(y_true - y_pred).mean())
+    metrics["rmse"] = float(np.sqrt(((y_true - y_pred) ** 2).mean()))
+    metrics["pearson"] = float(_pearson_r_safe(y_true, y_pred))
+    metrics["spearman"] = float(_spearman_r_safe(y_true, y_pred))
+    denominator = float(((y_true - y_true.mean()) ** 2).sum())
+    metrics["r2"] = float(1.0 - ((y_true - y_pred) ** 2).sum() / denominator) \
+        if denominator > 1e-12 else float("nan")
+
+    if sigma is not None:
+        sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)[valid]
+        metrics["nll"] = float(
+            0.5 * (np.log(2 * np.pi * np.maximum(sigma, 1e-8))
+                   + (y_true - y_pred) ** 2 / np.maximum(sigma, 1e-8)).mean()
+        )
+    return metrics
+
 
 def _source_dist(df, source_col: str):
     if source_col in df.columns:
@@ -961,6 +991,28 @@ def compute_multihead_loss(model_out, labels, criterion):
     return loss, loss_detail
 
 
+def compute_affinity_step_loss(model_out, labels, args, device):
+    """affinity 通路的单任务损失。model_out = (mu, log_var)，labels = (B,)。"""
+    from models.affinity_loss import affinity_loss
+
+    mu, log_var = model_out
+    if mu.ndim > 1:
+        mu = mu.squeeze(-1)
+    if log_var.ndim > 1:
+        log_var = log_var.squeeze(-1)
+
+    y = labels.reshape(-1).to(device=device, dtype=torch.float32)
+    return affinity_loss(
+        mu, log_var, y,
+        loss_type=str(getattr(args, "affinity_loss_type", "huber")),
+        nll_weight=float(getattr(args, "affinity_nll_weight", 0.05)),
+        rank_weight=float(getattr(args, "affinity_rank_weight", 0.0)),
+        rank_margin=float(getattr(args, "affinity_rank_margin", 0.0)),
+        var_reg_weight=float(getattr(args, "affinity_var_reg_weight", 0.0)),
+        var_reg_mode=str(getattr(args, "affinity_var_reg_mode", "abs")),
+    )
+
+
 def lr_range_test_for_tag(
     model,
     train_loader,
@@ -1112,6 +1164,7 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                kcat_group_dro_eta: float = 0.05,
                kcat_group_dro_num_groups: int = 3,
                kcat_group_dro_mix: float = 1.0,
+               args=None,
                  ):
     
     model.train()
@@ -1236,273 +1289,301 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
         
         with sync_ctx:
             with amp.autocast('cuda'):
-                try:
-                    pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                if str(getattr(args, "task", "kinetics")) == "affinity":
+                    mu, log_var = model(
                         seqs_mb, smiles_mb,
-                        prot_struct=p_mb,
-                        lig_struct=l_mb,
+                        prot_struct=p_mb, lig_struct=l_mb,
                         struct_avail_mask=struct_mb,
-                        phys_feat=phys_mb,
-                        phys_mask=phys_m_mb,
-                        phys_quality=phys_q_mb,
+                        phys_feat=phys_mb, phys_mask=phys_m_mb, phys_quality=phys_q_mb,
                         source_ids=source_mb,
                         use_mask=use_mask,
-                        bias_tuple=bias_tuple, caps=s_caps, floor_m=s_floorM
                     )
-                except TypeError:
-                    pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
-                        seqs_mb, smiles_mb, use_mask=use_mask,
-                        bias_tuple=bias_tuple, caps=s_caps, floor_m=s_floorM
+                    # loss_logs 是 affinity_loss 的分项（含 total）；train_step 只回传
+                    # 标量损失（与 kinetics 分支一致），分项暂不向上传。
+                    loss_mb, loss_logs = compute_affinity_step_loss(
+                        (mu, log_var), labels_mb, args, device
                     )
-
-                _alpha_direct = 0.4  # 直接 head 权重；0=纯派生（原行为），1=纯直接预测
-                pred_act = _alpha_direct * pred_act_tmp + (1.0 - _alpha_direct) * (pred_kcat - pred_Km + 3.0)
-
-                mask_k = torch.isfinite(labels_mb[:, 0])
-                mask_m = torch.isfinite(labels_mb[:, 1])
-                mask_r = torch.isfinite(labels_mb[:, 2]) & mask_k & mask_m
-
-                loss_k_per = torch.zeros_like(pred_kcat)
-                huber_m = torch.zeros_like(pred_Km)
-                huber_r = torch.zeros_like(pred_act)
-                if mask_k.any():
-                    if str(kcat_loss_type).lower() == "barron":
-                        loss_k_per[mask_k] = _barron_loss_per_sample(
-                            pred_kcat[mask_k],
-                            labels_mb[mask_k, 0],
-                            alpha=float(kcat_barron_alpha),
-                            scale=float(kcat_barron_scale),
-                        ).to(loss_k_per.dtype)
-                    else:
-                        loss_k_per[mask_k] = F.smooth_l1_loss(
-                            pred_kcat[mask_k], labels_mb[mask_k, 0], beta=beta, reduction='none'
-                        ).to(loss_k_per.dtype)
-                if mask_m.any():
-                    huber_m[mask_m] = F.smooth_l1_loss(pred_Km[mask_m], labels_mb[mask_m, 1], beta=beta, reduction='none').to(huber_m.dtype)
-                if mask_r.any():
-                    huber_r[mask_r] = F.smooth_l1_loss(pred_act[mask_r], labels_mb[mask_r, 2], beta=beta, reduction='none').to(huber_r.dtype)
-
-                mse_kcat = _safe_masked_mean(loss_k_per, mask_k, device=device, dtype=pred_kcat.dtype)
-                mse_Km = _safe_masked_mean(huber_m, mask_m, device=device, dtype=pred_kcat.dtype)
-                mse_ratio = _safe_masked_mean(huber_r, mask_r, device=device, dtype=pred_kcat.dtype)
-
-                if bool(kcat_use_group_dro) and mask_k.any():
-                    gid = source_mb.long()[mask_k]
-                    lk = loss_k_per[mask_k]
-                    if gid.numel() > 0:
-                        uniq = torch.unique(gid)
-                        lg_list = []
-                        for g in uniq:
-                            mg = (gid == g)
-                            if mg.any():
-                                lg_list.append(lk[mg].mean())
-                        if lg_list:
-                            lg = torch.stack(lg_list)
-                            real_model = getattr(model, "module", model)
-                            n_groups = max(int(kcat_group_dro_num_groups), 1)
-                            if (not hasattr(real_model, "_kcat_group_q")) or (real_model._kcat_group_q.numel() != n_groups):
-                                real_model._kcat_group_q = torch.ones(
-                                    n_groups, device=device, dtype=torch.float32
-                                ) / float(n_groups)
-                            q = real_model._kcat_group_q.float()
-                            valid_uniq = uniq.clamp(min=0, max=n_groups - 1)
-                            lg32 = lg.detach().float()
-                            with torch.no_grad():
-                                q[valid_uniq] = q[valid_uniq] * torch.exp(float(kcat_group_dro_eta) * lg32)
-                                q = q / q.sum().clamp_min(1e-8)
-                                real_model._kcat_group_q = q
-                            dro_loss = (q[valid_uniq] * lg32).sum().to(mse_kcat.dtype)
-                            mix = float(kcat_group_dro_mix)
-                            mse_kcat = (1.0 - mix) * mse_kcat + mix * dro_loss
-
-                kcat_rank_loss = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-                kcat_var_reg   = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-
-                if mask_k.any() and (float(kcat_rank_weight) > 0.0):
-                    idx_valid = mask_k.nonzero(as_tuple=False).reshape(-1)
-                    n_valid = int(idx_valid.numel())
-                    if n_valid >= 2:
-                        n_pairs = int(min(int(kcat_rank_pairs), n_valid * (n_valid - 1)))
-                        if n_pairs > 0:
-                            i_sel = idx_valid[torch.randint(0, n_valid, (n_pairs,), device=device)]
-                            j_sel = idx_valid[torch.randint(0, n_valid, (n_pairs,), device=device)]
-                            keep_pair = (i_sel != j_sel)
-                            if keep_pair.any():
-                                i_sel = i_sel[keep_pair]
-                                j_sel = j_sel[keep_pair]
-                                d_true = labels_mb[i_sel, 0] - labels_mb[j_sel, 0]
-                                y_sign = torch.sign(d_true)
-                                nz = y_sign != 0
-                                if nz.any():
-                                    kcat_rank_loss = F.margin_ranking_loss(
-                                        pred_kcat[i_sel[nz]],
-                                        pred_kcat[j_sel[nz]],
-                                        y_sign[nz],
-                                        margin=float(kcat_rank_margin),
-                                        reduction="mean",
-                                    ).to(pred_kcat.dtype)
-
-                if mask_k.any() and (float(kcat_var_reg_weight) > 0.0):
-                    pk = pred_kcat[mask_k]
-                    yk = labels_mb[mask_k, 0]
-                    if pk.numel() >= 2:
-                        with torch.cuda.amp.autocast(enabled=False):
-                            std_p = pk.float().std(unbiased=False)
-                            std_y = yk.float().std(unbiased=False)
-                            if str(kcat_var_reg_mode) == "ratio":
-                                var_term = torch.relu(std_y - std_p)
-                            else:
-                                var_term = (std_p - std_y).abs()
-                        kcat_var_reg = var_term.to(pred_kcat.dtype)
-
-                l1 = gate_e.abs().mean() + gate_s.abs().mean()
-                tv = (gate_e[:, 1:] - gate_e[:, :-1]).abs().mean() + (gate_s[:, 1:] - gate_s[:, :-1]).abs().mean()
-
-                (s_k_raw, s_m_raw, s_r_raw) = s_raw
-                (s_k_eff, s_m_eff, s_r_eff) = s_eff
-                
-                s_min, s_max = -0.5, 2.0
-                s_k_eff = s_k_eff.clamp(min=s_min, max=s_max)
-                s_m_eff = s_m_eff.clamp(min=s_min, max=s_max)
-                s_r_eff = s_r_eff.clamp(min=s_min, max=s_max)
-
-                n_k = float(mask_k.sum()) + 1e-8
-                n_m = float(mask_m.sum()) + 1e-8
-                n_r = float(mask_r.sum()) + 1e-8
-                n_active_tasks = (1 if mask_k.any() else 0) + (1 if mask_m.any() else 0) + (1 if mask_r.any() else 0)
-                n_total = n_k + n_m + n_r
-                w_k = min(2.0, n_total / (n_active_tasks * n_k)) if mask_k.any() else 0.0
-                w_m = min(2.0, n_total / (n_active_tasks * n_m)) if mask_m.any() else 0.0
-                w_r = min(2.0, n_total / (n_active_tasks * n_r)) if mask_r.any() else 0.0
-
-                task_terms = []
-                if mask_k.any():
-                    task_terms.append(w_k * _to_scalar_tensor(torch.exp(-s_k_eff) * mse_kcat + s_k_eff))
-                if mask_m.any():
-                    task_terms.append(w_m * _to_scalar_tensor(torch.exp(-s_m_eff) * mse_Km + s_m_eff))
-                if mask_r.any():
-                    task_terms.append(w_r * _to_scalar_tensor(torch.exp(-s_r_eff) * mse_ratio + s_r_eff))
-                if task_terms:
-                    loss_tasks = sum(task_terms) / float(len(task_terms))
+                    loss = loss_mb / max(int(getattr(args, "iters_to_accumulate", 1)), 1)
                 else:
-                    loss_tasks = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-
-                floor_k, floor_m, floor_r = -0.5, -0.5, -0.5  # 与 s_eff 下界一致
-                cap_k, cap_m, cap_r = s_caps
-                cap_penalty = 1e-3 * (
-                    torch.relu(s_k_raw - cap_k)**2 + torch.relu(floor_k - s_k_raw)**2 +
-                    torch.relu(s_m_raw - cap_m)**2 + torch.relu(floor_m - s_m_raw)**2 +
-                    torch.relu(s_r_raw - cap_r)**2 + torch.relu(floor_r - s_r_raw)**2
-                )
-                cap_penalty = _to_scalar_tensor(cap_penalty)
-
-                with torch.cuda.amp.autocast(enabled=False):
-                    s_reg = (5e-3) * ((s_k_raw.float() - 0.2)**2 + (s_r_raw.float() - 0.2)**2) \
-                          + (7e-3) * ((s_m_raw.float() + 0.2)**2)
-                s_reg = _to_scalar_tensor(s_reg)
-                    
-                
-                cap_penalty_sum += float(cap_penalty.detach().item())
-                s_reg_sum       += float(s_reg.detach().item())
-
-                s_k_raw_sum += float(s_k_raw.detach().mean().item())
-                s_m_raw_sum += float(s_m_raw.detach().mean().item())
-                s_r_raw_sum += float(s_r_raw.detach().mean().item())
-
-                s_k_eff_sum += float(s_k_eff.detach().mean().item())
-                s_m_eff_sum += float(s_m_eff.detach().mean().item())
-                s_r_eff_sum += float(s_r_eff.detach().mean().item())    
-                
-
-                aux_ratio_align = 0.1 * F.smooth_l1_loss(pred_act_tmp, pred_act.detach(), beta=beta)
-
-                real_model = getattr(model, "module", model)
-                gate_struct = getattr(real_model, "last_gate_struct", None)
-                avail_struct = getattr(real_model, "last_struct_avail", None)
-                if gate_struct is None:
-                    gate_struct = torch.zeros_like(struct_mb)
-                else:
-                    gate_struct = gate_struct.to(device=device, dtype=pred_kcat.dtype)
-                if avail_struct is None:
-                    avail_struct = struct_mb
-                else:
-                    avail_struct = avail_struct.to(device=device, dtype=pred_kcat.dtype)
-
-                off_mask = avail_struct <= 0.5
-                on_mask = avail_struct > 0.5
-                if off_mask.any():
-                    l_gate_off = gate_struct[off_mask].pow(2).mean()
-                else:
-                    l_gate_off = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-                if on_mask.any():
-                    l_gate_on = torch.relu(gate_on_margin - gate_struct[on_mask]).mean()
-                else:
-                    l_gate_on = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-
-                cons_loss = torch.zeros((), device=device, dtype=pred_kcat.dtype)
-                if (lambda_cons > 0.0) and (epoch_idx >= cons_warmup_epochs) and on_mask.any():
                     try:
-                        pred_kcat_wo, pred_Km_wo, pred_act_tmp_wo, _, _, _, _ = model(
-                            seqs_mb,
-                            smiles_mb,
-                            prot_struct=None,
-                            lig_struct=None,
-                            struct_avail_mask=torch.zeros_like(struct_mb),
+                        pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                            seqs_mb, smiles_mb,
+                            prot_struct=p_mb,
+                            lig_struct=l_mb,
+                            struct_avail_mask=struct_mb,
                             phys_feat=phys_mb,
                             phys_mask=phys_m_mb,
                             phys_quality=phys_q_mb,
                             source_ids=source_mb,
                             use_mask=use_mask,
-                            bias_tuple=bias_tuple,
-                            caps=s_caps,
-                            floor_m=s_floorM,
+                            bias_tuple=bias_tuple, caps=s_caps, floor_m=s_floorM
                         )
                     except TypeError:
-                        pred_kcat_wo, pred_Km_wo, pred_act_tmp_wo, _, _, _, _ = model(
-                            seqs_mb,
-                            smiles_mb,
-                            use_mask=use_mask,
-                            bias_tuple=bias_tuple,
-                            caps=s_caps,
-                            floor_m=s_floorM,
+                        pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                            seqs_mb, smiles_mb, use_mask=use_mask,
+                            bias_tuple=bias_tuple, caps=s_caps, floor_m=s_floorM
                         )
-                    pred_act_wo = pred_kcat_wo - pred_Km_wo + 3.0
-                    wk, wm, wr = cons_weights
-                    cons_loss = (
-                        float(wk) * F.smooth_l1_loss(pred_kcat[on_mask], pred_kcat_wo[on_mask], beta=beta)
-                        + float(wm) * F.smooth_l1_loss(pred_Km[on_mask], pred_Km_wo[on_mask], beta=beta)
-                        + float(wr) * F.smooth_l1_loss(pred_act[on_mask], pred_act_wo[on_mask], beta=beta)
+
+                    _alpha_direct = 0.4  # 直接 head 权重；0=纯派生（原行为），1=纯直接预测
+                    pred_act = _alpha_direct * pred_act_tmp + (1.0 - _alpha_direct) * (pred_kcat - pred_Km + 3.0)
+
+                    mask_k = torch.isfinite(labels_mb[:, 0])
+                    mask_m = torch.isfinite(labels_mb[:, 1])
+                    mask_r = torch.isfinite(labels_mb[:, 2]) & mask_k & mask_m
+
+                    loss_k_per = torch.zeros_like(pred_kcat)
+                    huber_m = torch.zeros_like(pred_Km)
+                    huber_r = torch.zeros_like(pred_act)
+                    if mask_k.any():
+                        if str(kcat_loss_type).lower() == "barron":
+                            loss_k_per[mask_k] = _barron_loss_per_sample(
+                                pred_kcat[mask_k],
+                                labels_mb[mask_k, 0],
+                                alpha=float(kcat_barron_alpha),
+                                scale=float(kcat_barron_scale),
+                            ).to(loss_k_per.dtype)
+                        else:
+                            loss_k_per[mask_k] = F.smooth_l1_loss(
+                                pred_kcat[mask_k], labels_mb[mask_k, 0], beta=beta, reduction='none'
+                            ).to(loss_k_per.dtype)
+                    if mask_m.any():
+                        huber_m[mask_m] = F.smooth_l1_loss(pred_Km[mask_m], labels_mb[mask_m, 1], beta=beta, reduction='none').to(huber_m.dtype)
+                    if mask_r.any():
+                        huber_r[mask_r] = F.smooth_l1_loss(pred_act[mask_r], labels_mb[mask_r, 2], beta=beta, reduction='none').to(huber_r.dtype)
+
+                    mse_kcat = _safe_masked_mean(loss_k_per, mask_k, device=device, dtype=pred_kcat.dtype)
+                    mse_Km = _safe_masked_mean(huber_m, mask_m, device=device, dtype=pred_kcat.dtype)
+                    mse_ratio = _safe_masked_mean(huber_r, mask_r, device=device, dtype=pred_kcat.dtype)
+
+                    if bool(kcat_use_group_dro) and mask_k.any():
+                        gid = source_mb.long()[mask_k]
+                        lk = loss_k_per[mask_k]
+                        if gid.numel() > 0:
+                            uniq = torch.unique(gid)
+                            lg_list = []
+                            for g in uniq:
+                                mg = (gid == g)
+                                if mg.any():
+                                    lg_list.append(lk[mg].mean())
+                            if lg_list:
+                                lg = torch.stack(lg_list)
+                                real_model = getattr(model, "module", model)
+                                n_groups = max(int(kcat_group_dro_num_groups), 1)
+                                if (not hasattr(real_model, "_kcat_group_q")) or (real_model._kcat_group_q.numel() != n_groups):
+                                    real_model._kcat_group_q = torch.ones(
+                                        n_groups, device=device, dtype=torch.float32
+                                    ) / float(n_groups)
+                                q = real_model._kcat_group_q.float()
+                                valid_uniq = uniq.clamp(min=0, max=n_groups - 1)
+                                lg32 = lg.detach().float()
+                                with torch.no_grad():
+                                    q[valid_uniq] = q[valid_uniq] * torch.exp(float(kcat_group_dro_eta) * lg32)
+                                    q = q / q.sum().clamp_min(1e-8)
+                                    real_model._kcat_group_q = q
+                                dro_loss = (q[valid_uniq] * lg32).sum().to(mse_kcat.dtype)
+                                mix = float(kcat_group_dro_mix)
+                                mse_kcat = (1.0 - mix) * mse_kcat + mix * dro_loss
+
+                    kcat_rank_loss = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    kcat_var_reg   = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+
+                    if mask_k.any() and (float(kcat_rank_weight) > 0.0):
+                        idx_valid = mask_k.nonzero(as_tuple=False).reshape(-1)
+                        n_valid = int(idx_valid.numel())
+                        if n_valid >= 2:
+                            n_pairs = int(min(int(kcat_rank_pairs), n_valid * (n_valid - 1)))
+                            if n_pairs > 0:
+                                i_sel = idx_valid[torch.randint(0, n_valid, (n_pairs,), device=device)]
+                                j_sel = idx_valid[torch.randint(0, n_valid, (n_pairs,), device=device)]
+                                keep_pair = (i_sel != j_sel)
+                                if keep_pair.any():
+                                    i_sel = i_sel[keep_pair]
+                                    j_sel = j_sel[keep_pair]
+                                    d_true = labels_mb[i_sel, 0] - labels_mb[j_sel, 0]
+                                    y_sign = torch.sign(d_true)
+                                    nz = y_sign != 0
+                                    if nz.any():
+                                        kcat_rank_loss = F.margin_ranking_loss(
+                                            pred_kcat[i_sel[nz]],
+                                            pred_kcat[j_sel[nz]],
+                                            y_sign[nz],
+                                            margin=float(kcat_rank_margin),
+                                            reduction="mean",
+                                        ).to(pred_kcat.dtype)
+
+                    if mask_k.any() and (float(kcat_var_reg_weight) > 0.0):
+                        pk = pred_kcat[mask_k]
+                        yk = labels_mb[mask_k, 0]
+                        if pk.numel() >= 2:
+                            with torch.cuda.amp.autocast(enabled=False):
+                                std_p = pk.float().std(unbiased=False)
+                                std_y = yk.float().std(unbiased=False)
+                                if str(kcat_var_reg_mode) == "ratio":
+                                    var_term = torch.relu(std_y - std_p)
+                                else:
+                                    var_term = (std_p - std_y).abs()
+                            kcat_var_reg = var_term.to(pred_kcat.dtype)
+
+                    l1 = gate_e.abs().mean() + gate_s.abs().mean()
+                    tv = (gate_e[:, 1:] - gate_e[:, :-1]).abs().mean() + (gate_s[:, 1:] - gate_s[:, :-1]).abs().mean()
+
+                    (s_k_raw, s_m_raw, s_r_raw) = s_raw
+                    (s_k_eff, s_m_eff, s_r_eff) = s_eff
+
+                    s_min, s_max = -0.5, 2.0
+                    s_k_eff = s_k_eff.clamp(min=s_min, max=s_max)
+                    s_m_eff = s_m_eff.clamp(min=s_min, max=s_max)
+                    s_r_eff = s_r_eff.clamp(min=s_min, max=s_max)
+
+                    n_k = float(mask_k.sum()) + 1e-8
+                    n_m = float(mask_m.sum()) + 1e-8
+                    n_r = float(mask_r.sum()) + 1e-8
+                    n_active_tasks = (1 if mask_k.any() else 0) + (1 if mask_m.any() else 0) + (1 if mask_r.any() else 0)
+                    n_total = n_k + n_m + n_r
+                    w_k = min(2.0, n_total / (n_active_tasks * n_k)) if mask_k.any() else 0.0
+                    w_m = min(2.0, n_total / (n_active_tasks * n_m)) if mask_m.any() else 0.0
+                    w_r = min(2.0, n_total / (n_active_tasks * n_r)) if mask_r.any() else 0.0
+
+                    task_terms = []
+                    if mask_k.any():
+                        task_terms.append(w_k * _to_scalar_tensor(torch.exp(-s_k_eff) * mse_kcat + s_k_eff))
+                    if mask_m.any():
+                        task_terms.append(w_m * _to_scalar_tensor(torch.exp(-s_m_eff) * mse_Km + s_m_eff))
+                    if mask_r.any():
+                        task_terms.append(w_r * _to_scalar_tensor(torch.exp(-s_r_eff) * mse_ratio + s_r_eff))
+                    if task_terms:
+                        loss_tasks = sum(task_terms) / float(len(task_terms))
+                    else:
+                        loss_tasks = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+
+                    floor_k, floor_m, floor_r = -0.5, -0.5, -0.5  # 与 s_eff 下界一致
+                    cap_k, cap_m, cap_r = s_caps
+                    cap_penalty = 1e-3 * (
+                        torch.relu(s_k_raw - cap_k)**2 + torch.relu(floor_k - s_k_raw)**2 +
+                        torch.relu(s_m_raw - cap_m)**2 + torch.relu(floor_m - s_m_raw)**2 +
+                        torch.relu(s_r_raw - cap_r)**2 + torch.relu(floor_r - s_r_raw)**2
+                    )
+                    cap_penalty = _to_scalar_tensor(cap_penalty)
+
+                    with torch.cuda.amp.autocast(enabled=False):
+                        s_reg = (5e-3) * ((s_k_raw.float() - 0.2)**2 + (s_r_raw.float() - 0.2)**2) \
+                              + (7e-3) * ((s_m_raw.float() + 0.2)**2)
+                    s_reg = _to_scalar_tensor(s_reg)
+
+
+                    cap_penalty_sum += float(cap_penalty.detach().item())
+                    s_reg_sum       += float(s_reg.detach().item())
+
+                    s_k_raw_sum += float(s_k_raw.detach().mean().item())
+                    s_m_raw_sum += float(s_m_raw.detach().mean().item())
+                    s_r_raw_sum += float(s_r_raw.detach().mean().item())
+
+                    s_k_eff_sum += float(s_k_eff.detach().mean().item())
+                    s_m_eff_sum += float(s_m_eff.detach().mean().item())
+                    s_r_eff_sum += float(s_r_eff.detach().mean().item())    
+
+
+                    aux_ratio_align = 0.1 * F.smooth_l1_loss(pred_act_tmp, pred_act.detach(), beta=beta)
+
+                    real_model = getattr(model, "module", model)
+                    gate_struct = getattr(real_model, "last_gate_struct", None)
+                    avail_struct = getattr(real_model, "last_struct_avail", None)
+                    if gate_struct is None:
+                        gate_struct = torch.zeros_like(struct_mb)
+                    else:
+                        gate_struct = gate_struct.to(device=device, dtype=pred_kcat.dtype)
+                    if avail_struct is None:
+                        avail_struct = struct_mb
+                    else:
+                        avail_struct = avail_struct.to(device=device, dtype=pred_kcat.dtype)
+
+                    off_mask = avail_struct <= 0.5
+                    on_mask = avail_struct > 0.5
+                    if off_mask.any():
+                        l_gate_off = gate_struct[off_mask].pow(2).mean()
+                    else:
+                        l_gate_off = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    if on_mask.any():
+                        l_gate_on = torch.relu(gate_on_margin - gate_struct[on_mask]).mean()
+                    else:
+                        l_gate_on = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+
+                    cons_loss = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    if (lambda_cons > 0.0) and (epoch_idx >= cons_warmup_epochs) and on_mask.any():
+                        try:
+                            pred_kcat_wo, pred_Km_wo, pred_act_tmp_wo, _, _, _, _ = model(
+                                seqs_mb,
+                                smiles_mb,
+                                prot_struct=None,
+                                lig_struct=None,
+                                struct_avail_mask=torch.zeros_like(struct_mb),
+                                phys_feat=phys_mb,
+                                phys_mask=phys_m_mb,
+                                phys_quality=phys_q_mb,
+                                source_ids=source_mb,
+                                use_mask=use_mask,
+                                bias_tuple=bias_tuple,
+                                caps=s_caps,
+                                floor_m=s_floorM,
+                            )
+                        except TypeError:
+                            pred_kcat_wo, pred_Km_wo, pred_act_tmp_wo, _, _, _, _ = model(
+                                seqs_mb,
+                                smiles_mb,
+                                use_mask=use_mask,
+                                bias_tuple=bias_tuple,
+                                caps=s_caps,
+                                floor_m=s_floorM,
+                            )
+                        pred_act_wo = pred_kcat_wo - pred_Km_wo + 3.0
+                        wk, wm, wr = cons_weights
+                        cons_loss = (
+                            float(wk) * F.smooth_l1_loss(pred_kcat[on_mask], pred_kcat_wo[on_mask], beta=beta)
+                            + float(wm) * F.smooth_l1_loss(pred_Km[on_mask], pred_Km_wo[on_mask], beta=beta)
+                            + float(wr) * F.smooth_l1_loss(pred_act[on_mask], pred_act_wo[on_mask], beta=beta)
+                        )
+
+                    gate_off_sum += float(l_gate_off.detach().item())
+                    gate_on_sum += float(l_gate_on.detach().item())
+                    cons_sum += float(cons_loss.detach().item())
+
+                    loss_mb = (
+                        loss_tasks
+                        + cap_penalty
+                        + s_reg.to(loss_tasks.dtype)
+                        + lam_l1 * l1
+                        + lam_tv * tv
+                        + aux_ratio_align
+                        + float(lambda_gate_off) * l_gate_off
+                        + float(lambda_gate_on) * l_gate_on
+                        + float(lambda_cons) * cons_loss
+                        + float(kcat_rank_weight)   * kcat_rank_loss.to(loss_tasks.dtype)
+                        + float(kcat_var_reg_weight) * kcat_var_reg.to(loss_tasks.dtype)
                     )
 
-                gate_off_sum += float(l_gate_off.detach().item())
-                gate_on_sum += float(l_gate_on.detach().item())
-                cons_sum += float(cons_loss.detach().item())
-
-                loss_mb = (
-                    loss_tasks
-                    + cap_penalty
-                    + s_reg.to(loss_tasks.dtype)
-                    + lam_l1 * l1
-                    + lam_tv * tv
-                    + aux_ratio_align
-                    + float(lambda_gate_off) * l_gate_off
-                    + float(lambda_gate_on) * l_gate_on
-                    + float(lambda_cons) * cons_loss
-                    + float(kcat_rank_weight)   * kcat_rank_loss.to(loss_tasks.dtype)
-                    + float(kcat_var_reg_weight) * kcat_var_reg.to(loss_tasks.dtype)
-                )
-
-                loss = loss_mb / steps
+                    loss = loss_mb / steps
             
             scaler.scale(loss).backward()
             
-        total_loss += float(loss_mb.detach().item())
-        mse_k_sum += float(mse_kcat.detach().item())
-        mse_m_sum += float(mse_Km.detach().item())
-        mse_r_sum += float(mse_ratio.detach().item())
-        
-        preds_chunks.append(torch.stack([pred_kcat, pred_Km, pred_act], dim=1).detach().cpu().numpy())
-        labels_chunks.append(labels_mb.detach().cpu().numpy())
+        if str(getattr(args, "task", "kinetics")) == "affinity":
+            total_loss += float(loss_mb.detach().item())
+            # R37：预测为 (B, 2) = [mu, log_var]；标签显式写成 (B, 2) 两列同值，
+            # 否则 recorder 里 numpy 会把 (B,) 静默广播进方差列。
+            preds_chunks.append(
+                torch.stack([mu.reshape(-1), log_var.reshape(-1)], dim=-1).detach().cpu().numpy()
+            )
+            labels_chunks.append(
+                torch.stack([labels_mb.reshape(-1), labels_mb.reshape(-1)], dim=-1)
+                .detach().cpu().numpy()
+            )
+        else:
+            total_loss += float(loss_mb.detach().item())
+            mse_k_sum += float(mse_kcat.detach().item())
+            mse_m_sum += float(mse_Km.detach().item())
+            mse_r_sum += float(mse_ratio.detach().item())
+
+            preds_chunks.append(torch.stack([pred_kcat, pred_Km, pred_act], dim=1).detach().cpu().numpy())
+            labels_chunks.append(labels_mb.detach().cpu().numpy())
               
             
     scaler.unscale_(optimizer)
@@ -1510,10 +1591,11 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
     scaler.step(optimizer)
     scaler.update()
 
-    with torch.no_grad():
-        cur = torch.stack([mse_kcat.detach(), mse_Km.detach(), mse_ratio.detach()]).to(device)
-        beta_ema = 0.9
-        model._mse_ema = beta_ema * model._mse_ema + (1.0 - beta_ema) * cur
+    if str(getattr(args, "task", "kinetics")) != "affinity":
+        with torch.no_grad():
+            cur = torch.stack([mse_kcat.detach(), mse_Km.detach(), mse_ratio.detach()]).to(device)
+            beta_ema = 0.9
+            model._mse_ema = beta_ema * model._mse_ema + (1.0 - beta_ema) * cur
         
     if recorder is not None:
         preds_np  = np.concatenate(preds_chunks,  axis=0)  # 可能是 (B,3) or (steps*B,3)（异常）
@@ -1552,7 +1634,8 @@ final_contact_store=None):
     losses = []
     n_batches = len(train_loader)
     n_samples = args.batch_size * n_batches #problem   
-    recorder = PredictionRecorder(n_samples, output_dim=3)
+    n_out = 2 if str(getattr(args, "task", "kinetics")) == "affinity" else 3
+    recorder = PredictionRecorder(n_samples, output_dim=n_out)
     real_model = getattr(model, "module", model)
     use_gate_mask = True
     if ep <= getattr(args, "gate_warmup_epochs", 2):
@@ -1575,6 +1658,7 @@ final_contact_store=None):
             batch,
             optimizer,
             scaler,
+            args=args,
             recorder=recorder,
             lam_l1=0,
             lam_tv=0,
@@ -1760,8 +1844,8 @@ def val_epoch(model, val_loader, ep, args, final_contact_store=None):
                 )
 
             with amp.autocast('cuda'):
-                try:
-                    pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                if str(getattr(args, "task", "kinetics")) == "affinity":
+                    mu, log_var = model(
                         seqs, smiles,
                         prot_struct=p_s, lig_struct=l_s,
                         struct_avail_mask=struct_avail_mask,
@@ -1770,103 +1854,118 @@ def val_epoch(model, val_loader, ep, args, final_contact_store=None):
                         phys_quality=phys_quality,
                         source_ids=source_ids,
                         use_mask=False,
-                        bias_tuple=(0.0, 0.0, 0.0),
-                        caps=s_caps,
                     )
-                except TypeError:
-                    pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
-                        seqs, smiles, use_mask=False,
-                        bias_tuple=(0.0, 0.0, 0.0),
-                        caps=s_caps,
+                    val_loss, _ = compute_affinity_step_loss(
+                        (mu, log_var), labels, args, device
                     )
-                log_pred_kcat = pred_kcat
-                log_pred_Km   = pred_Km
-                log_labels    = labels
-
-                mask_k = torch.isfinite(log_labels[:, 0])
-                mask_m = torch.isfinite(log_labels[:, 1])
-
-                pred_act  = pred_kcat - pred_Km + 3.0
-                mask_r = torch.isfinite(log_labels[:, 2]) & mask_k & mask_m
-
-                huber_k = torch.zeros_like(log_pred_kcat)
-                huber_m = torch.zeros_like(log_pred_Km)
-                huber_r = torch.zeros_like(pred_act)
-                if mask_k.any():
-                    huber_k[mask_k] = F.smooth_l1_loss(log_pred_kcat[mask_k], log_labels[mask_k, 0], beta=beta, reduction='none').to(huber_k.dtype)
-                if mask_m.any():
-                    huber_m[mask_m] = F.smooth_l1_loss(log_pred_Km[mask_m], log_labels[mask_m, 1], beta=beta, reduction='none').to(huber_m.dtype)
-                if mask_r.any():
-                    huber_r[mask_r] = F.smooth_l1_loss(pred_act[mask_r], log_labels[mask_r, 2], beta=beta, reduction='none').to(huber_r.dtype)
-
-                mse_kcat = _safe_masked_mean(huber_k, mask_k, device=device, dtype=pred_kcat.dtype)
-                mse_Km = _safe_masked_mean(huber_m, mask_m, device=device, dtype=pred_kcat.dtype)
-                mse_ratio = _safe_masked_mean(huber_r, mask_r, device=device, dtype=pred_kcat.dtype)
-
-                (s_k_raw, s_m_raw, s_r_raw) = s_raw
-                (s_k_eff, s_m_eff, s_r_eff) = s_eff
-
-                task_terms = []
-                if mask_k.any():
-                    task_terms.append(_to_scalar_tensor(torch.exp(-s_k_eff) * mse_kcat + s_k_eff))
-                if mask_m.any():
-                    task_terms.append(_to_scalar_tensor(torch.exp(-s_m_eff) * mse_Km + s_m_eff))
-                if mask_r.any():
-                    task_terms.append(_to_scalar_tensor(torch.exp(-s_r_eff) * mse_ratio + s_r_eff))
-                if task_terms:
-                    loss_tasks = sum(task_terms) / float(len(task_terms))
                 else:
-                    loss_tasks = torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    try:
+                        pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                            seqs, smiles,
+                            prot_struct=p_s, lig_struct=l_s,
+                            struct_avail_mask=struct_avail_mask,
+                            phys_feat=phys_feat,
+                            phys_mask=phys_mask,
+                            phys_quality=phys_quality,
+                            source_ids=source_ids,
+                            use_mask=False,
+                            bias_tuple=(0.0, 0.0, 0.0),
+                            caps=s_caps,
+                        )
+                    except TypeError:
+                        pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
+                            seqs, smiles, use_mask=False,
+                            bias_tuple=(0.0, 0.0, 0.0),
+                            caps=s_caps,
+                        )
+                    log_pred_kcat = pred_kcat
+                    log_pred_Km   = pred_Km
+                    log_labels    = labels
 
-                cap_penalty = 1e-3 * (
-                    F.relu(s_k_raw - s_cap_k)**2 +
-                    F.relu(s_m_raw - s_cap_m)**2 +
-                    F.relu(s_r_raw - s_cap_r)**2
-                )
-                cap_penalty = _to_scalar_tensor(cap_penalty)
+                    mask_k = torch.isfinite(log_labels[:, 0])
+                    mask_m = torch.isfinite(log_labels[:, 1])
 
-                with amp.autocast('cuda', enabled=False):
-                    s_reg = (5e-3) * ((s_k_raw.float() - 0.2)**2 + (s_r_raw.float() - 0.2)**2) \
-                          + (7e-3) * ((s_m_raw.float() + 0.2)**2)
-                s_reg = _to_scalar_tensor(s_reg)
-                    
-                cap_penalty_sum += float(cap_penalty.detach().item()) * bs
-                s_reg_sum       += float(s_reg.detach().item())       * bs
+                    pred_act  = pred_kcat - pred_Km + 3.0
+                    mask_r = torch.isfinite(log_labels[:, 2]) & mask_k & mask_m
 
-                mse_k_sum += float(mse_kcat.detach().item())  * bs
-                mse_m_sum += float(mse_Km.detach().item())    * bs
-                mse_r_sum += float(mse_ratio.detach().item()) * bs
+                    huber_k = torch.zeros_like(log_pred_kcat)
+                    huber_m = torch.zeros_like(log_pred_Km)
+                    huber_r = torch.zeros_like(pred_act)
+                    if mask_k.any():
+                        huber_k[mask_k] = F.smooth_l1_loss(log_pred_kcat[mask_k], log_labels[mask_k, 0], beta=beta, reduction='none').to(huber_k.dtype)
+                    if mask_m.any():
+                        huber_m[mask_m] = F.smooth_l1_loss(log_pred_Km[mask_m], log_labels[mask_m, 1], beta=beta, reduction='none').to(huber_m.dtype)
+                    if mask_r.any():
+                        huber_r[mask_r] = F.smooth_l1_loss(pred_act[mask_r], log_labels[mask_r, 2], beta=beta, reduction='none').to(huber_r.dtype)
 
-                s_k_raw_sum += float(s_k_raw.detach().mean().item()) * bs
-                s_m_raw_sum += float(s_m_raw.detach().mean().item()) * bs
-                s_r_raw_sum += float(s_r_raw.detach().mean().item()) * bs
+                    mse_kcat = _safe_masked_mean(huber_k, mask_k, device=device, dtype=pred_kcat.dtype)
+                    mse_Km = _safe_masked_mean(huber_m, mask_m, device=device, dtype=pred_kcat.dtype)
+                    mse_ratio = _safe_masked_mean(huber_r, mask_r, device=device, dtype=pred_kcat.dtype)
 
-                s_k_eff_sum += float(s_k_eff.detach().mean().item()) * bs
-                s_m_eff_sum += float(s_m_eff.detach().mean().item()) * bs
-                s_r_eff_sum += float(s_r_eff.detach().mean().item()) * bs
-            
-                l1 = gate_e.abs().mean() + gate_s.abs().mean()
-                tv = (gate_e[:, 1:] - gate_e[:, :-1]).abs().mean() + (gate_s[:, 1:] - gate_s[:, :-1]).abs().mean()
+                    (s_k_raw, s_m_raw, s_r_raw) = s_raw
+                    (s_k_eff, s_m_eff, s_r_eff) = s_eff
 
-                real_model = getattr(model, "module", model)
-                gate_struct = getattr(real_model, "last_gate_struct", None)
-                avail_struct = getattr(real_model, "last_struct_avail", None)
-                if gate_struct is None:
-                    gate_struct = torch.zeros(bs, device=device, dtype=pred_kcat.dtype)
-                if avail_struct is None:
-                    avail_struct = struct_avail_mask
-                else:
-                    avail_struct = avail_struct.to(device=device, dtype=pred_kcat.dtype)
+                    task_terms = []
+                    if mask_k.any():
+                        task_terms.append(_to_scalar_tensor(torch.exp(-s_k_eff) * mse_kcat + s_k_eff))
+                    if mask_m.any():
+                        task_terms.append(_to_scalar_tensor(torch.exp(-s_m_eff) * mse_Km + s_m_eff))
+                    if mask_r.any():
+                        task_terms.append(_to_scalar_tensor(torch.exp(-s_r_eff) * mse_ratio + s_r_eff))
+                    if task_terms:
+                        loss_tasks = sum(task_terms) / float(len(task_terms))
+                    else:
+                        loss_tasks = torch.zeros((), device=device, dtype=pred_kcat.dtype)
 
-                off_mask = avail_struct <= 0.5
-                on_mask = avail_struct > 0.5
-                l_gate_off = gate_struct[off_mask].pow(2).mean() if off_mask.any() else torch.zeros((), device=device, dtype=pred_kcat.dtype)
-                l_gate_on = torch.relu(float(getattr(args, "gate_on_margin", 0.2)) - gate_struct[on_mask]).mean() if on_mask.any() else torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    cap_penalty = 1e-3 * (
+                        F.relu(s_k_raw - s_cap_k)**2 +
+                        F.relu(s_m_raw - s_cap_m)**2 +
+                        F.relu(s_r_raw - s_cap_r)**2
+                    )
+                    cap_penalty = _to_scalar_tensor(cap_penalty)
 
-                val_loss = (loss_tasks + cap_penalty + s_reg.to(loss_tasks.dtype)
-                            + lam_l1 * l1 + lam_tv * tv
-                            + float(getattr(args, "lambda_gate_off", 0.0)) * l_gate_off
-                            + float(getattr(args, "lambda_gate_on", 0.0)) * l_gate_on)
+                    with amp.autocast('cuda', enabled=False):
+                        s_reg = (5e-3) * ((s_k_raw.float() - 0.2)**2 + (s_r_raw.float() - 0.2)**2) \
+                              + (7e-3) * ((s_m_raw.float() + 0.2)**2)
+                    s_reg = _to_scalar_tensor(s_reg)
+
+                    cap_penalty_sum += float(cap_penalty.detach().item()) * bs
+                    s_reg_sum       += float(s_reg.detach().item())       * bs
+
+                    mse_k_sum += float(mse_kcat.detach().item())  * bs
+                    mse_m_sum += float(mse_Km.detach().item())    * bs
+                    mse_r_sum += float(mse_ratio.detach().item()) * bs
+
+                    s_k_raw_sum += float(s_k_raw.detach().mean().item()) * bs
+                    s_m_raw_sum += float(s_m_raw.detach().mean().item()) * bs
+                    s_r_raw_sum += float(s_r_raw.detach().mean().item()) * bs
+
+                    s_k_eff_sum += float(s_k_eff.detach().mean().item()) * bs
+                    s_m_eff_sum += float(s_m_eff.detach().mean().item()) * bs
+                    s_r_eff_sum += float(s_r_eff.detach().mean().item()) * bs
+
+                    l1 = gate_e.abs().mean() + gate_s.abs().mean()
+                    tv = (gate_e[:, 1:] - gate_e[:, :-1]).abs().mean() + (gate_s[:, 1:] - gate_s[:, :-1]).abs().mean()
+
+                    real_model = getattr(model, "module", model)
+                    gate_struct = getattr(real_model, "last_gate_struct", None)
+                    avail_struct = getattr(real_model, "last_struct_avail", None)
+                    if gate_struct is None:
+                        gate_struct = torch.zeros(bs, device=device, dtype=pred_kcat.dtype)
+                    if avail_struct is None:
+                        avail_struct = struct_avail_mask
+                    else:
+                        avail_struct = avail_struct.to(device=device, dtype=pred_kcat.dtype)
+
+                    off_mask = avail_struct <= 0.5
+                    on_mask = avail_struct > 0.5
+                    l_gate_off = gate_struct[off_mask].pow(2).mean() if off_mask.any() else torch.zeros((), device=device, dtype=pred_kcat.dtype)
+                    l_gate_on = torch.relu(float(getattr(args, "gate_on_margin", 0.2)) - gate_struct[on_mask]).mean() if on_mask.any() else torch.zeros((), device=device, dtype=pred_kcat.dtype)
+
+                    val_loss = (loss_tasks + cap_penalty + s_reg.to(loss_tasks.dtype)
+                                + lam_l1 * l1 + lam_tv * tv
+                                + float(getattr(args, "lambda_gate_off", 0.0)) * l_gate_off
+                                + float(getattr(args, "lambda_gate_on", 0.0)) * l_gate_on)
 
             total_loss_sum += float(val_loss.item()) * bs
             total_samples  += bs
@@ -2970,8 +3069,8 @@ def main():
 
                 source_ids_eval = to_source_tensor(source_ids, labels.size(0), device=device)
 
-                try:
-                    p1, p2, p3_tmp, gate_e, gate_s, s_raw, s_eff = real_model(
+                if str(getattr(args, "task", "kinetics")) == "affinity":
+                    mu, log_var = real_model(
                         seqs, smiles,
                         prot_struct=p_s,
                         lig_struct=l_s,
@@ -2980,9 +3079,20 @@ def main():
                         phys_mask=phys_mask,
                         phys_quality=phys_quality,
                         source_ids=source_ids_eval,
-                        use_mask=False
+                        use_mask=False,
                     )
-                except TypeError:
+                    mu_flat = mu.reshape(-1)
+                    log_var_flat = log_var.reshape(-1).clamp(-20.0, 20.0)
+                    y_true.append(labels.detach().cpu().numpy().reshape(-1, 1))
+                    y_pred.append(
+                        torch.stack([mu_flat, log_var_flat], dim=-1).detach().cpu().numpy()
+                    )
+                    y_source.append(source_ids_eval.detach().cpu().numpy().reshape(-1))
+                    y_struct_avail.append(struct_avail_mask.detach().cpu().numpy().reshape(-1))
+                    sigma_pred.append(
+                        torch.exp(0.5 * log_var_flat).detach().cpu().numpy().reshape(-1, 1)
+                    )
+                else:
                     try:
                         p1, p2, p3_tmp, gate_e, gate_s, s_raw, s_eff = real_model(
                             seqs, smiles,
@@ -2992,41 +3102,54 @@ def main():
                             phys_feat=phys_feat,
                             phys_mask=phys_mask,
                             phys_quality=phys_quality,
-                            use_mask=False,
+                            source_ids=source_ids_eval,
+                            use_mask=False
                         )
                     except TypeError:
-                        p1, p2, p3_tmp, gate_e, gate_s, s_raw, s_eff = real_model(
-                            seqs, smiles, use_mask=False
-                        )
-                p3 = p1 - p2 + 3.0  # 派生 ratio
+                        try:
+                            p1, p2, p3_tmp, gate_e, gate_s, s_raw, s_eff = real_model(
+                                seqs, smiles,
+                                prot_struct=p_s,
+                                lig_struct=l_s,
+                                struct_avail_mask=struct_avail_mask,
+                                phys_feat=phys_feat,
+                                phys_mask=phys_mask,
+                                phys_quality=phys_quality,
+                                use_mask=False,
+                            )
+                        except TypeError:
+                            p1, p2, p3_tmp, gate_e, gate_s, s_raw, s_eff = real_model(
+                                seqs, smiles, use_mask=False
+                            )
+                    p3 = p1 - p2 + 3.0  # 派生 ratio
 
-                preds = torch.stack([p1, p2, p3], dim=-1).cpu().numpy()
-                y_true.append(labels.cpu().numpy())
-                y_pred.append(preds)
-                y_source.append(source_ids_eval.detach().cpu().numpy().reshape(-1))
-                y_struct_avail.append(struct_avail_mask.detach().cpu().numpy().reshape(-1))
+                    preds = torch.stack([p1, p2, p3], dim=-1).cpu().numpy()
+                    y_true.append(labels.cpu().numpy())
+                    y_pred.append(preds)
+                    y_source.append(source_ids_eval.detach().cpu().numpy().reshape(-1))
+                    y_struct_avail.append(struct_avail_mask.detach().cpu().numpy().reshape(-1))
 
-                s_k_eff, s_m_eff, s_r_eff = s_eff
+                    s_k_eff, s_m_eff, s_r_eff = s_eff
 
-                def _expand_s(x, bsz):
-                    if isinstance(x, torch.Tensor):
-                        t = x.detach().to(device=labels.device, dtype=labels.dtype).reshape(-1)
-                    else:
-                        t = torch.as_tensor(x, device=labels.device, dtype=labels.dtype).reshape(-1)
-                    if t.numel() == 1:
-                        t = t.expand(bsz)
-                    return t
+                    def _expand_s(x, bsz):
+                        if isinstance(x, torch.Tensor):
+                            t = x.detach().to(device=labels.device, dtype=labels.dtype).reshape(-1)
+                        else:
+                            t = torch.as_tensor(x, device=labels.device, dtype=labels.dtype).reshape(-1)
+                        if t.numel() == 1:
+                            t = t.expand(bsz)
+                        return t
 
-                bsz = labels.size(0)
-                sk = _expand_s(s_k_eff, bsz)
-                sm = _expand_s(s_m_eff, bsz)
-                sr = _expand_s(s_r_eff, bsz)
-                sig = torch.stack([
-                    torch.exp(0.5 * sk),
-                    torch.exp(0.5 * sm),
-                    torch.exp(0.5 * sr),
-                ], dim=-1).cpu().numpy()
-                sigma_pred.append(sig)
+                    bsz = labels.size(0)
+                    sk = _expand_s(s_k_eff, bsz)
+                    sm = _expand_s(s_m_eff, bsz)
+                    sr = _expand_s(s_r_eff, bsz)
+                    sig = torch.stack([
+                        torch.exp(0.5 * sk),
+                        torch.exp(0.5 * sm),
+                        torch.exp(0.5 * sr),
+                    ], dim=-1).cpu().numpy()
+                    sigma_pred.append(sig)
 
         y_true = np.concatenate(y_true, axis=0)  # (N, 3)
         y_pred = np.concatenate(y_pred, axis=0)  # (N, 3)
@@ -3056,36 +3179,51 @@ def main():
             sigma_out[valid] = sigma_col[valid] * T_opt
             return sigma_out
 
-        sigma_calibrated = sigma_pred.copy()
-        for _ti in range(sigma_pred.shape[1]):
-            sigma_calibrated[:, _ti] = _temperature_scale_sigma(
-                y_true[:, _ti], y_pred[:, _ti], sigma_pred[:, _ti]
+        if str(getattr(args, "task", "kinetics")) == "affinity":
+            # 亲和力通路不做温度标定：sigma 由 log_var 直接得到（见上面的收集处）。
+            # R37：指标读 preds[:, 0] / labels[:, 0]，sigma 来自 preds[:, 1]。
+            sigma_calibrated = sigma_pred
+            fold_metrics = _compute_affinity_metrics(
+                y_true[:, 0], y_pred[:, 0], sigma_calibrated[:, 0]
             )
+            unique_sources = sorted({str(x) for x in y_source.tolist()})
+            fold_metrics["by_source"] = {}
+            for src in unique_sources:
+                m = (y_source.astype(str) == src)
+                fold_metrics["by_source"][src] = _compute_affinity_metrics(
+                    y_true[m, 0], y_pred[m, 0], sigma_calibrated[m, 0]
+                )
+        else:
+            sigma_calibrated = sigma_pred.copy()
+            for _ti in range(sigma_pred.shape[1]):
+                sigma_calibrated[:, _ti] = _temperature_scale_sigma(
+                    y_true[:, _ti], y_pred[:, _ti], sigma_pred[:, _ti]
+                )
 
-        fold_metrics = {}
-        task_names = ["kcat", "Km", "kcat/Km"]
-        for i, name in enumerate(task_names):
-            fold_metrics.update(_compute_task_metrics_with_sigma(y_true[:, i], y_pred[:, i], sigma_calibrated[:, i], name))
-        _add_macro_metrics(fold_metrics, task_names)
-
-        unique_sources = sorted({str(x) for x in y_source.tolist()})
-        fold_metrics["by_source"] = {}
-        for src in unique_sources:
-            m = (y_source.astype(str) == src)
-            src_metrics = {}
+            fold_metrics = {}
+            task_names = ["kcat", "Km", "kcat/Km"]
             for i, name in enumerate(task_names):
-                src_metrics.update(_compute_task_metrics_with_sigma(y_true[m, i], y_pred[m, i], sigma_calibrated[m, i], name))
-            _add_macro_metrics(src_metrics, task_names)
-            fold_metrics["by_source"][src] = src_metrics
+                fold_metrics.update(_compute_task_metrics_with_sigma(y_true[:, i], y_pred[:, i], sigma_calibrated[:, i], name))
+            _add_macro_metrics(fold_metrics, task_names)
 
-        if is_main_process():
-            swanlab_log = {}
-            for name in task_names:
-                for key in ["mse", "rmse", "mae", "r2", "pearson_r", "spearman_r", "nll", "cov90", "cov95"]:
-                    k = f"{name}_{key}"
-                    if k in fold_metrics:
-                        swanlab_log[k] = fold_metrics[k]
-            swanlab.log(swanlab_log)
+            unique_sources = sorted({str(x) for x in y_source.tolist()})
+            fold_metrics["by_source"] = {}
+            for src in unique_sources:
+                m = (y_source.astype(str) == src)
+                src_metrics = {}
+                for i, name in enumerate(task_names):
+                    src_metrics.update(_compute_task_metrics_with_sigma(y_true[m, i], y_pred[m, i], sigma_calibrated[m, i], name))
+                _add_macro_metrics(src_metrics, task_names)
+                fold_metrics["by_source"][src] = src_metrics
+
+            if is_main_process():
+                swanlab_log = {}
+                for name in task_names:
+                    for key in ["mse", "rmse", "mae", "r2", "pearson_r", "spearman_r", "nll", "cov90", "cov95"]:
+                        k = f"{name}_{key}"
+                        if k in fold_metrics:
+                            swanlab_log[k] = fold_metrics[k]
+                swanlab.log(swanlab_log)
 
         np.savez_compressed(
             os.path.join(run_dir, "test_predictions.npz"),
@@ -3100,7 +3238,7 @@ def main():
         struct_sub_mask = (y_struct_avail > 0.5)
         n_struct_sub = int(struct_sub_mask.sum())
         print(f"[STRUCT-SUBSET] struct-available rows: {n_struct_sub} / {y_struct_avail.shape[0]}")
-        if n_struct_sub > 0:
+        if (str(getattr(args, "task", "kinetics")) != "affinity") and (n_struct_sub > 0):
             yt_sub = y_true[struct_sub_mask]
             yp_sub = y_pred[struct_sub_mask]
             sg_raw_sub = sigma_pred[struct_sub_mask]
