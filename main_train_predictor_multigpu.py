@@ -344,8 +344,24 @@ def _add_macro_metrics(metric_dict, task_names):
                 vals.append(float(v))
         metric_dict[f"macro_{k}"] = float(np.mean(vals)) if vals else float("nan")
 
-def _compute_affinity_metrics(y_true, y_pred, sigma=None):
-    """亲和力任务指标：MAE / RMSE / Pearson / Spearman / R2，可选 NLL。"""
+def _compute_affinity_metrics(y_true, y_pred, std=None):
+    """亲和力任务指标：MAE / RMSE / Pearson / Spearman / R2，可选 NLL。
+
+    R44 —— 第三个参数是**标准差** σ，不是方差：调用方传的是
+    `exp(0.5 * log_var)`（见 main() 里 sigma_pred 的收集处）。高斯 NLL 因此写成
+
+        0.5 * (log(2π) + 2·log σ + err² / σ²)
+
+    与 kinetics 的 `_compute_task_metrics_with_sigma` 是同一个公式（只是项的顺序不同，
+    那里 sigma 也是 σ，且带 cov90/cov95）。
+    训练用的 NLL（models/affinity_loss.py:86，log_var 是 log-方差）为
+    `0.5 * (log_var + err²·exp(-log_var))`，与上式只差常数 0.5·log(2π)。
+
+    早先这里把 σ 当方差写成 `0.5 * (log(2π·σ) + err²/σ)`，记录出来的 nll 因此
+    不是模型训练的那个量（对 σ≠1 会系统性偏移）。测试
+    `test_compute_affinity_metrics_nll_uses_standard_deviation` 用
+    (mu, log_var, y) = (1.0, ln 4, 3.0) 把这个口径钉在数字 2.112085713764618 上。
+    """
     y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
@@ -366,16 +382,16 @@ def _compute_affinity_metrics(y_true, y_pred, sigma=None):
     metrics["r2"] = float(1.0 - ((y_true - y_pred) ** 2).sum() / denominator) \
         if denominator > 1e-12 else float("nan")
 
-    if sigma is not None:
-        sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)[valid]
+    if std is not None:
+        std = np.asarray(std, dtype=np.float64).reshape(-1)[valid]
         # 与 kinetics 的 _compute_task_metrics_with_sigma 同口径：非有限 / 非正的 sigma
         # 直接剔除，否则一个 NaN sigma 会把整个 NLL 变成 NaN。
-        sigma_valid = np.isfinite(sigma) & (sigma > 0)
-        if sigma_valid.any():
-            sigma_v = np.maximum(sigma[sigma_valid], 1e-8)
-            err_v = y_true[sigma_valid] - y_pred[sigma_valid]
+        std_valid = np.isfinite(std) & (std > 0)
+        if std_valid.any():
+            std_v = np.maximum(std[std_valid], 1e-8)
+            err_v = y_true[std_valid] - y_pred[std_valid]
             metrics["nll"] = float(
-                0.5 * (np.log(2 * np.pi * sigma_v) + err_v ** 2 / sigma_v).mean()
+                0.5 * (np.log(2 * np.pi) + 2.0 * np.log(std_v) + err_v ** 2 / (std_v ** 2)).mean()
             )
         else:
             metrics["nll"] = float("nan")
@@ -1154,6 +1170,27 @@ def get_scheduler_with_warmup(optimizer, num_warmup_steps, num_training_steps, m
 
 
 
+def should_step(step_index: int, iters_to_accumulate: int, steps_in_epoch: int) -> bool:
+    """是否在本步执行 optimizer.step()。
+
+    窗口末尾与 epoch 最后一步都要 flush，否则尾部梯度被静默丢弃。
+    """
+    accum = max(int(iters_to_accumulate), 1)
+    if accum == 1:
+        return True
+    is_window_end = ((step_index + 1) % accum) == 0
+    is_last_step = (step_index + 1) >= int(steps_in_epoch)
+    return bool(is_window_end or is_last_step)
+
+
+def should_sync_grad(step_index: int, iters_to_accumulate: int,
+                     steps_in_epoch: int, is_ddp: bool) -> bool:
+    """DDP 下在累积窗口内部用 no_sync() 跳过梯度同步。"""
+    if not is_ddp:
+        return True
+    return should_step(step_index, iters_to_accumulate, steps_in_epoch)
+
+
 def train_step(model, batch, optimizer, scaler, recorder=None,
                lam_l1=0, lam_tv=0,
                microbatch_size: int | None = None,
@@ -1184,8 +1221,21 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                kcat_group_dro_mix: float = 1.0,
                args=None,
                loss_log_sink=None,
+               do_step: bool = True,
+               do_sync: bool = True,
                  ):
-    
+    """跑一批（内部可能再切微批）并反传。
+
+    R31 —— 梯度累积的窗口判定不在这里：`t` / `steps` 是**微批**索引，不是
+    optimizer step 的序列。窗口由 train_epoch 按 epoch 级批次数用
+    should_step / should_sync_grad 算好，通过下面两个开关传进来：
+
+    * `do_step=False`：本批是累积窗口内部的一批 —— 不 step，也不清梯度，
+      梯度留到下一批继续叠加（DDP 下配合 `do_sync=False` 的 no_sync()）。
+    * `do_sync=False`：本批不参与 DDP 梯度同步（窗口内部），窗口末尾那一批才同步。
+    * 两者的默认值 True 等价于旧调用方式（每批都 step、每批都同步）。
+    """
+
     model.train()
     seqs, smiles, row_ids, source_ids, p_s, l_s, labels, struct_avail_mask, phys_feat, phys_mask, phys_quality = unpack_batch(batch)
     if isinstance(row_ids, torch.Tensor):
@@ -1234,8 +1284,15 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
     B = labels.size(0)
     mb = microbatch_size or B
     steps = (B + mb - 1) // mb
-    
-    optimizer.zero_grad(set_to_none=True)
+    # R41：两个任务共用同一个累积因子，避免同一个 --iters_to_accumulate 下
+    # affinity / kinetics 的有效学习率不同（旧实现只有 affinity 除以 iters_to_accumulate）。
+    accum = max(int(getattr(args, "iters_to_accumulate", 1)), 1)
+
+    # R31：zero_grad 挪到真正 step 之后（见函数末尾），不在函数开头。
+    # 累积窗口前面几批的梯度必须活到窗口末尾，而窗口最后一批（do_step=True）
+    # 如果在自己的开头清梯度，就会把窗口里已经攒下的梯度一起清掉，累积白做。
+    # 对 iters_to_accumulate=1（默认）而言两种放法等价：每次调用都是
+    # 「进去时干净、出去时干净」，参数更新与旧实现逐位相同。
 
     beta = 1.0
     s_caps   = (0.6, 0.35, 0.4)
@@ -1304,7 +1361,10 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
         
         from contextlib import nullcontext
         is_ddp = dist.is_available() and dist.is_initialized()
-        sync_ctx = (model.no_sync() if (is_ddp and (t + 1) < steps) else nullcontext())
+        # R31：窗口内部（do_sync=False）整批走 no_sync()；窗口末尾那一批再按微批
+        # 边界同步（旧行为：(t+1) < steps 的微批不同步）。
+        needs_sync = (t + 1) >= steps
+        sync_ctx = nullcontext() if ((not is_ddp) or (do_sync and needs_sync)) else model.no_sync()
         
         with sync_ctx:
             with amp.autocast('cuda'):
@@ -1324,7 +1384,6 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                     # 调用方汇总写日志；train_step 的返回形状仍是标量损失。
                     if loss_log_sink is not None:
                         _accumulate_affinity_loss_logs(loss_log_sink, loss_logs)
-                    loss = loss_mb / max(int(getattr(args, "iters_to_accumulate", 1)), 1)
                 else:
                     try:
                         pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
@@ -1581,9 +1640,12 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                         + float(kcat_rank_weight)   * kcat_rank_loss.to(loss_tasks.dtype)
                         + float(kcat_var_reg_weight) * kcat_var_reg.to(loss_tasks.dtype)
                     )
-
-                    loss = loss_mb / steps
             
+            # R41：两个任务在反传点做**同一处**归一：除以（微批数 × 累积窗口）。
+            # / steps 是微批归一化（microbatch_size=None 时 steps=1，保留原语义），
+            # / accum 是累积归一化；accum=1 时本式退化为旧的 `loss_mb / steps`，
+            # 与改动前逐位一致。
+            loss = loss_mb / (steps * accum)
             scaler.scale(loss).backward()
             
         if str(getattr(args, "task", "kinetics")) == "affinity":
@@ -1607,10 +1669,14 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
             labels_chunks.append(labels_mb.detach().cpu().numpy())
               
             
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    scaler.step(optimizer)
-    scaler.update()
+    # R31：窗口内部（do_step=False）不 step、也不清梯度，梯度留给下一批继续叠加；
+    # 真正 step 的那一批结束后才就地清梯度，窗口之间不会互相污染。
+    if do_step:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
     if str(getattr(args, "task", "kinetics")) != "affinity":
         with torch.no_grad():
@@ -1671,10 +1737,17 @@ final_contact_store=None):
     
     progress = tqdm(train_loader, desc=f"Epoch {ep}/{args.epochs}", leave=True)
     
+    # R31：累积窗口在**这一层**判定 —— 每个 batch 一次 train_step，i 就是
+    # optimizer step 的序列；train_step 内部的 t / steps 是微批索引，不能用来
+    # 决定是否 step。窗口末尾与 epoch 最后一批都会 flush（should_step 保证）。
+    iters_to_accumulate = max(int(getattr(args, "iters_to_accumulate", 1)), 1)
+    is_ddp = dist.is_available() and dist.is_initialized()
     
     
     
     for i, batch in enumerate(progress):
+        do_step = should_step(i, iters_to_accumulate, n_batches)
+        do_sync = should_sync_grad(i, iters_to_accumulate, n_batches, is_ddp=is_ddp)
         loss = train_step(
             model,
             batch,
@@ -1683,6 +1756,8 @@ final_contact_store=None):
             args=args,
             loss_log_sink=affinity_loss_logs,
             recorder=recorder,
+            do_step=do_step,
+            do_sync=do_sync,
             lam_l1=0,
             lam_tv=0,
             microbatch_size=None,
@@ -2942,7 +3017,28 @@ def main():
             output_device=local_rank,
             find_unused_parameters=find_unused,
             static_graph=(not find_unused) and (not has_cons),
+            # 6B 骨干每卡一份、没有 buffer 需要跨卡一致：广播 buffer 只拖慢启动。
+            broadcast_buffers=False,
         )
+
+        if is_main_process():
+            real_model = getattr(model, "module", model)
+            groups = {"lora": 0, "proj": 0, "interactions": 0, "head": 0, "other": 0}
+            for name, param in real_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "lora_" in name:
+                    groups["lora"] += param.numel()
+                elif "proj" in name:
+                    groups["proj"] += param.numel()
+                elif "interaction" in name:
+                    groups["interactions"] += param.numel()
+                elif "multi_head" in name:
+                    groups["head"] += param.numel()
+                else:
+                    groups["other"] += param.numel()
+            total = sum(groups.values())
+            print(f"[DDP] trainable params total={total:,} breakdown={groups}")
     
     if is_main_process():
         print("Model set")
@@ -3129,6 +3225,10 @@ def main():
                     y_source.append(source_ids_eval.detach().cpu().numpy().reshape(-1))
                     y_struct_avail.append(struct_avail_mask.detach().cpu().numpy().reshape(-1))
                     sigma_pred.append(
+                        # R44：这里存的是**标准差** σ = exp(0.5·log_var)（log_var 是
+                        # log-方差），与 kinetics 的 sigma_pred 同单位；落盘成
+                        # test_predictions.npz 的 sigma / sigma_raw，也直接喂给
+                        # _compute_affinity_metrics 的 std 参数。
                         torch.exp(0.5 * log_var_flat).detach().cpu().numpy().reshape(-1, 1)
                     )
                 else:
@@ -3221,6 +3321,8 @@ def main():
         if str(getattr(args, "task", "kinetics")) == "affinity":
             # 亲和力通路不做温度标定：sigma 由 log_var 直接得到（见上面的收集处）。
             # R37：指标读 preds[:, 0] / labels[:, 0]，sigma 来自 preds[:, 1]。
+            # R44：传下去的是**标准差** σ（不是方差），_compute_affinity_metrics 的
+            # 第三个参数因此命名为 std。
             sigma_calibrated = sigma_pred
             fold_metrics = _compute_affinity_metrics(
                 y_true[:, 0], y_pred[:, 0], sigma_calibrated[:, 0]

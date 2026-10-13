@@ -125,6 +125,27 @@ def test_config_rejects_affinity_task_without_affinity_head_spec():
         PredictorConfig(task="affinity")
 
 
+def test_config_rejects_affinity_head_spec_without_active_affinity_head():
+    """R43：head_specs 里有 affinity 但 active_heads 停在 kinetics 缺省值时也必须报错。
+
+    MultiHead 按 cfg.active_heads 构建输出，forward 才读 outs_dict["affinity"]。
+    只查 head_specs 会让这个组合通过构造，然后死在裸 KeyError: 'affinity'。
+    """
+    # head_specs 有 affinity、active_heads 用缺省值 —— 正是漏检的那个组合
+    slipped = PredictorConfig(head_specs={"affinity": _small_head(2)})
+    assert slipped.active_heads == ["kcat", "Km", "ratio"]
+
+    with pytest.raises(ValueError, match="affinity"):
+        PredictorConfig(task="affinity", head_specs={"affinity": _small_head(2)})
+
+
+def test_config_for_task_affinity_keeps_spec_and_active_head_in_sync():
+    """R43 的反面：for_task 同时设置 active_heads 与 head_specs，不能被误伤。"""
+    cfg = PredictorConfig.for_task("affinity", **_small_cfg("affinity"))
+    assert cfg.active_heads == ["affinity"]
+    assert set(cfg.head_specs) == {"affinity"}
+
+
 def test_config_allows_partial_head_specs_for_kinetics():
     """R42：head_specs 允许只覆盖部分 head。
 

@@ -91,21 +91,28 @@ class PredictorConfig:
             "ratio": {**default_spec},
         }
 
-        # R40（R42 收紧后）：直接构造 PredictorConfig(task="affinity") 会让 active_heads 与
-        # head_specs 一起停在 kinetics 缺省值上，两者的**相互一致性**检查看不出问题，
-        # forward 直到 multi_head 里 outs_dict["affinity"] 才抛裸 KeyError。所以这里只针对
-        # affinity 任务要求 affinity head 存在。
+        # R40（R42 收紧后、R43 补齐）：直接构造 PredictorConfig(task="affinity") 会让
+        # active_heads 与 head_specs 一起停在 kinetics 缺省值上，两者的**相互一致性**
+        # 检查看不出问题，forward 直到 multi_head 里 outs_dict["affinity"] 才抛裸 KeyError。
+        # 所以这里只针对 affinity 任务要求 affinity head 存在。
+        # R43：必须同时查 head_specs 与 active_heads —— MultiHead 的输出是按
+        # `active_heads` 建的（`heads = self.cfg.active_heads`），forward 读的是
+        # outs_dict["affinity"]。只查 head_specs 会漏掉
+        # `PredictorConfig(task="affinity", head_specs={"affinity": ...})`：
+        # head 有 spec，但 active_heads 缺省成 ["kcat", "Km", "ratio"]，
+        # 构造通过、训练时才死在 KeyError: 'affinity'。
         # 不做「active_heads 里每个 head 都必须有 spec」的通用校验：MultiHead 有意容忍
         # 缺失 spec（`spec = cfg.head_specs.get(name, {})`，回退到 head_hidden_dim /
         # head_depth / dropout），而 main_infer_predictor.py:90-102 会按 checkpoint 里实际
         # 存在的 head 构造**部分** head_specs（只含 kcat 是合法输入），通用校验会误伤它。
-        if task == "affinity" and "affinity" not in self.head_specs:
+        if task == "affinity" and ("affinity" not in self.head_specs
+                                   or "affinity" not in self.active_heads):
             raise ValueError(
-                'task="affinity" 需要 head_specs 里有 "affinity"（out_dim=2）；'
+                'task="affinity" 需要 head_specs 与 active_heads 里都有 "affinity"（out_dim=2）；'
                 f"active_heads={self.active_heads}，"
                 f"head_specs 现有键: {sorted(self.head_specs)}。"
-                "直接构造 PredictorConfig(task=...) 不会自动切换 head_specs，"
-                "请显式传入 head_specs，或改用 PredictorConfig.for_task(...)。"
+                "直接构造 PredictorConfig(task=...) 不会自动切换 head_specs / active_heads，"
+                "请显式传入两者，或改用 PredictorConfig.for_task(...)。"
             )
 
         self.share_fusion = share_fusion
