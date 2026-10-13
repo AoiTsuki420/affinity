@@ -74,6 +74,11 @@ class _BackboneEncoder(nn.Module):
         if self.tokenizer is None:
             raise ValueError("缺少 tokenizer：请提供 tokenizer_obj 或可解析的 backbone_name。")
 
+        # 骨干和 proj 一样必须落到 device：旧实现是 backbone_obj.to(device) /
+        # from_pretrained(...).to(device)，漏掉这一步会让 ProteinEncoder(device="cuda")
+        # 把骨干留在 CPU，直到第一次 forward 才炸。两条分支共用这一次赋值。
+        self.backbone = self.backbone.to(device)
+
         self.max_length = int(max_length or self.spec.max_length)
         self.train_backbone = train_backbone
         self._apply_trainability()
@@ -92,7 +97,19 @@ class _BackboneEncoder(nn.Module):
         )
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
 
-        enable_grad = any(p.requires_grad for p in self.backbone.parameters())
+        # 梯度开关只能**收窄**环境上下文，绝不能把它打开：main_infer_ensemble.py:56-62
+        # 注入 LoRA 后从不设 train_backbone=True，所以 any(...) 为真；而它的前向跑在
+        # models/moe_kcat.py:103 的 @torch.no_grad() 里（:111 调 encode_tokens）。
+        # 若这里写成 set_grad_enabled(True)，650M 骨干会在 ensemble 路由时重新建图并
+        # 一直挂在返回的 tokens 上——数值不变，但峰值显存和延迟退化，且静默推翻了
+        # 调用方的意图。
+        # main_train_kcat_expert.py 那条路径不受影响：它在 :128 注入 LoRA 之后设了
+        # train_backbone=True，旧表达式本来就是 True，LoRA 一直在正常训练——这里
+        # 不存在「曾经没训练」的 bug。main kinetics 训练路径与新的 affinity 路径同理，
+        # 环境允许且参数可训练时仍然建图。
+        enable_grad = torch.is_grad_enabled() and any(
+            p.requires_grad for p in self.backbone.parameters()
+        )
         with torch.set_grad_enabled(enable_grad):
             tokens = forward_hidden_states(
                 self.backbone, encoded, output_hidden_states=self.spec.prefer_hidden_states

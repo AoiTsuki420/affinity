@@ -43,6 +43,22 @@ class _FakeBackbone(nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
+class _TrainableFakeBackbone(_FakeBackbone):
+    """带可训练参数的 fake：让「有没有建图」在输出 requires_grad 上可见。
+
+    _FakeBackbone 自身没有参数，光看它无法区分 set_grad_enabled 的真假。
+    """
+
+    def __init__(self, hidden=16, layers=3):
+        super().__init__(hidden=hidden, layers=layers)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, **kwargs):
+        out = super().forward(**kwargs)
+        out.last_hidden_state = out.last_hidden_state * self.scale
+        return out
+
+
 def _spec(kind, hidden, layers, max_length=64):
     return BackboneSpec(
         name="fake", kind=kind, trust_remote_code=False,
@@ -123,6 +139,54 @@ def test_encoders_require_spec_when_backbone_injected():
         ProteinEncoder(d_model=8, device="cpu",
                        backbone_obj=_FakeBackbone(), tokenizer_obj=_FakeTokenizer(),
                        train_backbone=True, spec=None)
+
+
+def test_encoder_moves_backbone_to_device():
+    """R28-fix：骨干必须和 proj 一样被搬到 device。
+
+    旧实现是 backbone_obj.to(device)，重写时漏了这一步：单独构造
+    ProteinEncoder(esm_model=..., device="cuda") 会把骨干留在 CPU，第一次 forward 才炸。
+    这里用 meta device 做 CPU-only 的等价断言。
+    """
+    encoder = ProteinEncoder(
+        d_model=8, device="meta",
+        backbone_obj=_TrainableFakeBackbone(hidden=16),
+        tokenizer_obj=_FakeTokenizer(),
+        train_backbone=True,
+        spec=_spec(KIND_ESM2, 16, 3),
+    )
+    assert encoder.proj.weight.device.type == "meta"
+    assert next(encoder.backbone.parameters()).device.type == "meta"
+
+
+def test_encoder_grad_gate_narrows_but_never_overrides_ambient_context():
+    """R28：编码器只能收窄环境梯度上下文，不能把调用方的 no_grad 顶掉。
+
+    main_infer_ensemble.py:56-62 在注入 LoRA 后从不设 train_backbone=True，所以 gate
+    会是 True；而它的前向跑在 models/moe_kcat.py:103 的 @torch.no_grad() 里
+    （:111 调 encode_tokens）。若这里用 torch.set_grad_enabled(True)，650M 骨干会在
+    ensemble 路由时重新建图：数值一样，但峰值显存与延迟退化，且静默推翻了调用方意图。
+    """
+    encoder = ProteinEncoder(
+        d_model=8, device="cpu",
+        backbone_obj=_TrainableFakeBackbone(hidden=16),
+        tokenizer_obj=_FakeTokenizer(),
+        train_backbone=True,
+        spec=_spec(KIND_ESM2, 16, 3),
+    )
+
+    # 断言必须落在 encode_tokens 的返回值上，不能落在 forward 的输出上：
+    # forward 里的 self.proj(...) 跑在 set_grad_enabled 块**之外**，处于环境上下文，
+    # 会把 no_grad 里的图剥掉，于是 forward 输出永远 requires_grad=False —— 那样断言
+    # 是空的。encode_tokens 才既是被顶掉的那一层，也是 models/moe_kcat.py:111
+    # 在 ensemble 路由里真正调用的那一层。
+    # 反向也要钉住：环境允许 + 参数可训练时必须建图，否则训练路径会被"一律关梯度"骗过。
+    outside, _ = encoder.encode_tokens(["MKTAYIAK"])
+    assert outside.requires_grad is True
+
+    with torch.no_grad():
+        inside, _ = encoder.encode_tokens(["MKTAYIAK"])
+    assert inside.requires_grad is False
 
 
 def test_strip_special_follows_backbone_kind():
