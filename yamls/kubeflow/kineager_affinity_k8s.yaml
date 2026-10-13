@@ -1,0 +1,177 @@
+# KinEAGER PDBbind-v2020 affinity training - Kubeflow PyTorchJob, one GPU per pod.
+#
+# Apply with:   kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml
+#
+# Relationship to the xtrimofold3 reference
+# (xtrimofold3-affinity-plm/yamls/kubeflow/xf3_pl_multitask_k8s.yaml): that file is
+# an argoproj.io/v1alpha1 Workflow which creates this same PyTorchJob as a
+# `resource:` template, embedding the manifest as a string and parameterising it
+# through {{inputs.parameters.*}}. This file is the bare PyTorchJob instead, so it
+# is directly kubectl-apply-able and needs no Argo controller. If your cluster
+# drives training through Argo, wrap this spec the same way the reference does.
+#
+# The pod spec below is written ONCE on the Master (anchor &pytorch-template) and
+# aliased by the Worker, so the two replicas can never drift apart; they differ
+# only in `replicas`.
+#
+# Every <REPLACE_ME ...> must be filled in before applying - none of them is a
+# real image, path or hardware size for this project. They are deliberately not
+# valid Kubernetes quantities/replica counts, so an unedited apply fails loudly
+# instead of silently landing on the wrong hardware.
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: kineager-affinity
+  namespace: default
+spec:
+  runPolicy:
+    # None = keep the pods after the job finishes so `kubectl logs` still works.
+    # The xtrimofold3 reference uses `Running` plus ttlSecondsAfterFinished: 6000.
+    cleanPodPolicy: None
+  # INVARIANT: NNODES (see the env block) == Master.replicas + Worker.replicas.
+  # bin/train/kineager_k8s.sh validates NODE_RANK < NNODES and fails fast if the
+  # two disagree.
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      # OnFailure as in the reference; use Never if you would rather fail fast
+      # than let a rank restart into a rendezvous the other ranks already left.
+      restartPolicy: OnFailure
+      template: &pytorch-template
+        metadata:
+          annotations:
+            # No service-mesh sidecar on the NCCL data path.
+            sidecar.istio.io/inject: 'false'
+          labels:
+            # Carried over from the reference (its storage webhook keys off this
+            # label); drop it if your cluster has no such webhook.
+            file-mount: 'true'
+        spec:
+          hostNetwork: false
+          containers:
+            - name: pytorch
+              image: "<REPLACE_ME: KinEAGER training image reference>"
+              imagePullPolicy: IfNotPresent
+              workingDir: "<REPLACE_ME: KinEAGER repo root inside that image>"
+              command:
+                - /bin/bash
+                - -lc
+              args:
+                - |
+                  set -euo pipefail
+                  : "${MASTER_ADDR:?PyTorchJob did not inject MASTER_ADDR}"
+
+                  # PET_* are injected by the training-operator. The NNODES
+                  # fallback has to be Worker.replicas + 1 (see the env block):
+                  # if neither is present we stop here instead of guessing.
+                  export NNODES="${PET_NNODES:-${NNODES:?PyTorchJob did not inject PET_NNODES - set NNODES = Worker.replicas + 1}}"
+                  export NODE_RANK="${PET_NODE_RANK:-${RANK:?PyTorchJob did not inject RANK}}"
+                  export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+                  export MASTER_PORT="${MASTER_PORT:-29500}"
+                  export NCCL_SOCKET_IFNAME=eth0
+                  export NCCL_IB_DISABLE=0
+                  export NCCL_IB_GID_INDEX=5
+                  export NCCL_DEBUG=INFO
+                  export NCCL_SOCKET_FAMILY=AF_INET
+
+                  # Declared once and called from both branches so the master and
+                  # the workers can never run different hyperparameters.
+                  run_trainer() {
+                    bash bin/train/kineager_k8s.sh \
+                      -epochs "${EPOCHS}" \
+                      -batch_size "${BATCH_SIZE}" \
+                      --split_mode group_pair \
+                      --split_seed 42
+                  }
+
+                  # Only rank 0 appends to the shared log file; the other ranks
+                  # stay on stdout/stderr. A single writer is what keeps the log
+                  # readable (same pattern as the xtrimofold3 launcher).
+                  node_rank="${NODE_RANK}"
+                  if [ "${node_rank}" -eq 0 ]; then
+                    run_trainer >> "${LOG_PATH:?set LOG_PATH to a file on storage all pods can write}" 2>&1
+                  else
+                    run_trainer
+                  fi
+              env:
+                # ---- inputs required by bin/train/kineager_k8s.sh --------------
+                - name: TRAIN_CSV
+                  value: "<REPLACE_ME: PDBbind v2020 affinity CSV, e.g. data/pdbbindv2020_affinity.csv>"
+                - name: KINEAGER_ESMC_PATH
+                  value: "<REPLACE_ME: local ESMC-6B directory visible inside the pod>"
+                - name: KINEAGER_MOLFORMER_PATH
+                  value: "<REPLACE_ME: local MoLFormer snapshot directory visible inside the pod>"
+                - name: LOG_PATH
+                  value: "<REPLACE_ME: rank-0 log file, e.g. /shared/runs/kineager_affinity/rank0.log>"
+                # Only consulted when the operator does not inject PET_NNODES.
+                - name: NNODES
+                  value: "<REPLACE_ME: Worker.replicas + 1>"
+                # ---- task and hyperparameters, passed through "$@" ------------
+                # EPOCHS / BATCH_SIZE are the plan's runbook values; tune freely.
+                # The launcher additionally honours LORA_LAYER_POLICY,
+                # LORA_LAST_K and the NCCL_* / OMP_NUM_THREADS overrides listed
+                # at the top of bin/train/kineager_k8s.sh - add them here if you
+                # need to change them per run.
+                - name: TASK
+                  value: "affinity"
+                - name: EPOCHS
+                  value: "30"
+                - name: BATCH_SIZE
+                  value: "8"
+                - name: ITERS_TO_ACCUMULATE
+                  value: "1"
+                - name: NUM_WORKERS
+                  value: "8"
+                - name: GRAD_CHECKPOINT_BACKBONE
+                  value: "off"
+              # A port named pytorchjob-port is how the training-operator derives
+              # MASTER_PORT for the rendezvous; keep it in sync with MASTER_PORT.
+              ports:
+                - name: pytorchjob-port
+                  containerPort: 11451
+                  protocol: TCP
+              securityContext:
+                # RDMA / NCCL needs locked memory; both come from the reference.
+                privileged: true
+                capabilities:
+                  add:
+                    - IPC_LOCK
+              resources:
+                requests:
+                  nvidia.com/gpu: 1
+                  # The reference asks for rdma/hca: "501" on its cluster.
+                  rdma/hca: "<REPLACE_ME: RDMA resource name/count your nodes expose>"
+                  cpu: "<REPLACE_ME: e.g. 16>"
+                  memory: "<REPLACE_ME: e.g. 200Gi>"
+                limits:
+                  nvidia.com/gpu: 1
+                  rdma/hca: "<REPLACE_ME: RDMA resource name/count your nodes expose>"
+                  cpu: "<REPLACE_ME: e.g. 16>"
+                  memory: "<REPLACE_ME: e.g. 200Gi>"
+              volumeMounts:
+                - name: shm-volume
+                  mountPath: /dev/shm
+          nodeSelector:
+            # Node labels copied from the xtrimofold3 reference; replace the
+            # values if your A100 / RoCE nodes are labelled differently.
+            gpu.device: a100
+            rdma: roce2
+          tolerations:
+            # Taints of the GPU partitions used by the reference run.
+            - effect: NoSchedule
+              key: role
+              operator: Equal
+              value: NBTopic
+            - effect: NoSchedule
+              key: role
+              operator: Equal
+              value: 006_mix
+          volumes:
+            - name: shm-volume
+              emptyDir:
+                medium: Memory
+                sizeLimit: "<REPLACE_ME: /dev/shm size, e.g. 64Gi>"
+    Worker:
+      replicas: "<REPLACE_ME: NNODES - 1>"
+      restartPolicy: OnFailure
+      template: *pytorch-template
