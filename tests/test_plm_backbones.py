@@ -453,3 +453,131 @@ def test_load_esmc_without_esm_package_raises_install_hint(monkeypatch):
     cause = excinfo.value.__cause__
     assert isinstance(cause, ImportError), cause
     assert getattr(cause, "name", None) == "esm", cause
+
+
+import warnings
+
+
+def test_build_token_mask_ignores_special_ids_in_padding():
+    """padding 里的 pad_token_id 不能计入特殊 token 诊断。
+
+    真实批次会把 50..400 长度的序列 pad 到 400，padding 位全是 pad_token_id；
+    整行统计的中位数会是几百，于是每个正常批次都误报"特殊 token 集合可能不完整"。
+    simplefilter("error") 让任何这类误报直接变成测试失败。
+    """
+
+    class _PaddedTokenizer:
+        all_special_ids = [0, 2]
+        pad_token_id = 0
+
+    inputs = {
+        "input_ids": torch.tensor([
+            [0, 5, 6, 7, 2, 0, 0, 0],
+            [0, 8, 2, 0, 0, 0, 0, 0],
+        ]),
+        "attention_mask": torch.tensor([
+            [1, 1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0, 0],
+        ]),
+    }
+    # 整行统计得到 [5, 7]（中位数 6，会误报）；只看非 padding 位则是 [2, 2]（中位数 2）。
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mask = build_token_mask(_PaddedTokenizer(), inputs)
+
+    assert mask.tolist() == [
+        [False, True, True, True, False, False, False, False],
+        [False, True, False, False, False, False, False, False],
+    ]
+
+
+from models import plm_backbones
+
+
+def test_load_resolves_config_when_model_has_no_config(monkeypatch):
+    """trust_remote_code=True 时 hub shim 可能返回 esm 自己的对象（普通 nn.Module，无 .config）。
+
+    此时必须像 tools/probe_backbone_modules.py 那样回退到 AutoConfig.from_pretrained，
+    而不是让 model.config 抛 AttributeError。
+    """
+    import transformers
+
+    class _NoConfig(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Module()
+            self.encoder.layer = torch.nn.ModuleList([torch.nn.Identity()] * 5)
+
+    def _fake_loader(name, **kwargs):
+        return _NoConfig(), object(), True
+
+    config_calls = []
+
+    def _fake_from_pretrained(cls, name, **kwargs):
+        config_calls.append((name, kwargs))
+        return SimpleNamespace(embedding_dim=2560)  # 不带层数字段，逼出结构回退
+
+    monkeypatch.setitem(plm_backbones._LOADERS, KIND_ESMC, _fake_loader)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", classmethod(_fake_from_pretrained)
+    )
+
+    model, _tokenizer, spec = plm_backbones.load_protein_backbone(
+        "biohub/ESMC-6B", max_length=512
+    )
+
+    assert isinstance(model, _NoConfig)
+    assert config_calls == [("biohub/ESMC-6B", {"trust_remote_code": True})]
+    assert spec.hidden_size == 2560  # 来自 AutoConfig 兜底
+    assert spec.num_layers == 5  # 来自模型结构的回退分支
+    assert spec.kind == KIND_ESMC
+    assert spec.max_length == 512
+    assert spec.prefer_hidden_states is True
+
+
+def test_load_threads_revision_and_trust_remote_code_to_tokenizer(monkeypatch):
+    """MoLFormer 权重被钉在固定 revision（spec §4 约束 4），tokenizer 必须同 revision。
+
+    同时校验 tokenizer 用的是调用方解析出的 trust_remote_code，而不是硬编码 True。
+    """
+    import transformers
+
+    revision = "7b12d946c181a37f6012b9dc3b002275de070314"
+    tokenizer_calls = []
+    model_calls = []
+
+    class _FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            tokenizer_calls.append((name, kwargs))
+            return cls()
+
+    class _FakeModel:
+        config = SimpleNamespace(hidden_size=768, num_hidden_layers=12)
+
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            model_calls.append((name, kwargs))
+            return cls()
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", _FakeTokenizer.from_pretrained
+    )
+    monkeypatch.setattr(transformers.AutoModel, "from_pretrained", _FakeModel.from_pretrained)
+
+    name = "ibm-research/MoLFormer-XL-both-10pct"
+    _model, _tokenizer, spec = plm_backbones.load_ligand_backbone(name, revision=revision)
+
+    # 默认 trust_remote_code=True（见 _TRUST_REMOTE_CODE_DEFAULT），权重与 tokenizer 同参同 revision。
+    assert tokenizer_calls == [(name, {"trust_remote_code": True, "revision": revision})]
+    assert model_calls == tokenizer_calls
+    assert spec.kind == KIND_MOLFORMER
+    assert spec.trust_remote_code is True
+
+    # 调用方显式关掉 trust_remote_code 时，tokenizer 不能偷偷改回 True。
+    tokenizer_calls.clear()
+    model_calls.clear()
+    plm_backbones.load_ligand_backbone(name, trust_remote_code=False, revision=revision)
+
+    assert tokenizer_calls == [(name, {"revision": revision})]
+    assert model_calls == tokenizer_calls

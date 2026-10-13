@@ -272,7 +272,9 @@ def _load_molformer(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
     """MoLFormer 是 encoder-only，没有 get_encoder()。"""
     from transformers import AutoModel, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    # tokenizer 与权重共用同一份 kwargs：trust_remote_code 由调用方决定（默认 True），
+    # revision 也必须一致，否则 tokenizer 会解析 main 而与钉住的权重版本漂移。
+    tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
     model = AutoModel.from_pretrained(name, **kwargs)
     return model, tokenizer, False
 
@@ -280,7 +282,7 @@ def _load_molformer(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
 def _load_esm2(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
     from transformers import EsmModel, EsmTokenizer
 
-    tokenizer = EsmTokenizer.from_pretrained(name)
+    tokenizer = EsmTokenizer.from_pretrained(name, **kwargs)
     model = EsmModel.from_pretrained(name, **kwargs)
     return model, tokenizer, False
 
@@ -288,7 +290,7 @@ def _load_esm2(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
 def _load_t5(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
     from transformers import T5EncoderModel, T5Tokenizer
 
-    tokenizer = T5Tokenizer.from_pretrained(name)
+    tokenizer = T5Tokenizer.from_pretrained(name, **kwargs)
     model = T5EncoderModel.from_pretrained(name, **kwargs)
     return model, tokenizer, False
 
@@ -318,13 +320,22 @@ def _load(name: str, *, kind=None, trust_remote_code=None, max_length=None,
 
     model, tokenizer, prefer_hidden_states = _LOADERS[resolved_kind](name, **kwargs)
 
+    # trust_remote_code=True 时 hub shim 可能返回 esm 自己的 ESMC 对象：那是普通 nn.Module，
+    # 没有 .config。此时按 tools/probe_backbone_modules.py 的做法单独取一份 config，
+    # 并把 model 一并交给 resolve_num_layers 走结构回退。
+    config = getattr(model, "config", None)
+    if config is None:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(name, **kwargs)
+
     spec = BackboneSpec(
         name=name,
         kind=resolved_kind,
         trust_remote_code=bool(trust_remote_code),
         max_length=int(max_length or default_max_length(resolved_kind)),
-        hidden_size=resolve_hidden_size(model.config),
-        num_layers=resolve_num_layers(model.config, model),
+        hidden_size=resolve_hidden_size(config),
+        num_layers=resolve_num_layers(config, model),
         prefer_hidden_states=prefer_hidden_states,
     )
     return model, tokenizer, spec
@@ -394,6 +405,11 @@ def build_token_mask(tokenizer, inputs: dict, *, strip_special: bool = True) -> 
     special = torch.zeros_like(ids, dtype=torch.bool)
     for token_id in special_ids:
         special |= (ids == token_id)
+
+    # 只看非 padding 位：padding 位塞满 pad_token_id，若一并计入，正常的 padding 批次
+    # （50..400 补齐到 400）中位数会是几百，于是每个批次都误报，真信号反而被淹没。
+    # 返回的 mask 不受影响：padding 位在 attention_mask 里本来就是 False。
+    special = special & mask
 
     per_row = special.sum(dim=1)
     if per_row.numel() > 0:
