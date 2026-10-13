@@ -1,117 +1,178 @@
+"""蛋白与配体编码器。
+
+骨干的加载、hidden 维度解析、特殊 token 处理全部委托给 models.plm_backbones，
+本模块只负责「骨干输出 → 投影到统一的 d_model」以及冻结/LoRA 参数的可见性策略。
+"""
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 import torch.nn as nn
-from transformers import EsmModel, EsmTokenizer, T5Tokenizer, T5EncoderModel
+
+from .plm_backbones import (
+    KIND_ESMC,
+    BackboneSpec,
+    build_token_mask,
+    forward_hidden_states,
+    load_ligand_backbone,
+    load_protein_backbone,
+)
 
 
-class ProteinEncoder(nn.Module):
-    def __init__(self, esm_model="/root/autodl-tmp/models/esm2_t33_650M_UR50D",
-                 d_model=768, device="cuda",
-                 backbone_obj=None, train_backbone=False,
-                 tokenizer_obj=None):
+def _resolve_backbone_name(backbone_name, legacy_name, legacy_keyword):
+    """把 legacy 关键字（esm_model / molt5_model）折叠进 backbone_name。
+
+    R24：旧的调用点（main_train_kcat_expert.py:112-113、main_infer_ensemble.py:48-49）
+    仍然用 esm_model= / molt5_model= 传名字，而设计 spec §12 禁止修改这两个文件，
+    所以兼容层放在这里。两个名字都给就是调用方的错误，必须显式报出来，
+    不能静默挑一个——静默会让"以为加载了 A、实际加载了 B"变成不可见的 bug。
+    """
+    if backbone_name is not None and legacy_name is not None:
+        raise ValueError(
+            f"backbone_name 与 legacy 别名 {legacy_keyword} 不能同时提供："
+            f"backbone_name={backbone_name!r}, {legacy_keyword}={legacy_name!r}。"
+            f"请只传 backbone_name（新写法），或只传 {legacy_keyword}（legacy 写法）。"
+        )
+    return backbone_name if backbone_name is not None else legacy_name
+
+
+class _BackboneEncoder(nn.Module):
+    """蛋白与配体编码器的共同实现。"""
+
+    def __init__(
+        self,
+        *,
+        backbone_name: str | None,
+        d_model: int,
+        device: str,
+        backbone_obj: nn.Module | None,
+        tokenizer_obj: Any | None,
+        train_backbone: bool,
+        spec: BackboneSpec | None,
+        max_length: int | None,
+        loader,
+    ):
         super().__init__()
         self.device = device
-        try:
-            from transformers import EsmTokenizer
-            self.tokenizer = tokenizer_obj or EsmTokenizer.from_pretrained(esm_model, local_files_only=False)
-        except Exception:
-            from transformers import AutoTokenizer
-            self.tokenizer = tokenizer_obj or AutoTokenizer.from_pretrained(esm_model, local_files_only=False)
 
-        if backbone_obj is not None:
-            self.backbone = backbone_obj.to(device)
-        else:
-            try:
-                from transformers import EsmModel
-                self.backbone = EsmModel.from_pretrained(esm_model, local_files_only=False).to(device)
-            except Exception:
-                from transformers import AutoModel
-                self.backbone = AutoModel.from_pretrained(esm_model, local_files_only=False).to(device)
-
-        self.train_backbone = train_backbone
-        if not self.train_backbone:
-            self.backbone.eval()
-            for p in self.backbone.parameters():
-                p.requires_grad_(False)
-
-        hidden = self.backbone.config.hidden_size
-        self.proj = nn.Linear(hidden, d_model).to(device)
-
-    def encode_tokens(self, seqs):
-        inputs = self.tokenizer(seqs, return_tensors="pt", padding=True,
-                                truncation=True, max_length=640) # 768 
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.set_grad_enabled(self.train_backbone):
-            outputs = self.backbone(**inputs).last_hidden_state  # (B,L,H)
-
-        mask = inputs["attention_mask"].bool()
-        return outputs, mask
-
-    def forward(self, seqs):
-        tok, mask = self.encode_tokens(seqs)
-        tok = self.proj(tok)
-        return tok, mask
-import torch
-import torch.nn as nn
-from transformers import T5Tokenizer, T5EncoderModel
-
-import torch
-import torch.nn as nn
-from transformers import T5Tokenizer, T5EncoderModel
-
-
-class LigandEncoder(nn.Module):
-    def __init__(self, molt5_model="/root/autodl-tmp/models/molt5-base-smiles2caption",
-                 d_model=768, device="cuda",
-                 backbone_obj=None, train_backbone=False,
-                 tokenizer_obj=None):
-        super().__init__()
-        self.device = device
-        from transformers import T5Tokenizer, T5EncoderModel
-
-        self.tokenizer = tokenizer_obj or T5Tokenizer.from_pretrained(molt5_model, local_files_only=False)
-
-        if backbone_obj is not None:
-            self.backbone = backbone_obj.to(device)  # 例如 self.molt5.get_encoder()
-        else:
-            self.backbone = T5EncoderModel.from_pretrained(molt5_model, local_files_only=False).to(device)
-
-        self.train_backbone = train_backbone
-        if not self.train_backbone:
-            for name, p in self.backbone.named_parameters():
-                if "lora_" in name:
-                    p.requires_grad_(True)
-                else:
-                    p.requires_grad_(False)
-
-            has_trainable_lora = any(
-                ("lora_" in n) and p.requires_grad for n, p in self.backbone.named_parameters()
+        if backbone_obj is not None and spec is None:
+            raise ValueError(
+                "注入 backbone_obj 时必须同时提供 spec，"
+                "否则无法确定 hidden 维度与最大长度。"
             )
-            if has_trainable_lora:
-                self.backbone.train()
-            else:
-                self.backbone.eval()
+
+        if backbone_obj is None:
+            self.backbone, self.tokenizer, self.spec = loader(
+                backbone_name, max_length=max_length
+            )
         else:
-            self.backbone.train()
+            self.backbone = backbone_obj
+            self.tokenizer = tokenizer_obj
+            self.spec = spec
 
-        hidden = self.backbone.config.d_model
-        self.proj = nn.Linear(hidden, d_model).to(device)
+        if self.tokenizer is None:
+            raise ValueError("缺少 tokenizer：请提供 tokenizer_obj 或可解析的 backbone_name。")
 
-    def encode_tokens(self, smiles):
-        inputs = self.tokenizer(smiles, return_tensors="pt", padding=True,
-                                truncation=True, max_length=384) # 384
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        self.max_length = int(max_length or self.spec.max_length)
+        self.train_backbone = train_backbone
+        self._apply_trainability()
+        self.proj = nn.Linear(self.spec.hidden_size, d_model).to(device)
+
+    def _apply_trainability(self) -> None:
+        raise NotImplementedError
+
+    def encode_tokens(self, inputs) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.tokenizer(
+            inputs,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+        )
+        encoded = {k: v.to(self.device) for k, v in encoded.items()}
 
         enable_grad = any(p.requires_grad for p in self.backbone.parameters())
         with torch.set_grad_enabled(enable_grad):
-            outputs = self.backbone(**inputs).last_hidden_state
-            
-        outputs = torch.nan_to_num(outputs)
-        mask = inputs["attention_mask"].bool()
-        return outputs, mask
+            tokens = forward_hidden_states(
+                self.backbone, encoded, output_hidden_states=self.spec.prefer_hidden_states
+            )
 
-    def forward(self, smiles):
-        tok, mask = self.encode_tokens(smiles)
-        tok = self.proj(tok.float())
-        tok = torch.nan_to_num(tok)
-        return tok, mask
+        # R25：剥离边界特殊 token 只对 ESMC 成立（spec 约束 7：ESMC 的输出保留 2 个
+        # 特殊 token，不剔除会污染 masked_mean 池化）。ESM-2 / T5 走的旧代码是从
+        # attention_mask 直接取掩码，<cls>/<eos> 是**计入**池化的；这里若无条件剥离，
+        # kinetics 的 masked_mean（models/moe_kcat.py:114-115）就会变，等于改动所有
+        # kinetics 数值。所以由 kind 决定，而不是常量 True。
+        # 也不要把条件放宽到别的 kind：EsmTokenizer.all_special_ids 可能含 <unk>，
+        # 剥离未知残基位会丢掉真实信号。
+        mask = build_token_mask(
+            self.tokenizer, encoded, strip_special=(self.spec.kind == KIND_ESMC)
+        )
+        return tokens, mask
+
+    def forward(self, inputs):
+        tokens, mask = self.encode_tokens(inputs)
+        tokens = self.proj(tokens.float())
+        return torch.nan_to_num(tokens), mask
+
+
+class ProteinEncoder(_BackboneEncoder):
+    def __init__(self, backbone_name: str | None = None, d_model: int = 768,
+                 device: str = "cuda", backbone_obj: nn.Module | None = None,
+                 train_backbone: bool = False, tokenizer_obj: Any | None = None,
+                 spec: BackboneSpec | None = None, max_length: int | None = None,
+                 esm_model: str | None = None):
+        """esm_model 是 backbone_name 的 **legacy 别名**（R24：main_train_kcat_expert.py
+        与 main_infer_ensemble.py 仍在用它，且那两个文件不允许改）。两者都给会抛
+        ValueError，不会静默取其一。
+        """
+        super().__init__(
+            backbone_name=_resolve_backbone_name(backbone_name, esm_model, "esm_model"),
+            d_model=d_model, device=device,
+            backbone_obj=backbone_obj, tokenizer_obj=tokenizer_obj,
+            train_backbone=train_backbone, spec=spec, max_length=max_length,
+            loader=load_protein_backbone,
+        )
+
+    def _apply_trainability(self) -> None:
+        """蛋白侧：非 LoRA 参数按 train_backbone 决定；LoRA 参数始终可训练。"""
+        if self.train_backbone:
+            self.backbone.train()
+            return
+        for name, param in self.backbone.named_parameters():
+            param.requires_grad_("lora_" in name)
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            self.backbone.train()
+        else:
+            self.backbone.eval()
+
+
+class LigandEncoder(_BackboneEncoder):
+    def __init__(self, backbone_name: str | None = None, d_model: int = 768,
+                 device: str = "cuda", backbone_obj: nn.Module | None = None,
+                 train_backbone: bool = False, tokenizer_obj: Any | None = None,
+                 spec: BackboneSpec | None = None, max_length: int | None = None,
+                 molt5_model: str | None = None):
+        """molt5_model 是 backbone_name 的 **legacy 别名**（R24：main_train_kcat_expert.py
+        与 main_infer_ensemble.py 仍在用它，且那两个文件不允许改）。两者都给会抛
+        ValueError，不会静默取其一。
+        """
+        super().__init__(
+            backbone_name=_resolve_backbone_name(backbone_name, molt5_model, "molt5_model"),
+            d_model=d_model, device=device,
+            backbone_obj=backbone_obj, tokenizer_obj=tokenizer_obj,
+            train_backbone=train_backbone, spec=spec, max_length=max_length,
+            loader=load_ligand_backbone,
+        )
+
+    def _apply_trainability(self) -> None:
+        """配体侧：与蛋白侧同策略。"""
+        if self.train_backbone:
+            self.backbone.train()
+            return
+        for name, param in self.backbone.named_parameters():
+            param.requires_grad_("lora_" in name)
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            self.backbone.train()
+        else:
+            self.backbone.eval()
