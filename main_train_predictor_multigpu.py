@@ -54,6 +54,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from data import EnzymeDataset
+from data_affinity import AffinityDataset, AffinityScaler
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.optim.lr_scheduler import OneCycleLR
@@ -2240,8 +2241,7 @@ def train_one_stage(model, train_loader, val_loader, args,
     
 
 
-def main():
-    global RUNTIME_PATHS
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("-csv", type=str, required=True)
     p.add_argument("--out_dir", type=str, default=None)
@@ -2397,7 +2397,44 @@ def main():
     p.add_argument("--test_csv", type=str, default=None,
                help="eval_only 模式下指定测试集 CSV（覆盖 -csv 的默认划分逻辑）")
 
-    args = p.parse_args()
+    # ---- PDBbind 亲和力通路 ----
+    p.add_argument("--task", type=str, default="kinetics",
+                   choices=["kinetics", "affinity"],
+                   help="kinetics=原有 kcat/Km/ratio 三任务；affinity=单任务亲和力")
+    p.add_argument("--affinity_label_col", type=str, default="pKaffinity")
+    p.add_argument("--affinity_loss_type", type=str, default="huber",
+                   choices=["huber", "barron"])
+    p.add_argument("--affinity_nll_weight", type=float, default=0.05)
+    p.add_argument("--affinity_rank_weight", type=float, default=0.0)
+    p.add_argument("--affinity_rank_margin", type=float, default=0.0)
+    p.add_argument("--affinity_var_reg_weight", type=float, default=0.0)
+    p.add_argument("--affinity_var_reg_mode", type=str, default="abs",
+                   choices=["abs", "ratio"])
+
+    # ---- LoRA 与骨干 ----
+    p.add_argument("--lora_layer_policy", type=str, default="last_k",
+                   choices=["all", "last_k", "explicit"])
+    p.add_argument("--lora_last_k", type=int, default=30)
+    p.add_argument("--lora_explicit_layers", type=int, nargs="+", default=None)
+    p.add_argument("--lora_target_suffixes", type=str, nargs="+", default=None,
+                   help="覆盖 LoRA 目标后缀白名单（由 tools/probe_backbone_modules.py 的"
+                        "leaf_names 决定）")
+    p.add_argument("--plm_max_len_prot", type=int, default=None)
+    p.add_argument("--plm_max_len_lig", type=int, default=None)
+    p.add_argument("--grad_checkpoint_backbone", type=str, default="off",
+                   choices=["off", "active", "all"])
+
+    # ---- 分布式与吞吐 ----
+    p.add_argument("--iters_to_accumulate", type=int,
+                   default=int(os.environ.get("KINEAGER_ITERS_TO_ACCUMULATE", "1")))
+    p.add_argument("--num_workers", type=int,
+                   default=int(os.environ.get("KINEAGER_NUM_WORKERS", "8")))
+    return p
+
+
+def main():
+    global RUNTIME_PATHS
+    args = build_arg_parser().parse_args()
     if (KineticsPredictor is None) or (PredictorConfig is None):
         raise ImportError(
             "Failed to import models.predictor dependencies. "
@@ -2532,31 +2569,46 @@ def main():
         if split_meta.get("ood_dedup_pair", False):
             print(f"[Split] ood_dedup_removed_rows={split_meta.get('ood_dedup_removed_rows', 0)}")
 
-    kscaler = KineticsScaler()
-    kscaler.fit(train_df["kcat(s^-1)"], train_df["Km(M)"])
-    if is_main_process():
-        kscaler.save(os.path.join(run_dir, "scaler_fold.json"))
-        
-    
+    if args.task == "affinity":
+        kscaler = AffinityScaler()
+        kscaler.fit(train_df[args.affinity_label_col].to_numpy())
+        if is_main_process():
+            kscaler.save(os.path.join(run_dir, "scaler_affinity.json"))
 
-    train_dataset = EnzymeDataset(
-        train_df,
-        scaler=kscaler,
-        supervised=True,
-        return_row_id=need_row_id,
-        source_ids=train_source_ids,
-        default_source_id=int(getattr(args, "default_source_id", 0)),
-        phys_cols=phys_cols if use_phys_evidence else [],
-    )
-    val_dataset = EnzymeDataset(
-        val_df,
-        scaler=kscaler,
-        supervised=True,
-        return_row_id=need_row_id,
-        source_ids=val_source_ids,
-        default_source_id=int(getattr(args, "default_source_id", 0)),
-        phys_cols=phys_cols if use_phys_evidence else [],
-    )
+        def _make_affinity_dataset(frame):
+            return AffinityDataset(
+                frame, label_col=args.affinity_label_col, scaler=kscaler,
+                supervised=True, return_source=False,
+            )
+
+        train_dataset = _make_affinity_dataset(train_df)
+        val_dataset = _make_affinity_dataset(val_df)
+    else:
+        kscaler = KineticsScaler()
+        kscaler.fit(train_df["kcat(s^-1)"], train_df["Km(M)"])
+        if is_main_process():
+            kscaler.save(os.path.join(run_dir, "scaler_fold.json"))
+
+
+
+        train_dataset = EnzymeDataset(
+            train_df,
+            scaler=kscaler,
+            supervised=True,
+            return_row_id=need_row_id,
+            source_ids=train_source_ids,
+            default_source_id=int(getattr(args, "default_source_id", 0)),
+            phys_cols=phys_cols if use_phys_evidence else [],
+        )
+        val_dataset = EnzymeDataset(
+            val_df,
+            scaler=kscaler,
+            supervised=True,
+            return_row_id=need_row_id,
+            source_ids=val_source_ids,
+            default_source_id=int(getattr(args, "default_source_id", 0)),
+            phys_cols=phys_cols if use_phys_evidence else [],
+        )
     
     is_ddp = dist.is_available() and dist.is_initialized()
 
@@ -2572,7 +2624,7 @@ def main():
         batch_size=args.batch_size,
         sampler=train_sampler,                      # 自动分区
         shuffle=(train_sampler is None),            # 只有单卡时再 shuffle
-        num_workers=8,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
     )
@@ -2582,7 +2634,7 @@ def main():
         batch_size=args.batch_size,
         sampler=val_sampler,
         shuffle=False,
-        num_workers=4,
+        num_workers=max(1, args.num_workers // 2),
         pin_memory=True,
         drop_last=False
     )
@@ -2594,63 +2646,114 @@ def main():
 
     print("dataset division finished")
         
-    esm_cfg = AutoConfig.from_pretrained(args.esm)
-    esm_layers = esm_cfg.num_hidden_layers
-    print(f"[INFO] ESM ({args.esm}) has {esm_layers} layers")
-        
-    molt5_cfg = AutoConfig.from_pretrained(args.molt5)
-    molt5_layers = molt5_cfg.num_hidden_layers
-    print(f"[INFO] MolT5 ({args.molt5}) has {molt5_layers} layers")
-        
-    total_layers = max(esm_layers, molt5_layers)
+    if args.task == "affinity":
+        # 亲和力通路不读 remote-code config 的 num_hidden_layers（ESMC 的 config 可能缺该字段）；
+        # 层数在 model 构造后从骨干 spec 回填。
+        esm_layers = None
+        molt5_layers = None
+    else:
+        esm_cfg = AutoConfig.from_pretrained(args.esm)
+        esm_layers = esm_cfg.num_hidden_layers
+        print(f"[INFO] ESM ({args.esm}) has {esm_layers} layers")
+
+        molt5_cfg = AutoConfig.from_pretrained(args.molt5)
+        molt5_layers = molt5_cfg.num_hidden_layers
+        print(f"[INFO] MolT5 ({args.molt5}) has {molt5_layers} layers")
+
+        total_layers = max(esm_layers, molt5_layers)
         
     
     
 
-    cfg = PredictorConfig(
-    d_model=768,num_heads=8,num_interaction_layers=4,
-    num_mamba_layers=1,rate=0.1,head_hidden=768,
-    use_attention_pool=True,use_checkpoint=True,             
-    num_stages=2 ,num_interaction_layers_per_stage=3,
-        
-    use_struct_branch=args.use_struct_branch,         # 新增：总开关
-    struct_in_dim_prot=args.struct_in_dim_prot,       # 新增：prot_struct 维度（45）
-    struct_in_dim_lig=args.struct_in_dim_lig,         # 新增：lig_struct 维度（135）
-    struct_fusion_mode=getattr(args, "struct_fusion_mode", "concat"),  # 若 predictor 支持
-    enable_avail_gate=bool(getattr(args, "enable_avail_gate", False)),
-    avail_gate_hidden=int(getattr(args, "avail_gate_hidden", 256)),
-    use_phys_branch=use_phys_evidence,
-    phys_in_dim=len(phys_cols) if use_phys_evidence else 0,
-    phys_hidden=128,
-    domain_uncertainty=bool(getattr(args, "domain_uncertainty", False)),
-    num_domains=int(getattr(args, "num_domains", 3)),
+    if args.task == "affinity":
+        cfg = PredictorConfig.for_task(
+            "affinity",
+            d_model=768, num_heads=8, num_interaction_layers=4,
+            num_mamba_layers=1, rate=0.1, head_hidden=768,
+            use_attention_pool=True, use_checkpoint=True,
+            num_stages=2, num_interaction_layers_per_stage=3,
+            use_struct_branch=args.use_struct_branch,
+            struct_in_dim_prot=args.struct_in_dim_prot,
+            struct_in_dim_lig=args.struct_in_dim_lig,
+            struct_fusion_mode=getattr(args, "struct_fusion_mode", "concat"),
+            enable_avail_gate=bool(getattr(args, "enable_avail_gate", False)),
+            avail_gate_hidden=int(getattr(args, "avail_gate_hidden", 256)),
+            use_phys_branch=use_phys_evidence,
+            phys_in_dim=len(phys_cols) if use_phys_evidence else 0,
+            phys_hidden=128,
+            domain_uncertainty=False,      # affinity 通路关闭域不确定性
+            num_domains=1,
+            use_interactions=args.use_interactions,
+            use_gate_p=args.use_gate_p,
+            use_gate_l=args.use_gate_l,
+            fusion_norm=True,
+            fusion_proj_dim=512,
+            use_moe_in_head=False,
+            num_heads_in_head=1,
+            head_hidden_dim=768,
+            head_depth=3,
+        )
+    else:
+        cfg = PredictorConfig(
+        d_model=768,num_heads=8,num_interaction_layers=4,
+        num_mamba_layers=1,rate=0.1,head_hidden=768,
+        use_attention_pool=True,use_checkpoint=True,             
+        num_stages=2 ,num_interaction_layers_per_stage=3,
 
-    use_interactions=args.use_interactions,
-    use_gate_p=args.use_gate_p,
-    use_gate_l=args.use_gate_l,
-                              
-    active_heads=["kcat", "Km", "ratio"],
+        use_struct_branch=args.use_struct_branch,         # 新增：总开关
+        struct_in_dim_prot=args.struct_in_dim_prot,       # 新增：prot_struct 维度（45）
+        struct_in_dim_lig=args.struct_in_dim_lig,         # 新增：lig_struct 维度（135）
+        struct_fusion_mode=getattr(args, "struct_fusion_mode", "concat"),  # 若 predictor 支持
+        enable_avail_gate=bool(getattr(args, "enable_avail_gate", False)),
+        avail_gate_hidden=int(getattr(args, "avail_gate_hidden", 256)),
+        use_phys_branch=use_phys_evidence,
+        phys_in_dim=len(phys_cols) if use_phys_evidence else 0,
+        phys_hidden=128,
+        domain_uncertainty=bool(getattr(args, "domain_uncertainty", False)),
+        num_domains=int(getattr(args, "num_domains", 3)),
 
-    fusion_norm=True,
-    fusion_proj_dim=512,  
+        use_interactions=args.use_interactions,
+        use_gate_p=args.use_gate_p,
+        use_gate_l=args.use_gate_l,
 
-    head_specs={
-        "kcat":  {"type": "mlp", "hidden_dim": 768, "depth": 3, "dropout": 0.10, "out_dim": 1},
-        "Km":    {"type": "mlp",  "hidden_dim": 640,  "depth": 3, "dropout": 0.10, "out_dim": 1},
-        "ratio": {"type": "mlp",  "out_dim": 1},
-    },
+        active_heads=["kcat", "Km", "ratio"],
 
-    use_moe_in_head=False,
-    moe_num_experts=2,
-    moe_top_k=1,
-                          
-    num_heads_in_head=1,
-    head_hidden_dim=768,
-    head_depth=3)    
+        fusion_norm=True,
+        fusion_proj_dim=512,  
+
+        head_specs={
+            "kcat":  {"type": "mlp", "hidden_dim": 768, "depth": 3, "dropout": 0.10, "out_dim": 1},
+            "Km":    {"type": "mlp",  "hidden_dim": 640,  "depth": 3, "dropout": 0.10, "out_dim": 1},
+            "ratio": {"type": "mlp",  "out_dim": 1},
+        },
+
+        use_moe_in_head=False,
+        moe_num_experts=2,
+        moe_top_k=1,
+
+        num_heads_in_head=1,
+        head_hidden_dim=768,
+        head_depth=3)    
     
-    model = KineticsPredictor(device=device, esm_model=args.esm, molt5_model=args.molt5, cfg=cfg, use_lora=True, lora_r=32, lora_alpha=64,lora_dropout=0.05)
+    model = KineticsPredictor(
+        device=device, esm_model=args.esm, molt5_model=args.molt5, cfg=cfg,
+        use_lora=True, lora_r=32, lora_alpha=64,lora_dropout=0.05,
+        lora_layer_policy=args.lora_layer_policy,
+        lora_last_k=args.lora_last_k,
+        lora_explicit_layers=args.lora_explicit_layers,
+        lora_target_suffixes=args.lora_target_suffixes,
+        plm_max_len_prot=args.plm_max_len_prot,
+        plm_max_len_lig=args.plm_max_len_lig,
+        grad_checkpoint_backbone=args.grad_checkpoint_backbone,
+    )
 
     model.to(device)
+
+    if args.task == "affinity":
+        esm_layers = int(getattr(getattr(model, "_prot_spec", None), "num_layers", 0) or 0)
+        molt5_layers = int(getattr(getattr(model, "_lig_spec", None), "num_layers", 0) or 0)
+        if is_main_process():
+            print(f"[INFO] ESM layers={esm_layers}, MolT5 layers={molt5_layers} (from backbone spec)")
 
     _kcat_init = getattr(args, "kcat_init_weights", None)
     if _kcat_init:
@@ -2738,17 +2841,27 @@ def main():
         print("Training begin")
         train_one_stage(model, train_loader, val_loader, args, esm_layers, molt5_layers,criterion,run_dir)
 
-    test_loader = make_dataloader(
-        test_df,
-        scaler=kscaler,
-        batch_size=args.batch_size,
-        shuffle=False,
-        supervised=True,
-        return_row_id=need_row_id,
-        source_ids=test_source_ids,
-        default_source_id=int(getattr(args, "default_source_id", 0)),
-        phys_cols=phys_cols if use_phys_evidence else [],
-    ) # 非十折版本，使用十折时请修改
+    if args.task == "affinity":
+        test_loader = DataLoader(
+            _make_affinity_dataset(test_df),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+    else:
+        test_loader = make_dataloader(
+            test_df,
+            scaler=kscaler,
+            batch_size=args.batch_size,
+            shuffle=False,
+            supervised=True,
+            return_row_id=need_row_id,
+            source_ids=test_source_ids,
+            default_source_id=int(getattr(args, "default_source_id", 0)),
+            phys_cols=phys_cols if use_phys_evidence else [],
+        ) # 非十折版本，使用十折时请修改
     
     device = next(model.parameters()).device
     

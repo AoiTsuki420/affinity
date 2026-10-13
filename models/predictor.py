@@ -91,6 +91,23 @@ class PredictorConfig:
             "ratio": {**default_spec},
         }
 
+        # R40：直接构造 PredictorConfig(task="affinity") 会保留 kinetics 的 head_specs，
+        # forward 直到 multi_head 里 outs_dict["affinity"] 才抛裸 KeyError。这里提前拦下。
+        # active_heads 的缺省值同样是 kinetics 三头，所以只检查 active_heads 会漏掉
+        # task="affinity" 这个例子：task 真正要读的 head 必须一并纳入检查。
+        required_heads = list(self.active_heads)
+        if task == "affinity":
+            required_heads.append("affinity")
+        missing_heads = [name for name in required_heads if name not in self.head_specs]
+        if missing_heads:
+            raise ValueError(
+                f"head_specs 缺少 forward 需要的 head: {missing_heads}；"
+                f"task={task!r}，active_heads={self.active_heads}，"
+                f"head_specs 现有键: {sorted(self.head_specs)}。"
+                "直接构造 PredictorConfig(task=...) 不会自动切换 head_specs，"
+                "请显式传入对应的 head_specs，或改用 PredictorConfig.for_task(...)。"
+            )
+
         self.share_fusion = share_fusion
         self.fusion_norm = fusion_norm
         self.fusion_proj_dim = fusion_proj_dim  # e.g. 512 降维；None 表示不投影
@@ -515,6 +532,15 @@ class KineticsPredictor(nn.Module):
         self.plm_max_len_prot = plm_max_len_prot
         self.plm_max_len_lig = plm_max_len_lig
         self.grad_checkpoint_backbone = grad_checkpoint_backbone
+
+        # R39a：梯度检查点只对 LoRA 命中的层开启（见 _build_backbones_and_lora），
+        # use_lora=False 时该开关会被静默忽略；提前报错，别让用户在 6B 模型上等 OOM。
+        if (not self.use_lora) and (str(grad_checkpoint_backbone) != "off"):
+            raise ValueError(
+                f"use_lora=False 时 grad_checkpoint_backbone={grad_checkpoint_backbone!r} 不会生效："
+                "梯度检查点只对 LoRA 命中的层开启。"
+                "请改用 use_lora=True，或把 grad_checkpoint_backbone 设为 'off'。"
+            )
         
         self.num_stages = getattr(cfg, 'num_stages', 1)
         self.num_interaction_layers_per_stage = getattr(cfg, 'num_interaction_layers_per_stage', 1)
@@ -524,6 +550,14 @@ class KineticsPredictor(nn.Module):
         
         C = cfg.d_model
 
+
+        # R39b：只注入一个编码器时，旧逻辑会静默丢弃它并去加载真实骨干权重。
+        if (protein_encoder is None) != (ligand_encoder is None):
+            missing = "ligand_encoder" if ligand_encoder is None else "protein_encoder"
+            raise ValueError(
+                f"protein_encoder / ligand_encoder 必须成对注入：缺少 {missing}。"
+                "只注入一个时另一个会被静默忽略，转而加载真实骨干权重。"
+            )
         if protein_encoder is not None and ligand_encoder is not None:
             # 测试注入路径：跳过骨干加载与 LoRA 注入。
             # 注入的编码器自带 backbone / spec，且返回的是原始骨干（未套 peft）。
