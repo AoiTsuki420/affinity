@@ -1191,6 +1191,21 @@ def should_sync_grad(step_index: int, iters_to_accumulate: int,
     return should_step(step_index, iters_to_accumulate, steps_in_epoch)
 
 
+def optimizer_steps_per_epoch(n_batches: int, iters_to_accumulate: int) -> int:
+    """一个 epoch 里实际会发生多少次 optimizer.step()。
+
+    should_step 会让每个 epoch 最后一个不满的窗口 flush，所以正好是 ceil(B / accum)。
+
+    R47：LR 计划长度（OneCycleLR 的 steps_per_epoch / 余弦调度的 total_steps）必须用
+    这个数，而不是 len(train_loader)：调度的 step 次数与 optimizer step 同频之后，
+    若计划仍按 batch 计数，累积 k 时只会走完计划的 1/k，LR 永远退火不到终点。
+    accum=1 时退化为 n_batches，与旧式逐字等价。
+    """
+    accum = max(int(iters_to_accumulate), 1)
+    n = max(int(n_batches), 0)
+    return (n + accum - 1) // accum
+
+
 def train_step(model, batch, optimizer, scaler, recorder=None,
                lam_l1=0, lam_tv=0,
                microbatch_size: int | None = None,
@@ -1678,7 +1693,9 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-    if str(getattr(args, "task", "kinetics")) != "affinity":
+    # R47：_mse_ema 是「一步一次」的自适应偏置状态，与 optimizer step 同频推进；
+    # 累积窗口内部不更新，窗口末尾（do_step=True）才更新一次。accum=1 时不变。
+    if do_step and str(getattr(args, "task", "kinetics")) != "affinity":
         with torch.no_grad():
             cur = torch.stack([mse_kcat.detach(), mse_Km.detach(), mse_ratio.detach()]).to(device)
             beta_ema = 0.9
@@ -1791,23 +1808,24 @@ final_contact_store=None):
             kcat_group_dro_num_groups=int(getattr(args, "kcat_group_dro_num_groups", 3)),
             kcat_group_dro_mix=float(getattr(args, "kcat_group_dro_mix", 1.0)),
         )
-        ema.update(getattr(model, "module", model))
         losses.append(float(loss))
         avg_loss = float(np.mean(losses))
-        
-        if use_onecycle and (onecycle is not None):
-            if global_step < onecycle.total_steps:
-                onecycle.step()
-            for g in optimizer.param_groups:
-                if g.get("tag","") not in {"head", "lora", "lora_prot", "lora_lig"}:
-                    g["lr"] = g.get("base_lr", g["lr"])
-        elif scheduler is not None:
-            scheduler.step_and_clip()
-        
 
-            
+        # R47：记账（EMA / LR 调度 / global_step）与 optimizer step 同频 —— 累积窗口
+        # 内部不推进，否则 accum=k 时 LR 计划会提前 k 倍走完、EMA 会被多更新 k 倍。
+        # accum=1 时每批都 step，本门控是 no-op，默认路径逐位不变。
+        if do_step:
+            ema.update(getattr(model, "module", model))
+            if use_onecycle and (onecycle is not None):
+                if global_step < onecycle.total_steps:
+                    onecycle.step()
+                for g in optimizer.param_groups:
+                    if g.get("tag","") not in {"head", "lora", "lora_prot", "lora_lig"}:
+                        g["lr"] = g.get("base_lr", g["lr"])
+            elif scheduler is not None:
+                scheduler.step_and_clip()
 
-        global_step += 1
+            global_step += 1
         
         
         if (i+1) % 10 == 0:  # 每10步打印一次（可调）
@@ -2130,7 +2148,12 @@ def train_one_stage(model, train_loader, val_loader, args,
     - 只训练头部或adapter等（冻结backbone）
     """
     epochs = args.epochs
-    total_steps = len(train_loader) * epochs
+    # R47：LR 计划按 **optimizer step** 计数（与 global_step / scheduler.step_and_clip()
+    # 同频）。每 epoch 的步数是 ceil(n_batches / accum)：最后一个不满的窗口也会 flush。
+    # accum=1 时 ceil(B/1) == B，下面两行与改动前逐字等价。
+    iters_to_accumulate = max(int(getattr(args, "iters_to_accumulate", 1)), 1)
+    opt_steps_per_epoch = optimizer_steps_per_epoch(len(train_loader), iters_to_accumulate)
+    total_steps = opt_steps_per_epoch * epochs
     warmup_steps = min(500, int(0.1 * total_steps))
     
     is_ddp = dist.is_available() and dist.is_initialized()
@@ -2255,7 +2278,9 @@ def train_one_stage(model, train_loader, val_loader, args,
     head_group_idx = []
     
     if use_onecycle:
-        steps_per_epoch = len(train_loader)
+        # R47：OneCycleLR 的 steps_per_epoch 也必须是 optimizer step 数，否则累积 k 时
+        # onecycle.step() 只走到计划的 1/k，LR 永远不会退火到 final_div_factor。
+        steps_per_epoch = opt_steps_per_epoch
         max_lrs = []
         lora_seen = False
         for g in optimizer.param_groups:
@@ -2293,7 +2318,7 @@ def train_one_stage(model, train_loader, val_loader, args,
             if not lora_seen:
                 print("[OneCycle][WARN] 未检测到 tag=='lora' 的 param_group；若希望 LoRA 也随 OneCycle 调度，请在构建 optimizer 时给 LoRA 组添加 tag='lora' 与 base_lr。")
     elif use_cosine:
-        total_steps  = len(train_loader) * args.epochs
+        total_steps  = opt_steps_per_epoch * args.epochs
         warmup_steps = min(500, int(0.1 * total_steps))
 
         scheduler = get_scheduler_with_warmup(

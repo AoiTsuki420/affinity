@@ -20,6 +20,12 @@ _AFFINITY_SAMPLES = {
     "pKaffinity": [1.0, 2.0, 3.0, 4.0],
 }
 
+# 生产代码里的两处 CPU 环境告警：跑 kinetics 通路就会触发，与本任务的断言无关。
+_NO_CUDA_WARNING = "ignore:CUDA is not available:UserWarning"
+_NO_AUTOCAST_DEPRECATION = (
+    "ignore:.*torch.cuda.amp.autocast.*is deprecated:FutureWarning"
+)
+
 
 class _AffinityArgs:
     task = "affinity"
@@ -416,9 +422,24 @@ class _StepCountingAdamW(AdamW):
         return super().step(closure)
 
 
-class _NullEMA:
+class _CountingEMA:
+    """只统计 update() 次数：R47 要求它与 optimizer step 同频。"""
+
+    def __init__(self):
+        self.updates = 0
+
     def update(self, module):
-        return None
+        self.updates += 1
+
+
+class _CountingScheduler:
+    """只实现 train_epoch 调用的 step_and_clip()：统计 LR 调度推进次数。"""
+
+    def __init__(self):
+        self.steps = 0
+
+    def step_and_clip(self):
+        self.steps += 1
 
 
 class _NoSyncAffinity(_VaryingAffinity):
@@ -444,6 +465,7 @@ class _NoSyncAffinity(_VaryingAffinity):
 
 class _KineticsArgs:
     task = "kinetics"
+    epochs = 1
     batch_size = 4
     phys_ablation = "real"
     gate_on_margin = 0.2
@@ -489,23 +511,46 @@ class _KineticsDummy(nn.Module):
         return pred_k, pred_m, pred_r, gate_e, gate_s, s_raw, s_raw
 
 
-def _kinetics_batch():
+def _kinetics_loader(n_batches, batch_size):
+    """kinetics 版的确定性 loader；标签按 batch_size 周期重复。"""
     from data import EnzymeDataset
     from torch.utils.data import DataLoader
     from utils import KineticsScaler
 
+    n_rows = n_batches * batch_size
     frame = pd.DataFrame({
-        "Sequence": ["MKT"] * 4,
-        "Smiles": ["CCO"] * 4,
-        "kcat(s^-1)": [1.0, 1.5, 2.0, 1.3],
-        "Km(M)": [0.01, 0.02, 0.03, 0.04],
-        "source_id": [0, 1, 2, 0],
+        "Sequence": ["MKT"] * n_rows,
+        "Smiles": ["CCO"] * n_rows,
+        "kcat(s^-1)": [1.0 + 0.1 * (k % batch_size) for k in range(n_rows)],
+        "Km(M)": [0.01 + 0.001 * (k % batch_size) for k in range(n_rows)],
+        "source_id": [k % 3 for k in range(n_rows)],
     })
     scaler = KineticsScaler()
     scaler.fit(frame["kcat(s^-1)"].to_numpy(), frame["Km(M)"].to_numpy())
     dataset = EnzymeDataset(frame, scaler=scaler, supervised=True,
                             return_row_id=True, source_col="source_id")
-    return next(iter(DataLoader(dataset, batch_size=4, shuffle=False)))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+def _kinetics_batch():
+    return next(iter(_kinetics_loader(1, 4)))
+
+
+class _MseEmaCountingKinetics(_KineticsDummy):
+    """统计 `_mse_ema` 被赋值的次数（train_step 每次更新一次）。
+
+    train_step 用的是普通赋值 `model._mse_ema = ...`（不是 in-place），
+    所以重载 __setattr__ 就能精确数出更新次数。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mse_ema_updates = 0  # __init__ 里那次赋值不计入
+
+    def __setattr__(self, name, value):
+        if name == "_mse_ema":
+            self.__dict__["mse_ema_updates"] = self.__dict__.get("mse_ema_updates", 0) + 1
+        super().__setattr__(name, value)
 
 
 def _task_fixture(task, accum):
@@ -607,29 +652,41 @@ def _affinity_loader(n_batches, batch_size, scaler):
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
-def _run_affinity_epoch(monkeypatch, loader, accum, model):
-    """跑一个 train_epoch，返回记录 step 次数 / step 时梯度的 optimizer。"""
+def _run_epoch(monkeypatch, loader, accum, model, args, tracked,
+               scheduler=None, ema=None):
+    """跑一个 train_epoch，返回 (optimizer, scheduler, ema, global_step)。
+
+    scheduler / ema 缺省都是计数器，用来验证 R47 的「记账按 optimizer step 推进」。
+    """
     import pathlib
     import shutil
 
     import main_train_predictor_multigpu as training
     from main_train_predictor_multigpu import train_epoch
 
-    args = _AffinityArgs()
     args.iters_to_accumulate = accum
     args.batch_size = int(loader.batch_size)
+    scheduler = _CountingScheduler() if scheduler is None else scheduler
+    ema = _CountingEMA() if ema is None else ema
 
     monkeypatch.setattr(training.swanlab, "log", lambda payload: None)
     scratch = pathlib.Path("_scratch_accum_epoch")
     scratch.mkdir(exist_ok=True)
     monkeypatch.setitem(training.RUNTIME_PATHS, "train_data_dir", scratch)
 
-    optimizer = _StepCountingAdamW(model.parameters(), model.p_mu)
+    optimizer = _StepCountingAdamW(model.parameters(), tracked)
     try:
-        train_epoch(model, loader, optimizer, None, _NoOpScaler(), _NullEMA(),
-                    0, args, None, None, 0)
+        global_step, _ = train_epoch(model, loader, optimizer, scheduler, _NoOpScaler(),
+                                     ema, 0, args, None, None, 0)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+    return optimizer, scheduler, ema, global_step
+
+
+def _run_affinity_epoch(monkeypatch, loader, accum, model):
+    """跑一个 train_epoch，返回记录 step 次数 / step 时梯度的 optimizer。"""
+    optimizer, _, _, _ = _run_epoch(monkeypatch, loader, accum, model,
+                                    _AffinityArgs(), model.p_mu)
     return optimizer
 
 
@@ -656,7 +713,25 @@ def test_train_epoch_steps_once_per_accumulation_window(monkeypatch):
     assert model.no_sync_calls == 0, "非 DDP 通路不该调用 no_sync()"
 
 
-@pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
+def test_optimizer_steps_per_epoch_matches_the_flush_contract():
+    """R47：LR 计划长度 = 每 epoch 的 optimizer step 数 = ceil(B / accum)。
+
+    尾窗会 flush，所以不满一个窗口的那一批仍然产生一次 step；accum=1 时
+    退化成旧的 len(train_loader)。
+    """
+    from main_train_predictor_multigpu import optimizer_steps_per_epoch
+
+    assert optimizer_steps_per_epoch(7, 1) == 7      # 默认路径与旧式相同
+    assert optimizer_steps_per_epoch(4, 1) == 4
+    assert optimizer_steps_per_epoch(4, 2) == 2
+    assert optimizer_steps_per_epoch(5, 2) == 3      # 尾窗 flush
+    assert optimizer_steps_per_epoch(7, 3) == 3
+    assert optimizer_steps_per_epoch(1, 4) == 1      # 一批也要 step
+    assert optimizer_steps_per_epoch(0, 3) == 0
+
+
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
 @pytest.mark.parametrize("n_batches,accum,expected", [
     (1, 1, 1),
     (4, 1, 4),
@@ -666,10 +741,18 @@ def test_train_epoch_steps_once_per_accumulation_window(monkeypatch):
 ])
 def test_train_epoch_step_count_flushes_last_partial_window(monkeypatch, n_batches,
                                                             accum, expected):
-    """最后一个不满的窗口必须 flush：否则尾部梯度被静默丢弃。"""
+    """最后一个不满的窗口必须 flush：否则尾部梯度被静默丢弃。
+
+    同时把「LR 计划长度公式」与真实 step 次数对上：train_one_stage 用
+    optimizer_steps_per_epoch() 算 OneCycle/余弦的 total_steps，公式错了
+    LR 计划就会与实际步数脱节。
+    """
+    from main_train_predictor_multigpu import optimizer_steps_per_epoch
+
     opt = _run_affinity_epoch(monkeypatch, _affinity_loader(n_batches, 2, _affinity_scaler(16)),
                               accum, _VaryingAffinity())
     assert opt.step_count == expected
+    assert opt.step_count == optimizer_steps_per_epoch(n_batches, accum)
 
 
 @pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
@@ -692,3 +775,55 @@ def test_train_epoch_skips_ddp_sync_inside_accumulation_window(monkeypatch):
 
     assert opt.step_count == 2
     assert model.no_sync_calls == 2, "窗口内部的两批（i=0/2）必须跳过梯度同步"
+
+
+# ---------------------------------------------------------------------------
+# R47：LR 调度 / global_step / ema.update() / _mse_ema 必须与 optimizer step 同频。
+# 累积 k 时它们若按 batch 推进，LR 计划会提前 k 倍走完、EMA 会被多更新 k 倍。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
+@pytest.mark.filterwarnings(_NO_AUTOCAST_DEPRECATION)
+def test_train_epoch_accumulation_advances_bookkeeping_per_optimizer_step(monkeypatch):
+    """R47：7 批 / 累积 3 → 五个计数全部是 3（optimizer step 次数），不是 7。"""
+    model = _MseEmaCountingKinetics()
+    opt, sched, ema, global_step = _run_epoch(
+        monkeypatch, _kinetics_loader(7, 2), 3, model, _KineticsArgs(), model.p_k)
+
+    assert opt.step_count == 3
+    assert sched.steps == 3, "LR 调度器必须按 optimizer step 推进"
+    assert global_step == 3, "global_step 必须按 optimizer step 推进"
+    assert ema.updates == 3, "ema.update() 必须按 optimizer step 推进"
+    assert model.mse_ema_updates == 3, "_mse_ema 必须按 optimizer step 推进"
+
+
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
+@pytest.mark.filterwarnings(_NO_AUTOCAST_DEPRECATION)
+def test_train_epoch_default_path_advances_bookkeeping_every_batch(monkeypatch):
+    """R47 反面：iters_to_accumulate=1（默认）时五个计数仍然各推进 7 次。
+
+    默认路径每批都 step，所以新门控是 no-op —— 这里把「没有变化」钉住。
+    """
+    model = _MseEmaCountingKinetics()
+    opt, sched, ema, global_step = _run_epoch(
+        monkeypatch, _kinetics_loader(7, 2), 1, model, _KineticsArgs(), model.p_k)
+
+    assert opt.step_count == 7
+    assert sched.steps == 7
+    assert global_step == 7
+    assert ema.updates == 7
+    assert model.mse_ema_updates == 7
+
+
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
+def test_train_epoch_affinity_accumulation_advances_bookkeeping_per_optimizer_step(monkeypatch):
+    """R47：affinity 通路走同一个门控（affinity 没有 _mse_ema，其余四个在列）。"""
+    model = _VaryingAffinity()
+    opt, sched, ema, global_step = _run_epoch(
+        monkeypatch, _affinity_loader(7, 2, _affinity_scaler(8)), 3, model,
+        _AffinityArgs(), model.p_mu)
+
+    assert opt.step_count == 3
+    assert sched.steps == 3
+    assert global_step == 3
+    assert ema.updates == 3
