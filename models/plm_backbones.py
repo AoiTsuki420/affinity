@@ -23,6 +23,15 @@ SUPPORTED_KINDS = (KIND_ESMC, KIND_MOLFORMER, KIND_ESM2, KIND_T5)
 _HIDDEN_SIZE_FIELDS = ("hidden_size", "d_model", "embedding_dim", "n_embd", "dim")
 _NUM_LAYER_FIELDS = ("num_hidden_layers", "num_layers", "n_layers", "n_layer", "num_blocks")
 
+# 层容器的候选与顺序，被 resolve_num_layers 与 _layer_containers 共用：
+# 层数解析和梯度检查点必须落在同一个容器上，否则两者会对不同的层集合生效。
+_LAYER_CONTAINER_CANDIDATES: tuple[tuple[str | None, str], ...] = (
+    ("encoder", "layer"),
+    ("encoder", "block"),
+    (None, "layers"),
+    (None, "h"),
+)
+
 
 def resolve_hidden_size(config: Any) -> int:
     """按已知的 HF config 字段名依次尝试，全部失败时抛出带字段清单的错误。"""
@@ -45,13 +54,7 @@ def resolve_num_layers(config: Any, model: nn.Module | None = None) -> int:
             return int(value)
 
     if model is not None:
-        candidates = (
-            ("encoder", "layer"),
-            ("encoder", "block"),
-            (None, "layers"),
-            (None, "h"),
-        )
-        for holder_name, attr in candidates:
+        for holder_name, attr in _LAYER_CONTAINER_CANDIDATES:
             holder = model if holder_name is None else getattr(model, holder_name, None)
             if holder is None:
                 continue
@@ -439,13 +442,7 @@ def count_lora_parameters(model: nn.Module) -> tuple[int, int]:
 
 def _layer_containers(model: nn.Module):
     """产出 (层号, 层模块) 的可迭代序列，用于定位逐层属性。"""
-    containers = (
-        ("encoder", "layer"),
-        ("encoder", "block"),
-        (None, "layers"),
-        (None, "h"),
-    )
-    for holder_name, attr in containers:
+    for holder_name, attr in _LAYER_CONTAINER_CANDIDATES:
         holder = model if holder_name is None else getattr(model, holder_name, None)
         if holder is None:
             continue
@@ -506,10 +503,20 @@ def set_backbone_gradient_checkpointing(
     *,
     layers: Sequence[int] | None = None,
 ) -> int:
-    """按模式开关骨干的逐层梯度检查点，返回被开启的层数。
+    """按模式开关骨干的逐层梯度检查点，返回真正接受了开关的层数。
 
     mode='active' 只对 LoRA 命中的层开启：前段层因无 LoRA 而不建图，
     对它们开检查点只会白白增加重算开销。
+
+    契约（调用方必读）：
+    - 本函数只切换**逐层**的 gradient_checkpointing / _gradient_checkpointing_func 属性，
+      也就是 transformers 5.x `GradientCheckpointingLayer` 真正读取的那一对；
+    - 若某个骨干把开关放在**模型级或 encoder 级**的 gradient_checkpointing 上
+      （自写的 remote code 可能如此），本函数覆盖不到：这类骨干请改用它自带的
+      `gradient_checkpointing_enable()`。此时返回值可能是正数，但那**不是**检查点已生效的
+      证据——层上带着类属性、模型却不读，本函数无从分辨；
+    - 非 off 模式下，一层都没真正接受开关就抛 ValueError，所以返回 0 永远不表示成功；
+      off 是唯一允许什么都不做并原样返回 0 的模式。
 
     逐层属性成对设置，镜像 transformers 的
     `PreTrainedModel._set_gradient_checkpointing`：布尔量是唯一的开关，
@@ -528,8 +535,13 @@ def set_backbone_gradient_checkpointing(
 
     enabled = 0
     touched = 0
+    capable = 0
     for index, module in _layer_containers(model):
         touched += 1
+        if not hasattr(module, "gradient_checkpointing"):
+            continue
+
+        capable += 1
         if mode == "off":
             should_enable = False
         elif mode == "all":
@@ -537,15 +549,32 @@ def set_backbone_gradient_checkpointing(
         else:
             should_enable = wanted is not None and index in wanted
 
-        if hasattr(module, "gradient_checkpointing"):
-            module._gradient_checkpointing_func = checkpoint_func
-            module.gradient_checkpointing = should_enable
+        module._gradient_checkpointing_func = checkpoint_func
+        module.gradient_checkpointing = should_enable
         if should_enable:
+            # 只有真正接受了开关的层才计数：返回值是调用方唯一的成功信号，
+            # 不能被"选中的层数"冒名顶替。
             enabled += 1
 
-    if mode != "off" and touched == 0:
+    if mode != "off" and enabled == 0:
+        candidates = " / ".join(
+            f"{holder}.{attr}" if holder else attr for holder, attr in _LAYER_CONTAINER_CANDIDATES
+        )
+        requested = (
+            "全部层（mode='all'）"
+            if mode == "all"
+            else (f"layers={sorted(wanted)}" if wanted is not None else "layers=None（未指定）")
+        )
+        container_desc = (
+            f"找到 {touched} 个层模块" if touched else f"未找到任何层容器（候选：{candidates}）"
+        )
         raise ValueError(
-            "无法定位骨干的层容器（encoder.layer / encoder.block / layers / h），"
-            "梯度检查点未生效。"
+            f"梯度检查点未生效：mode={mode!r}，请求的层={requested}，{container_desc}，"
+            f"带 gradient_checkpointing 属性的层={capable} 个，实际开启 {enabled} 个。"
+            "排查顺序：① 层容器是否为 "
+            f"{candidates}；"
+            "② 层模块是否带 gradient_checkpointing 属性"
+            "（远程代码骨干常常没有，请先在集群上跑 tools/probe_backbone_modules.py 确认）；"
+            "③ mode='active' 时 layers 是否传入了 LoRA 命中的层号。"
         )
     return enabled

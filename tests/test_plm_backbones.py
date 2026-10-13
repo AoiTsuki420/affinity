@@ -583,8 +583,8 @@ def test_load_threads_revision_and_trust_remote_code_to_tokenizer(monkeypatch):
     assert model_calls == tokenizer_calls
 
 
-# peft 是可选依赖：用模块级 try/except + 逐条 skipif，绝不能用 pytest.importorskip。
-# importorskip 在模块导入期执行，会把本文件里 Tasks 2-5 的全部测试一起跳过。
+# peft 是可选依赖：模块级 try/except + 逐条 skipif。绝不能用"导入期即跳过"的 skip 助手，
+# 它会在模块导入阶段把本文件里 Tasks 2-5 的全部测试一并跳过，而不只是 peft 相关用例。
 try:
     import peft  # noqa: F401
     HAS_PEFT = True
@@ -739,3 +739,85 @@ def test_gradient_checkpointing_on_lora_layers_survives_real_forward_and_backwar
         assert grad is not None, f"第 {index} 层的 lora_A 没有拿到梯度"
         assert torch.isfinite(grad).all()
         assert query.lora_B.default.weight.grad is not None
+
+
+class _FlaglessLayer(torch.nn.Module):
+    """远程代码骨干里常见的层：不暴露 gradient_checkpointing 属性。"""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+
+
+class _FlaglessBackbone(torch.nn.Module):
+    def __init__(self, num_layers=3):
+        super().__init__()
+        self.encoder = torch.nn.Module()
+        self.encoder.layer = torch.nn.ModuleList([_FlaglessLayer() for _ in range(num_layers)])
+
+
+def test_set_gradient_checkpointing_raises_when_no_layer_carries_the_flag():
+    """R23: 没有一个层接受开关时不能返回正数——调用方唯一的信号就是返回值。
+
+    远程代码骨干（如 esm 包自己的 ESMC）的层模块可能根本不暴露
+    gradient_checkpointing；旧实现在这里返回"开启了 3 层"却什么都没开，也不报错。
+    """
+    assert not hasattr(_FlaglessLayer(), "gradient_checkpointing")
+
+    with pytest.raises(ValueError) as excinfo:
+        set_backbone_gradient_checkpointing(_FlaglessBackbone(3), "all")
+    message = str(excinfo.value)
+    assert "mode='all'" in message
+    assert "找到 3 个层模块" in message
+    assert "带 gradient_checkpointing 属性的层=0 个" in message
+
+    with pytest.raises(ValueError) as excinfo:
+        set_backbone_gradient_checkpointing(_FlaglessBackbone(3), "active", layers=[1, 2])
+    assert "layers=[1, 2]" in str(excinfo.value)
+
+
+def test_set_gradient_checkpointing_off_is_a_silent_noop_without_the_flag():
+    """off 是唯一允许什么都不做、且不报错的模式。"""
+    assert set_backbone_gradient_checkpointing(_FlaglessBackbone(3), "off") == 0
+
+
+def test_set_gradient_checkpointing_raises_when_active_has_nothing_selected():
+    """R23: active 却没传 layers（或层号全在范围外）时静默返回 0，
+    代价是配置写着 active 的 6B 任务几小时后才 OOM。"""
+    model = _PeftableBackbone(6)
+
+    with pytest.raises(ValueError) as excinfo:
+        set_backbone_gradient_checkpointing(model, "active", layers=None)
+    message = str(excinfo.value)
+    assert "layers=None（未指定）" in message
+    assert "带 gradient_checkpointing 属性的层=6 个" in message
+
+    with pytest.raises(ValueError):
+        set_backbone_gradient_checkpointing(model, "active", layers=[99])
+    assert not any(model.encoder.layer[i].gradient_checkpointing for i in range(6))
+
+
+def test_set_gradient_checkpointing_diagnostics_distinguish_missing_container():
+    """R23: 两种成因必须能分开——"没有层容器"与"层不带开关"的排查动作完全不同。"""
+
+    class _NoContainer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = torch.nn.Linear(4, 4)
+
+    with pytest.raises(ValueError) as excinfo:
+        set_backbone_gradient_checkpointing(_NoContainer(), "all")
+    message = str(excinfo.value)
+    assert "未找到任何层容器" in message
+    assert "encoder.layer" in message
+
+
+def test_set_gradient_checkpointing_documents_per_layer_only_contract():
+    """R23 part 3: 只切换逐层属性这一限制必须写进契约。
+
+    模型级/encoder 级开关的骨干本函数覆盖不到，返回值也无法与成功区分，
+    只能靠文档说清楚（这类骨干要用它自己的 gradient_checkpointing_enable()）。
+    """
+    doc = set_backbone_gradient_checkpointing.__doc__ or ""
+    assert "模型级或 encoder 级" in doc
+    assert "gradient_checkpointing_enable" in doc
