@@ -7,8 +7,6 @@ from .encoders import ProteinEncoder, LigandEncoder
 from .interactions import CrossAttentionBlock, ResidueMask,LigandMask
 from utils import masked_mean
 import json
-from transformers import AutoModel
-from transformers import AutoModelForSeq2SeqLM
 
 class PredictorConfig:
     def __init__(self,
@@ -55,6 +53,7 @@ class PredictorConfig:
                  use_interactions=True,   # 是否启用 cross-attention 堆栈
                  use_gate_p=True,         # 是否启用 protein gate
                  use_gate_l=True,         # 是否启用 ligand gate         
+                 task="kinetics",         # "kinetics" 三任务 / "affinity" 单任务
                 ):
         self.d_model = d_model
         self.num_heads = num_heads
@@ -120,6 +119,39 @@ class PredictorConfig:
         self.use_interactions = use_interactions
         self.use_gate_p = use_gate_p
         self.use_gate_l = use_gate_l
+        self.task = task
+
+    KINETICS_HEADS = ["kcat", "Km", "ratio"]
+
+    @classmethod
+    def for_task(cls, task: str, **overrides) -> "PredictorConfig":
+        """按任务产出预设配置，避免在训练脚本里硬编码 active_heads / head_specs。"""
+        if task == "kinetics":
+            preset = {
+                "task": "kinetics",
+                "active_heads": list(cls.KINETICS_HEADS),
+                "head_specs": {
+                    "kcat":  {"type": "mlp", "hidden_dim": 768, "depth": 3,
+                              "dropout": 0.10, "out_dim": 1},
+                    "Km":    {"type": "mlp", "hidden_dim": 640, "depth": 3,
+                              "dropout": 0.10, "out_dim": 1},
+                    "ratio": {"type": "mlp", "out_dim": 1},
+                },
+            }
+        elif task == "affinity":
+            preset = {
+                "task": "affinity",
+                "active_heads": ["affinity"],
+                "head_specs": {
+                    "affinity": {"type": "mlp", "hidden_dim": 768, "depth": 3,
+                                 "dropout": 0.10, "out_dim": 2},
+                },
+            }
+        else:
+            raise ValueError(f"未知 task: {task!r}（支持 kinetics / affinity）")
+
+        preset.update(overrides)
+        return cls(**preset)
         
         
 class AttentionPool(nn.Module):
@@ -458,6 +490,15 @@ class KineticsPredictor(nn.Module):
                  lora_dropout=0.05,
                  struct_in_dim_prot=None,
                  struct_in_dim_lig=None,
+                 protein_encoder=None,
+                 ligand_encoder=None,
+                 lora_layer_policy="all",
+                 lora_last_k=30,
+                 lora_explicit_layers=None,
+                 lora_target_suffixes=None,
+                 plm_max_len_prot=None,
+                 plm_max_len_lig=None,
+                 grad_checkpoint_backbone="off",
                 ):
         super().__init__()
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -466,6 +507,14 @@ class KineticsPredictor(nn.Module):
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        # 骨干/LoRA 选项：_build_backbones_and_lora 从这里读，Task 14 从 args 透传。
+        self.lora_layer_policy = lora_layer_policy
+        self.lora_last_k = lora_last_k
+        self.lora_explicit_layers = lora_explicit_layers
+        self.lora_target_suffixes = lora_target_suffixes
+        self.plm_max_len_prot = plm_max_len_prot
+        self.plm_max_len_lig = plm_max_len_lig
+        self.grad_checkpoint_backbone = grad_checkpoint_backbone
         
         self.num_stages = getattr(cfg, 'num_stages', 1)
         self.num_interaction_layers_per_stage = getattr(cfg, 'num_interaction_layers_per_stage', 1)
@@ -474,9 +523,28 @@ class KineticsPredictor(nn.Module):
 
         
         C = cfg.d_model
-        
-        self.esm = AutoModel.from_pretrained(esm_model)
-        self.molt5 = AutoModelForSeq2SeqLM.from_pretrained(molt5_model)
+
+        if protein_encoder is not None and ligand_encoder is not None:
+            # 测试注入路径：跳过骨干加载与 LoRA 注入。
+            # 注入的编码器自带 backbone / spec，且返回的是原始骨干（未套 peft）。
+            self.protein = protein_encoder
+            self.ligand = ligand_encoder
+            self.esm = getattr(protein_encoder, "backbone", None)
+            self.molt5 = getattr(ligand_encoder, "backbone", None)
+            self._prot_spec = getattr(protein_encoder, "spec", None)
+            self._lig_spec = getattr(ligand_encoder, "spec", None)
+            self._prot_tokenizer = getattr(protein_encoder, "tokenizer", None)
+            self._lig_tokenizer = getattr(ligand_encoder, "tokenizer", None)
+        else:
+            self._build_backbones_and_lora(esm_model, molt5_model)
+            self.protein = ProteinEncoder(
+                backbone_obj=self.esm, tokenizer_obj=self._prot_tokenizer,
+                spec=self._prot_spec, d_model=C, device=self.device, train_backbone=True,
+            )
+            self.ligand = LigandEncoder(
+                backbone_obj=self.molt5, tokenizer_obj=self._lig_tokenizer,
+                spec=self._lig_spec, d_model=C, device=self.device, train_backbone=True,
+            )
         
         self.use_struct_branch = cfg.use_struct_branch
         if self.use_struct_branch:
@@ -527,158 +595,6 @@ class KineticsPredictor(nn.Module):
             )
         else:
             self.phys_fusion = None
-
-        if self.use_lora:
-            from peft import LoraConfig, get_peft_model
-
-            def _count_lora_params(model):
-                n_params, n_tensors = 0, 0
-                for name, p in model.named_parameters():
-                    if "lora_" in name:
-                        n_params += p.numel()
-                        n_tensors += 1
-                return n_params, n_tensors
-
-            def _list_linear_names(m):
-                return [n for n, mod in m.named_modules() if isinstance(mod, nn.Linear)]
-
-            def _num_layers_from_model(m):
-                L = getattr(getattr(m, "config", object()), "num_hidden_layers", None)
-                if L is None and hasattr(m, "encoder") and hasattr(m.encoder, "layer"):
-                    L = len(m.encoder.layer)
-                assert L is not None, "无法推断 ESM 层数"
-                return int(L)
-
-            def _select_layers(L, policy="sandwich", last_k=2, explicit=None):
-                if policy in ("all", "full", "everything"):
-                    return list(range(max(0, L)))
-                if policy == "last_k":
-                    k = max(1, min(last_k, L))
-                    return list(range(L - k, L))
-                elif policy == "sandwich":
-                    picks = {0, L // 2, max(L - 4, 0), max(L - 2, 0), L - 1}
-                    return sorted(i for i in picks if 0 <= i < L)
-                elif policy == "explicit":
-                    assert explicit, "explicit 需提供层号"
-                    return sorted(i for i in explicit if 0 <= i < L)
-                
-                else:
-                    raise ValueError(f"Unknown policy: {policy}")
-
-            def _build_esm_targets_exact(model: nn.Module, layers):
-                names = set(_list_linear_names(model))
-                targets = []
-                suffixes = [
-                    "attention.self.query",
-                    "attention.self.key",
-                    "attention.self.value",
-                    "attention.output.dense",
-                    "intermediate.dense",
-                    "output.dense",
-                ]
-                for i in layers:
-                    stem = f"encoder.layer.{i}"  # 你的模型是 encoder.layer.* 这一种
-                    for sfx in suffixes:
-                        key = f"{stem}.{sfx}"
-                        if key in names:
-                            targets.append(key)
-                targets = sorted(set(targets))
-                assert targets, "没有命中任何 ESM 线性层，请检查层号或命名。"
-                return targets
-            
-            def _num_t5_encoder_layers(t5):
-                if hasattr(t5, "encoder") and hasattr(t5.encoder, "block"):
-                    return len(t5.encoder.block)
-                return int(getattr(getattr(t5, "config", object()), "num_layers", 0))
-
-            def _build_t5_encoder_targets_exact(t5_model: nn.Module):
-                names = set(_list_linear_names(t5_model))
-                L = _num_t5_encoder_layers(t5_model)
-                targets = []
-                sfx = [
-                    "layer.0.SelfAttention.q",
-                    "layer.0.SelfAttention.k",
-                    "layer.0.SelfAttention.v",
-                    "layer.0.SelfAttention.o",
-                    "layer.1.DenseReluDense.wi_0",
-                    "layer.1.DenseReluDense.wi_1",
-                    "layer.1.DenseReluDense.wo",
-                ]
-                for i in range(L):
-                    stem = f"encoder.block.{i}"
-                    for tail in sfx:
-                        key = f"{stem}.{tail}"
-                        if key in names:
-                            targets.append(key)
-                targets = sorted(set(targets))
-                assert targets, "没有命中任何 MolT5 encoder 线性层，请检查命名。"
-                return targets
-
-            L = _num_layers_from_model(self.esm)
-            selected_layers = _select_layers(L, policy="all")  # -> L=12 时为 [0,6,8,10,11]
-            print(f"[ESM] total layers = {L}, selected layers = {selected_layers}")
-
-            all_linear = _list_linear_names(self.esm)
-            probe = [n for n in all_linear if any(f"encoder.layer.{i}." in n for i in selected_layers)]
-            print("[ESM Linear sample near selected layers]")
-            for n in sorted(probe)[:20]:
-                print("  ", n)
-
-            target_modules_esm = _build_esm_targets_exact(self.esm, layers=selected_layers)
-            print("[ESM target_modules] count =", len(target_modules_esm))
-            for t in target_modules_esm[:24]:
-                print("  ", t)
-
-            lora_cfg_esm = LoraConfig(
-                r=self.lora_r,
-                lora_alpha=self.lora_alpha,
-                target_modules=target_modules_esm,
-                lora_dropout=self.lora_dropout,
-                bias="none",
-                task_type="FEATURE_EXTRACTION",
-            )
-            self.esm = get_peft_model(self.esm, lora_cfg_esm)
-
-            n_lora_params, n_lora_tensors = _count_lora_params(self.esm)
-            print(f"[ESM injected] LoRA tensors={n_lora_tensors}, params={n_lora_params}")
-            assert n_lora_params > 0, "LoRA 没注进 self.esm（请检查 target_modules 是否命中真实层名）"
-            
-            
-            
-            target_modules_molt5 = _build_t5_encoder_targets_exact(self.molt5)
-            print("[MolT5 encoder target_modules] count =", len(target_modules_molt5))
-            for t in target_modules_molt5[:24]:
-                print("  ", t)
-                
-            lora_cfg_molt5 = LoraConfig(
-               r=self.lora_r,
-               lora_alpha=self.lora_alpha,
-               target_modules=target_modules_molt5,
-               lora_dropout=self.lora_dropout,
-                bias="none",
-                task_type="FEATURE_EXTRACTION",
-            )
-            self.molt5 = get_peft_model(self.molt5, lora_cfg_molt5)
-            n_lora_params_m5, n_lora_tensors_m5 = _count_lora_params(self.molt5)
-            print(f"[MolT5 encoder injected] LoRA tensors={n_lora_tensors_m5}, params={n_lora_params_m5}")
-            assert n_lora_params_m5 > 0, "MolT5 LoRA 注入失败（没有命中 q/v）"
-            
-
-        self.protein = ProteinEncoder(
-            esm_model=esm_model,
-            backbone_obj=self.esm,
-            d_model=C,
-            device=self.device,
-            train_backbone=True,
-        )
-        self.ligand = LigandEncoder(
-            molt5_model=molt5_model,
-            backbone_obj=self.molt5.get_encoder(),
-            d_model=C,
-            device=self.device,
-            train_backbone=True,
-        )
-        
 
         self.token_transformer_layers = nn.ModuleList([
             ProteinTransformerLayer(
@@ -738,16 +654,18 @@ class KineticsPredictor(nn.Module):
             cfg=cfg,
             cond_split=cond_split  # 若不用 film_mlp 也无妨
         )
-        self.kcat_source_residual = None
-        if bool(getattr(cfg, "use_source_residual_head", False)):
-            tasks = set(getattr(cfg, "source_head_tasks", ["kcat"]))
-            if "kcat" in tasks:
-                self.kcat_source_residual = SourceResidualHead(
-                    in_dim=fused_dim,
-                    num_domains=int(getattr(cfg, "num_domains", 3)),
-                    hidden_dim=int(getattr(cfg, "source_head_hidden", 256)),
-                    drop=float(getattr(cfg, "source_head_dropout", cfg.dropout)),
-                )
+        # 同 s_*：affinity 通路根本不创建这个 head（测试按 not hasattr 判定）。
+        if cfg.task == "kinetics":
+            self.kcat_source_residual = None
+            if bool(getattr(cfg, "use_source_residual_head", False)):
+                tasks = set(getattr(cfg, "source_head_tasks", ["kcat"]))
+                if "kcat" in tasks:
+                    self.kcat_source_residual = SourceResidualHead(
+                        in_dim=fused_dim,
+                        num_domains=int(getattr(cfg, "num_domains", 3)),
+                        hidden_dim=int(getattr(cfg, "source_head_hidden", 256)),
+                        drop=float(getattr(cfg, "source_head_dropout", cfg.dropout)),
+                    )
 
         self.last_pred_dict = None
         
@@ -763,17 +681,86 @@ class KineticsPredictor(nn.Module):
         self.last_gate_phys_logits = None
         self.last_phys_avail = None
 
-        self.s_kcat  = nn.Parameter(torch.zeros(1))
-        self.s_Km    = nn.Parameter(torch.zeros(1))
-        self.s_ratio = nn.Parameter(torch.zeros(1))
-        if bool(getattr(cfg, "domain_uncertainty", False)):
-            self.s_domain_task = nn.Parameter(torch.zeros(int(getattr(cfg, "num_domains", 3)), 3))
-        else:
-            self.s_domain_task = None
+        # affinity 通路**不得**构造这三个异方差参数（也不得构造 s_domain_task）：
+        # DDP 在 find_unused_parameters=False 下会因「有图无梯度」的参数直接报错，
+        # 构造出来再冻结并不能绕过。所以这里不是冻结、也不是置 None——置 None 仍然是
+        # 存在的属性，测试与 DDP 检查都按 `not hasattr` 判定，而是根本不创建。
+        # forward 的 affinity 分支在读到这些名字之前就已经 return。
+        if cfg.task == "kinetics":
+            self.s_kcat  = nn.Parameter(torch.zeros(1))
+            self.s_Km    = nn.Parameter(torch.zeros(1))
+            self.s_ratio = nn.Parameter(torch.zeros(1))
+            if bool(getattr(cfg, "domain_uncertainty", False)):
+                self.s_domain_task = nn.Parameter(torch.zeros(int(getattr(cfg, "num_domains", 3)), 3))
+            else:
+                self.s_domain_task = None
 
         self._reset_parameters()
         self.to(self.device)
         
+    def _build_backbones_and_lora(self, esm_model, molt5_model):
+        """加载蛋白/配体骨干，可选注入 LoRA，并填好编码器所需的 tokenizer 与 spec。
+
+        取代原先内联的 `AutoModel.from_pretrained` / `AutoModelForSeq2SeqLM.from_pretrained`
+        与 `_build_esm_targets_exact` / `_build_t5_encoder_targets_exact` 两套层名猜测：
+        层发现、层选择与注入全部交给 models.plm_backbones（Task 5/6）。
+
+        两处有意为之的取舍：
+        - `use_lora=False` 时完全不调用注入，也不碰梯度检查点开关；测试注入路径根本
+          不会走到本方法。
+        - 梯度检查点只对蛋白骨干生效（ESMC-6B 才是显存瓶颈），配体侧保持原行为。
+        """
+        from .plm_backbones import (
+            inject_lora,
+            load_ligand_backbone,
+            load_protein_backbone,
+            set_backbone_gradient_checkpointing,
+        )
+
+        self.esm, self._prot_tokenizer, self._prot_spec = load_protein_backbone(
+            esm_model, max_length=self.plm_max_len_prot
+        )
+        # load_ligand_backbone 对 T5 返回的是 T5EncoderModel（不是带 decoder 的
+        # Seq2SeqLM），MoLFormer 返回的本来就是 encoder-only 模型，所以两条支路都
+        # 直接把 backbone 交给 LigandEncoder，不再调用 get_encoder()。
+        self.molt5, self._lig_tokenizer, self._lig_spec = load_ligand_backbone(
+            molt5_model, max_length=self.plm_max_len_lig
+        )
+
+        if not self.use_lora:
+            return
+
+        self.esm, esm_targets, esm_lora_layers = inject_lora(
+            self.esm,
+            r=self.lora_r,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout,
+            policy=self.lora_layer_policy,
+            last_k=self.lora_last_k,
+            explicit_layers=self.lora_explicit_layers,
+            suffixes=self.lora_target_suffixes,
+        )
+        print(f"[ESM] LoRA targets={len(esm_targets)}, layers={esm_lora_layers}")
+
+        self.molt5, lig_targets, _lig_lora_layers = inject_lora(
+            self.molt5,
+            r=self.lora_r,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout,
+            policy=self.lora_layer_policy,
+            last_k=self.lora_last_k,
+            explicit_layers=self.lora_explicit_layers,
+            suffixes=self.lora_target_suffixes,
+        )
+        print(f"[Ligand] LoRA targets={len(lig_targets)}")
+
+        # mode="active" 只对 LoRA 命中的层开检查点，所以必须把 inject_lora 返回的
+        # 层号透传过去（R23：不传 layers 会直接抛 ValueError）。
+        enabled = set_backbone_gradient_checkpointing(
+            self.esm, self.grad_checkpoint_backbone, layers=esm_lora_layers
+        )
+        print(f"[ESM] gradient checkpointing={self.grad_checkpoint_backbone}, layers={enabled}")
+
     def _reset_parameters(self):
         skip_prefixes = ("protein.backbone", "ligand.backbone")
         for name, m in self.named_modules():
@@ -959,6 +946,13 @@ class KineticsPredictor(nn.Module):
         outs_list, outs_dict = self.multi_head(x, cond=x)
         self.last_pred_dict = outs_dict  # 方便你在外部拿到完整字典，比如 outs_dict["kcat"] shape=(B,1)
 
+        # affinity 在末端分叉：trunk 与 kinetics 完全共用，这里直接短路掉
+        # source-residual 与 domain-uncertainty 两段——它们用的 s_* 参数在
+        # affinity 通路里根本不存在。
+        if getattr(self.cfg, "task", "kinetics") == "affinity":
+            affinity = outs_dict["affinity"]
+            return affinity[..., 0], affinity[..., 1]
+
         heads = self.cfg.active_heads  # e.g. ["kcat","Km","ratio"]
         outs_list = [outs_dict[name].squeeze(-1) for name in heads]
 
@@ -1021,6 +1015,8 @@ class KineticsPredictor(nn.Module):
             Compute simple gradient-based saliency on protein residues.
             Returns (sal_protein, p_mask).
             """
+            if getattr(self.cfg, "task", "kinetics") == "affinity":
+                raise NotImplementedError("saliency 目前只支持 kinetics 通路")
             self.eval()
             for p in self.parameters():
                 p.requires_grad_(True)
