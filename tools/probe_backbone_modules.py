@@ -20,14 +20,6 @@ from typing import Any
 
 import torch.nn as nn
 
-# describe_backbone 需要 `from models.plm_backbones import ...`。按文件路径直接运行
-# （python tools/probe_backbone_modules.py）时 sys.path[0] 是 tools/，仓库根不在
-# sys.path 上，该导入会以 "No module named 'models'" 失败，hidden_size / num_layers
-# 静默变成 null。这里显式把仓库根放到 sys.path 最前面，保证两种启动方式都能解析。
-_REPO_ROOT = str(Path(__file__).resolve().parents[1])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 
 def describe_backbone(model: nn.Module, config: Any) -> dict:
     """收集 LoRA 目标发现所需的全部信息。纯读取，不修改模型。"""
@@ -100,8 +92,39 @@ def main() -> int:
 
     print("\n=== 建议的 LoRA 后缀白名单（取 Linear 末段名，人工筛选后填入 plm_backbones） ===")
     print(json.dumps(info["leaf_names"], ensure_ascii=False))
+
+    # stdout 与 --out 产物先落地，再决定退出码：即使 resolve 失败，模块命名 dump 也
+    # 必须留下供人工判断（这是探针的主要价值）。但退出码不能是 0 —— 集群验收检查的
+    # 正是 hidden_size == 2560 / num_layers == 80，静默返回 0 会让一次什么都没解析
+    # 出来的探测看起来成功。
+    unresolved = [key for key in ("hidden_size", "num_layers") if info[key] is None]
+    if unresolved:
+        reasons = [
+            item for item in info["layer_names_sample"] if "resolve failed" in item
+        ]
+        print(f"[PROBE-FAILURE] 无法解析: {', '.join(unresolved)}", file=sys.stderr)
+        for reason in reasons:
+            print(f"[PROBE-FAILURE] 原因: {reason}", file=sys.stderr)
+        print(
+            "[PROBE-FAILURE] 退出码 2：上述字段为 null，本次探测结果不可用于确定 "
+            "LoRA target_modules。",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 
 if __name__ == "__main__":
+    # describe_backbone 需要 `from models.plm_backbones import ...`。按文件路径直接运行
+    # （python tools/probe_backbone_modules.py）时 sys.path[0] 是 tools/，仓库根不在
+    # sys.path 上，该导入会以 "No module named 'models'" 失败，hidden_size / num_layers
+    # 静默变成 null。这里显式把仓库根放到 sys.path 最前面，保证两种启动方式都能解析。
+    #
+    # 只在脚本模式下改动 sys.path：本文件会被测试模块在收集期 import，import 期的
+    # sys.path 变更会改变整个 pytest 会话的导入优先级，让仓库根的 data.py / utils.py /
+    # tracing.py / path_config.py 遮蔽同名的已安装发行包。
+    _REPO_ROOT = str(Path(__file__).resolve().parents[1])
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+
     raise SystemExit(main())
