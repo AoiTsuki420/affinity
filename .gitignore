@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 .pytest_cache/
@@ -19,3 +19,5 @@ checkpoints/
 !examples/*.csv
 .env
 .DS_Store
+.worktrees/
+.superpowers/
