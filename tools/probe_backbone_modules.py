@@ -5,8 +5,8 @@ ESMC-6B 通过 trust_remote_code 加载，其模块命名不可先验假定；
 
 用法（集群上，需要权重可访问）::
 
-    python tools/probe_backbone_modules.py --model biohub/ESMC-6B --kind esmc
-    python tools/probe_backbone_modules.py \
+    python -m tools.probe_backbone_modules --model biohub/ESMC-6B --kind esmc
+    python -m tools.probe_backbone_modules \
         --model ibm-research/MoLFormer-XL-both-10pct --kind molformer \
         --revision 7b12d946c181a37f6012b9dc3b002275de070314
 """
@@ -14,9 +14,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
+
+# describe_backbone 需要 `from models.plm_backbones import ...`。按文件路径直接运行
+# （python tools/probe_backbone_modules.py）时 sys.path[0] 是 tools/，仓库根不在
+# sys.path 上，该导入会以 "No module named 'models'" 失败，hidden_size / num_layers
+# 静默变成 null。这里显式把仓库根放到 sys.path 最前面，保证两种启动方式都能解析。
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 def describe_backbone(model: nn.Module, config: Any) -> dict:
