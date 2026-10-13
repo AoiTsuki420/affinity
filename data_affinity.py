@@ -66,7 +66,18 @@ class AffinityScaler:
 
 
 class AffinityDataset(Dataset):
-    """PDBbind 亲和力数据集：单标签列，可选 source（亲和力类型）。"""
+    """PDBbind 亲和力数据集：单标签列，可选 source（亲和力类型）。
+
+    ``return_source`` 仅供离线分析（例如按 Kd/Ki/IC50 分组统计）。置 True 时
+    ``__getitem__`` 返回 4 元组 ``(seq, smi, y, source)``，而这个 4 元组落进
+    ``utils.unpack_batch`` 时会走 ``len(batch) == 4`` 分支，把第 4 个元素当成
+    **row id** 绑定（utils.py:774-776），即把亲和力类型字符串静默错绑成
+    ``row_ids``。因此训练/推理 loader 必须保持默认的 ``return_source=False``
+    （3 元组 ``(seq, smi, y)``，走 utils.py:771-773）。
+
+    ``supervised`` 只是接受并保存，affinity 通路始终携带标签，不会因为
+    ``supervised=False`` 而省略 ``y``。
+    """
 
     SEQ_COLUMNS = ("Sequence", "sequence", "Protein Sequence", "protein_sequence")
     SMI_COLUMNS = ("Smiles", "SMILES", "smiles", "Substrate SMILES", "Substrate_SMILES")

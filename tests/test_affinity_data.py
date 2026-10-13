@@ -68,6 +68,26 @@ def test_transform_preserves_nan_for_invalid_rows():
     assert np.isfinite(z[0]) and np.isfinite(z[2])
 
 
+def test_transform_masks_infinities_not_just_nan():
+    """±inf 与 NaN 一样必须映射成 NaN——只有有限值掩码能做到这点。
+
+    NaN 自己会顺着算术传播，所以「掩码写」与「整体写」在 NaN 上无法区分；
+    inf 则不同：不掩码时 (inf - mean) / scale 仍是 inf，会原样漏进输出。
+    """
+    fit_y = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    scaler = AffinityScaler().fit(fit_y)
+
+    z = scaler.transform(np.array([1.0, np.inf, np.nan, -np.inf, 3.0], dtype=np.float32))
+
+    # 非有限位置（inf / -inf / nan）必须全部是 NaN，而不是 ±inf 或 0。
+    assert np.isnan(z[1]), f"np.inf 未掩码，得到 {z[1]!r}"
+    assert np.isnan(z[2]), f"np.nan 未掩码，得到 {z[2]!r}"
+    assert np.isnan(z[3]), f"-np.inf 未掩码，得到 {z[3]!r}"
+    # 有限位置照常标准化：fit 用的 [1, 2, 3] 标准化后约 [-1.2247, 0, 1.2247]。
+    assert np.isfinite(z[[0, 4]]).all()
+    np.testing.assert_allclose(z[[0, 4]], [-1.224745, 1.224745], atol=1e-5)
+
+
 def test_save_and_load_round_trip(scratch_dir):
     y = np.array([-1.0, 0.5, 3.0, 9.0], dtype=np.float32)
     scaler = AffinityScaler().fit(y)
