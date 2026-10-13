@@ -26,3 +26,5 @@ pytest-cache-files-*/
 probe-mode-dir/
 probe-scratch-*/
 tmp????????/
+.pytest-tmp/
+.pytmp/
