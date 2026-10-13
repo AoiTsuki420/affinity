@@ -7,8 +7,6 @@ from .encoders import ProteinEncoder, LigandEncoder
 from .interactions import CrossAttentionBlock, ResidueMask,LigandMask
 from utils import masked_mean
 import json
-import loralib as lora
-from peft import LoraConfig, get_peft_model
 from transformers import AutoModel
 from transformers import AutoModelForSeq2SeqLM
 
@@ -531,6 +529,8 @@ class KineticsPredictor(nn.Module):
             self.phys_fusion = None
 
         if self.use_lora:
+            from peft import LoraConfig, get_peft_model
+
             def _count_lora_params(model):
                 n_params, n_tensors = 0, 0
                 for name, p in model.named_parameters():
