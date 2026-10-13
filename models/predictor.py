@@ -91,21 +91,21 @@ class PredictorConfig:
             "ratio": {**default_spec},
         }
 
-        # R40：直接构造 PredictorConfig(task="affinity") 会保留 kinetics 的 head_specs，
-        # forward 直到 multi_head 里 outs_dict["affinity"] 才抛裸 KeyError。这里提前拦下。
-        # active_heads 的缺省值同样是 kinetics 三头，所以只检查 active_heads 会漏掉
-        # task="affinity" 这个例子：task 真正要读的 head 必须一并纳入检查。
-        required_heads = list(self.active_heads)
-        if task == "affinity":
-            required_heads.append("affinity")
-        missing_heads = [name for name in required_heads if name not in self.head_specs]
-        if missing_heads:
+        # R40（R42 收紧后）：直接构造 PredictorConfig(task="affinity") 会让 active_heads 与
+        # head_specs 一起停在 kinetics 缺省值上，两者的**相互一致性**检查看不出问题，
+        # forward 直到 multi_head 里 outs_dict["affinity"] 才抛裸 KeyError。所以这里只针对
+        # affinity 任务要求 affinity head 存在。
+        # 不做「active_heads 里每个 head 都必须有 spec」的通用校验：MultiHead 有意容忍
+        # 缺失 spec（`spec = cfg.head_specs.get(name, {})`，回退到 head_hidden_dim /
+        # head_depth / dropout），而 main_infer_predictor.py:90-102 会按 checkpoint 里实际
+        # 存在的 head 构造**部分** head_specs（只含 kcat 是合法输入），通用校验会误伤它。
+        if task == "affinity" and "affinity" not in self.head_specs:
             raise ValueError(
-                f"head_specs 缺少 forward 需要的 head: {missing_heads}；"
-                f"task={task!r}，active_heads={self.active_heads}，"
+                'task="affinity" 需要 head_specs 里有 "affinity"（out_dim=2）；'
+                f"active_heads={self.active_heads}，"
                 f"head_specs 现有键: {sorted(self.head_specs)}。"
                 "直接构造 PredictorConfig(task=...) 不会自动切换 head_specs，"
-                "请显式传入对应的 head_specs，或改用 PredictorConfig.for_task(...)。"
+                "请显式传入 head_specs，或改用 PredictorConfig.for_task(...)。"
             )
 
         self.share_fusion = share_fusion

@@ -368,11 +368,29 @@ def _compute_affinity_metrics(y_true, y_pred, sigma=None):
 
     if sigma is not None:
         sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)[valid]
-        metrics["nll"] = float(
-            0.5 * (np.log(2 * np.pi * np.maximum(sigma, 1e-8))
-                   + (y_true - y_pred) ** 2 / np.maximum(sigma, 1e-8)).mean()
-        )
+        # 与 kinetics 的 _compute_task_metrics_with_sigma 同口径：非有限 / 非正的 sigma
+        # 直接剔除，否则一个 NaN sigma 会把整个 NLL 变成 NaN。
+        sigma_valid = np.isfinite(sigma) & (sigma > 0)
+        if sigma_valid.any():
+            sigma_v = np.maximum(sigma[sigma_valid], 1e-8)
+            err_v = y_true[sigma_valid] - y_pred[sigma_valid]
+            metrics["nll"] = float(
+                0.5 * (np.log(2 * np.pi * sigma_v) + err_v ** 2 / sigma_v).mean()
+            )
+        else:
+            metrics["nll"] = float("nan")
     return metrics
+
+
+def _accumulate_affinity_loss_logs(sink, loss_logs):
+    """把 affinity_loss 的标量分项累加进 sink，供 train_epoch / val_epoch 写日志。
+
+    train_step 的返回形状保持标量损失不变（kinetics 侧同样只回传标量），分项通过
+    这个可选 sink 向上传，落在 swanlab 的 affinity_* / affinity_val_* 键上。
+    """
+    for key, value in loss_logs.items():
+        value = value.detach().item() if torch.is_tensor(value) else float(value)
+        sink[key] = sink.get(key, 0.0) + float(value)
 
 
 def _source_dist(df, source_col: str):
@@ -1165,6 +1183,7 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                kcat_group_dro_num_groups: int = 3,
                kcat_group_dro_mix: float = 1.0,
                args=None,
+               loss_log_sink=None,
                  ):
     
     model.train()
@@ -1298,11 +1317,13 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
                         source_ids=source_mb,
                         use_mask=use_mask,
                     )
-                    # loss_logs 是 affinity_loss 的分项（含 total）；train_step 只回传
-                    # 标量损失（与 kinetics 分支一致），分项暂不向上传。
                     loss_mb, loss_logs = compute_affinity_step_loss(
                         (mu, log_var), labels_mb, args, device
                     )
+                    # affinity_loss 的分项（huber/barron/nll/rank/var_reg/total）交给
+                    # 调用方汇总写日志；train_step 的返回形状仍是标量损失。
+                    if loss_log_sink is not None:
+                        _accumulate_affinity_loss_logs(loss_log_sink, loss_logs)
                     loss = loss_mb / max(int(getattr(args, "iters_to_accumulate", 1)), 1)
                 else:
                     try:
@@ -1636,6 +1657,7 @@ final_contact_store=None):
     n_samples = args.batch_size * n_batches #problem   
     n_out = 2 if str(getattr(args, "task", "kinetics")) == "affinity" else 3
     recorder = PredictionRecorder(n_samples, output_dim=n_out)
+    affinity_loss_logs = {}
     real_model = getattr(model, "module", model)
     use_gate_mask = True
     if ep <= getattr(args, "gate_warmup_epochs", 2):
@@ -1659,6 +1681,7 @@ final_contact_store=None):
             optimizer,
             scaler,
             args=args,
+            loss_log_sink=affinity_loss_logs,
             recorder=recorder,
             lam_l1=0,
             lam_tv=0,
@@ -1735,6 +1758,11 @@ final_contact_store=None):
 
 
         })
+        if affinity_loss_logs:
+            n_logged = max(len(losses), 1)
+            swanlab.log({
+                f"affinity_{k}": v / n_logged for k, v in affinity_loss_logs.items()
+            })
         print(f"{avg_loss:.4f} | lr={optimizer.param_groups[0]['lr']:.6e}")
 
     all_preds, all_labels = recorder.get()
@@ -1793,6 +1821,9 @@ def val_epoch(model, val_loader, ep, args, final_contact_store=None):
 
     s_k_raw_sum = s_m_raw_sum = s_r_raw_sum = 0.0
     s_k_eff_sum = s_m_eff_sum = s_r_eff_sum = 0.0
+
+    affinity_loss_logs = {}
+    affinity_batches = 0
 
     progress = tqdm(val_loader, desc=f"Val Epoch {ep}/{args.epochs}",
                     leave=False, disable=not is_main)
@@ -1855,9 +1886,11 @@ def val_epoch(model, val_loader, ep, args, final_contact_store=None):
                         source_ids=source_ids,
                         use_mask=False,
                     )
-                    val_loss, _ = compute_affinity_step_loss(
+                    val_loss, loss_logs = compute_affinity_step_loss(
                         (mu, log_var), labels, args, device
                     )
+                    _accumulate_affinity_loss_logs(affinity_loss_logs, loss_logs)
+                    affinity_batches += 1
                 else:
                     try:
                         pred_kcat, pred_Km, pred_act_tmp, gate_e, gate_s, s_raw, s_eff = model(
@@ -2004,6 +2037,12 @@ def val_epoch(model, val_loader, ep, args, final_contact_store=None):
         )        
     """
     
+    if affinity_loss_logs and is_main:
+        swanlab.log({
+            f"affinity_val_{k}": v / max(affinity_batches, 1)
+            for k, v in affinity_loss_logs.items()
+        })
+
     return avg_val_loss
 
 

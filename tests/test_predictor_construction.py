@@ -125,10 +125,16 @@ def test_config_rejects_affinity_task_without_affinity_head_spec():
         PredictorConfig(task="affinity")
 
 
-def test_config_rejects_active_head_without_head_spec():
-    """R40：active_heads 里的每个 head 都必须在 head_specs 里有定义。"""
-    with pytest.raises(ValueError, match="affinity"):
-        PredictorConfig(active_heads=["kcat", "affinity"])
+def test_config_allows_partial_head_specs_for_kinetics():
+    """R42：head_specs 允许只覆盖部分 head。
+
+    main_infer_predictor.py:90-102 按 checkpoint 里实际存在的 head 构造 head_specs，
+    只含 kcat 是合法输入；MultiHead 对缺失项走 cfg.head_specs.get(name, {}) 回退，
+    所以「active_heads 里每个 head 都必须有 spec」的通用校验会误伤这条推理路径。
+    """
+    cfg = PredictorConfig(head_specs={"kcat": _small_head(1)})
+    assert cfg.active_heads == ["kcat", "Km", "ratio"]
+    assert set(cfg.head_specs) == {"kcat"}
 
 
 def test_predictor_rejects_half_injected_encoders():

@@ -5,7 +5,90 @@ KinEAGER 原先在模块顶层 import peft 与 loralib，导致任何不装 peft
 """
 import sys
 
+import numpy as np
+import pandas as pd
 import pytest
+import torch
+from torch import nn
+from torch.optim import AdamW
+
+from utils import PredictionRecorder
+
+_AFFINITY_SAMPLES = {
+    "Sequence": ["MKT"] * 4,
+    "Smiles": ["CCO"] * 4,
+    "pKaffinity": [1.0, 2.0, 3.0, 4.0],
+}
+
+
+class _AffinityArgs:
+    task = "affinity"
+    epochs = 1
+    batch_size = 4
+    phys_ablation = "real"
+    gate_on_margin = 0.2
+    lambda_gate_off = 0.0
+    lambda_gate_on = 0.0
+    affinity_loss_type = "huber"
+    affinity_nll_weight = 0.05
+    affinity_rank_weight = 0.0
+    affinity_rank_margin = 0.0
+    affinity_var_reg_weight = 0.0
+    affinity_var_reg_mode = "abs"
+    iters_to_accumulate = 1
+
+
+class _VaryingAffinity(nn.Module):
+    """mu / log_var 都逐样本变化：常量 log_var 会被 recorder 的零初始化掩盖。"""
+
+    def __init__(self):
+        super().__init__()
+        self.p_mu = nn.Parameter(torch.tensor(0.1))
+        self.p_log_var = nn.Parameter(torch.tensor(0.75))
+
+    def forward(self, seqs, smiles, **kwargs):
+        idx = torch.arange(len(seqs), dtype=torch.float32)
+        return self.p_mu + 0.1 * idx, self.p_log_var + 0.5 * idx
+
+
+class _NoOpScaler:
+    """GradScaler(enabled=False) 的等价替身，避免触发 torch.cuda.amp 弃用告警。"""
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):
+        return None
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        return None
+
+
+class _ShapeSpyRecorder(PredictionRecorder):
+    """记录 update() 实际收到的形状：labels 必须已经是 (B, 2)，不能靠 numpy 广播。"""
+
+    def __init__(self, n_samples, output_dim=3):
+        super().__init__(n_samples, output_dim=output_dim)
+        self.seen = []
+
+    def update(self, preds, labels):
+        self.seen.append((np.shape(preds), np.shape(labels)))
+        super().update(preds=preds, labels=labels)
+
+
+def _affinity_batch():
+    """返回 (scaler, frame, batch)：batch 的标签已按 scaler 标准化。"""
+    from data_affinity import AffinityDataset, AffinityScaler
+    from torch.utils.data import DataLoader
+
+    frame = pd.DataFrame(_AFFINITY_SAMPLES)
+    scaler = AffinityScaler().fit(frame["pKaffinity"].to_numpy())
+    dataset = AffinityDataset(frame, label_col="pKaffinity", scaler=scaler)
+    batch = next(iter(DataLoader(dataset, batch_size=len(frame), shuffle=False)))
+    return scaler, frame, batch
 
 
 def _drop_modules():
@@ -121,118 +204,123 @@ def test_compute_affinity_metrics_scores_and_skips_non_finite_rows():
 
 @pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
 def test_train_step_affinity_branch_fills_two_column_recorder():
-    """R37：affinity 的 labels 必须以 (B, 2) 显式传入 recorder，两列同为标签。"""
-    import numpy as np
-    import pandas as pd
-    import torch
-    from torch import nn
-    from torch.optim import AdamW
-    from torch.utils.data import DataLoader
+    """R37：affinity 的 preds 是 (B, 2) = [mu, log_var]，labels 是显式 (B, 2) 标签副本。
 
-    from data_affinity import AffinityDataset, AffinityScaler
+    三个断言都必须是可证伪的：log_var 逐样本变化（只把 mu 写进 recorder 会失败）、
+    labels 是标准化后的标签（写原始标签或全零会失败）、update() 收到的 labels 已经是
+    二维 (B, 2)（传 (B,) 时 numpy 会在 update 内部静默广播，形状断言会失败）。
+    """
+    scaler, frame, batch = _affinity_batch()
     from main_train_predictor_multigpu import train_step
-    from utils import PredictionRecorder
 
-    class _Args:
-        task = "affinity"
-        affinity_loss_type = "huber"
-        affinity_nll_weight = 0.05
-        affinity_rank_weight = 0.0
-        affinity_rank_margin = 0.0
-        affinity_var_reg_weight = 0.0
-        affinity_var_reg_mode = "abs"
-        iters_to_accumulate = 1
-
-    class _DummyAffinity(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.p_mu = nn.Parameter(torch.tensor(0.1))
-            self.p_log_var = nn.Parameter(torch.tensor(0.0))
-
-        def forward(self, seqs, smiles, **kwargs):
-            one = torch.ones(len(seqs))
-            return self.p_mu * one, self.p_log_var * one
-
-    class _NoOpScaler:
-        """GradScaler(enabled=False) 的等价替身，避免触发 torch.cuda.amp 弃用告警。"""
-
-        def scale(self, loss):
-            return loss
-
-        def unscale_(self, optimizer):
-            return None
-
-        def step(self, optimizer):
-            optimizer.step()
-
-        def update(self):
-            return None
-
-    frame = pd.DataFrame({
-        "Sequence": ["MKT"] * 4,
-        "Smiles": ["CCO"] * 4,
-        "pKaffinity": [1.0, 2.0, 3.0, 4.0],
-    })
-    scaler = AffinityScaler().fit(frame["pKaffinity"].to_numpy())
-    dataset = AffinityDataset(frame, label_col="pKaffinity", scaler=scaler)
-    batch = next(iter(DataLoader(dataset, batch_size=4, shuffle=False)))
-
-    model = _DummyAffinity()
+    model = _VaryingAffinity()
     optimizer = AdamW(model.parameters(), lr=1e-3)
-    recorder = PredictionRecorder(4, output_dim=2)
+    recorder = _ShapeSpyRecorder(4, output_dim=2)
 
     loss = train_step(model, batch, optimizer, _NoOpScaler(),
-                      recorder=recorder, args=_Args())
+                      recorder=recorder, args=_AffinityArgs())
 
     assert np.isfinite(float(loss))
     preds, labels = recorder.get()
     assert preds.shape == (4, 2) and labels.shape == (4, 2)
-    assert np.allclose(labels[:, 0], labels[:, 1])
+    assert recorder.seen == [((4, 2), (4, 2))]
+
+    idx = np.arange(4, dtype=np.float32)
+    assert np.allclose(preds[:, 0], 0.1 + 0.1 * idx, atol=1e-6)
+    assert np.allclose(preds[:, 1], 0.75 + 0.5 * idx, atol=1e-6)
+
+    raw = frame["pKaffinity"].to_numpy()
+    expected = scaler.transform(raw)
+    assert np.allclose(labels[:, 0], expected, atol=1e-6)
+    assert not np.allclose(labels[:, 0], raw)
 
 
 @pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
-def test_val_epoch_affinity_branch_returns_finite_loss():
-    import numpy as np
-    import pandas as pd
-    import torch
-    from torch import nn
+def test_train_step_affinity_reports_sub_losses_to_the_sink():
+    """affinity_loss 的分项必须能被调用方拿到：train_epoch 用它写日志。"""
+    _, _, batch = _affinity_batch()
+    from main_train_predictor_multigpu import train_step
+
+    model = _VaryingAffinity()
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    sink = {}
+
+    loss = train_step(model, batch, optimizer, _NoOpScaler(),
+                      recorder=_ShapeSpyRecorder(4, output_dim=2),
+                      args=_AffinityArgs(), loss_log_sink=sink)
+
+    assert np.isfinite(float(loss))
+    for key in ("huber", "barron", "nll", "rank", "var_reg", "total"):
+        assert key in sink, f"affinity 分项 {key} 没有进入日志 sink"
+        assert np.isfinite(sink[key])
+
+
+@pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
+def test_val_epoch_affinity_branch_reports_sub_losses(monkeypatch):
+    from data_affinity import AffinityDataset
+    from main_train_predictor_multigpu import val_epoch
     from torch.utils.data import DataLoader
 
-    from data_affinity import AffinityDataset, AffinityScaler
-    from main_train_predictor_multigpu import val_epoch
+    import main_train_predictor_multigpu as training
 
-    class _Args:
-        task = "affinity"
-        epochs = 1
-        phys_ablation = "real"
-        gate_on_margin = 0.2
-        lambda_gate_off = 0.0
-        lambda_gate_on = 0.0
-        affinity_loss_type = "huber"
-        affinity_nll_weight = 0.05
-        affinity_rank_weight = 0.0
-        affinity_rank_margin = 0.0
-        affinity_var_reg_weight = 0.0
-        affinity_var_reg_mode = "abs"
-
-    class _DummyAffinity(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.p_mu = nn.Parameter(torch.tensor(0.2))
-            self.p_log_var = nn.Parameter(torch.tensor(-0.5))
-
-        def forward(self, seqs, smiles, **kwargs):
-            one = torch.ones(len(seqs))
-            return self.p_mu * one, self.p_log_var * one
-
-    frame = pd.DataFrame({
-        "Sequence": ["MKT"] * 3,
-        "Smiles": ["CCO"] * 3,
-        "pKaffinity": [1.0, 2.0, 3.0],
-    })
-    scaler = AffinityScaler().fit(frame["pKaffinity"].to_numpy())
+    scaler, frame, _ = _affinity_batch()
     loader = DataLoader(AffinityDataset(frame, label_col="pKaffinity", scaler=scaler),
-                        batch_size=3, shuffle=False)
+                        batch_size=4, shuffle=False)
+    logged = {}
+    monkeypatch.setattr(training.swanlab, "log", lambda payload: logged.update(payload))
 
-    loss = val_epoch(_DummyAffinity(), loader, 0, _Args())
+    loss = val_epoch(_VaryingAffinity(), loader, 0, _AffinityArgs())
+
     assert np.isfinite(float(loss))
+    assert "affinity_val_total" in logged and "affinity_val_huber" in logged
+    assert np.isfinite(logged["affinity_val_nll"])
+
+
+@pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
+def test_train_epoch_affinity_routes_sub_losses_to_swanlab(monkeypatch):
+    import pathlib
+    import shutil
+
+    from data_affinity import AffinityDataset
+    from main_train_predictor_multigpu import train_epoch
+    from torch.utils.data import DataLoader
+
+    import main_train_predictor_multigpu as training
+
+    scaler, frame, _ = _affinity_batch()
+    loader = DataLoader(AffinityDataset(frame, label_col="pKaffinity", scaler=scaler),
+                        batch_size=4, shuffle=False)
+    logged = {}
+    monkeypatch.setattr(training.swanlab, "log", lambda payload: logged.update(payload))
+
+    class _NoOpEMA:
+        def update(self, module):
+            return None
+
+    scratch = pathlib.Path("_scratch_epoch_loss_logs")
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setitem(training.RUNTIME_PATHS, "train_data_dir", scratch)
+    try:
+        model = _VaryingAffinity()
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        train_epoch(model, loader, optimizer, None, _NoOpScaler(), _NoOpEMA(),
+                    0, _AffinityArgs(), None, None, 0)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    assert "affinity_total" in logged and "affinity_huber" in logged
+    assert np.isfinite(logged["affinity_nll"])
+
+
+def test_compute_affinity_metrics_ignores_non_finite_sigma():
+    """R43 对位：非有限 sigma 不能污染 NLL，kinetics 路径同样先过滤 sigma。"""
+    from main_train_predictor_multigpu import _compute_affinity_metrics
+
+    poisoned = _compute_affinity_metrics([1.0, 2.0, 3.0], [1.0, 2.0, 3.0],
+                                        sigma=[0.5, float("nan"), 0.5])
+    assert np.isfinite(poisoned["nll"])
+    assert poisoned["nll"] > 0.0
+
+    dead = _compute_affinity_metrics([1.0, 2.0], [1.0, 2.0],
+                                     sigma=[float("nan"), float("inf")])
+    assert np.isnan(dead["nll"])
