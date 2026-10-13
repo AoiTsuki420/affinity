@@ -5,7 +5,7 @@ peft 与 esm 一律在函数内部 lazy import。
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch.nn as nn
 
@@ -58,3 +58,33 @@ def resolve_num_layers(config: Any, model: nn.Module | None = None) -> int:
         f"无法推断层数：config 无 {_NUM_LAYER_FIELDS}，"
         "模型也无 encoder.layer / encoder.block / layers / h"
     )
+
+
+def resolve_lora_layers(
+    num_layers: int,
+    policy: str,
+    last_k: int,
+    explicit: Sequence[int] | None = None,
+) -> list[int]:
+    """把 LoRA 层选择策略解析成显式的层号列表。"""
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        raise ValueError(f"num_layers 必须是正整数，得到 {num_layers!r}")
+
+    if policy in ("all", "full", "everything"):
+        return list(range(num_layers))
+
+    if policy == "last_k":
+        k = max(1, min(int(last_k), num_layers))
+        return list(range(num_layers - k, num_layers))
+
+    if policy == "explicit":
+        if not explicit:
+            raise ValueError("policy='explicit' 时必须提供 explicit 层号列表")
+        picked = sorted({int(i) for i in explicit if 0 <= int(i) < num_layers})
+        if not picked:
+            raise ValueError(
+                f"explicit 层号 {list(explicit)} 在 num_layers={num_layers} 范围内无有效项"
+            )
+        return picked
+
+    raise ValueError(f"未知的 LoRA 层策略: {policy!r}（支持 all / last_k / explicit）")
