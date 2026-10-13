@@ -6,8 +6,11 @@ peft 与 esm 一律在函数内部 lazy import。
 from __future__ import annotations
 
 import re
+import warnings
+from dataclasses import dataclass
 from typing import Any, Sequence
 
+import torch
 import torch.nn as nn
 
 KIND_ESMC = "esmc"
@@ -184,3 +187,222 @@ def discover_lora_targets(
         )
 
     return targets
+
+
+_KIND_KEYWORDS = (
+    ("esmc", KIND_ESMC),
+    ("molformer", KIND_MOLFORMER),
+    ("mol_former", KIND_MOLFORMER),
+    ("molt5", KIND_T5),
+    ("esm2", KIND_ESM2),
+)
+
+_CONFIG_MODEL_TYPE_MAP = {
+    "esmc": KIND_ESMC,
+    "molformer": KIND_MOLFORMER,
+    "t5": KIND_T5,
+    "esm": KIND_ESM2,
+}
+
+_DEFAULT_MAX_LENGTH = {
+    KIND_ESMC: 1024,
+    KIND_MOLFORMER: 202,
+    KIND_ESM2: 640,
+    KIND_T5: 384,
+}
+
+_TRUST_REMOTE_CODE_DEFAULT = {
+    KIND_ESMC: True,
+    KIND_MOLFORMER: True,
+    KIND_ESM2: False,
+    KIND_T5: False,
+}
+
+
+def default_max_length(kind: str) -> int:
+    if kind not in _DEFAULT_MAX_LENGTH:
+        raise ValueError(f"未知骨干类型: {kind!r}（支持 {SUPPORTED_KINDS}）")
+    return _DEFAULT_MAX_LENGTH[kind]
+
+
+def detect_kind(name: str, config: Any = None) -> str:
+    """按名字关键字判定骨干类型；失败时回退到 config.model_type。"""
+    lowered = (name or "").lower()
+    for keyword, kind in _KIND_KEYWORDS:
+        if keyword in lowered:
+            return kind
+
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    if model_type in _CONFIG_MODEL_TYPE_MAP:
+        return _CONFIG_MODEL_TYPE_MAP[model_type]
+
+    raise ValueError(
+        f"无法判定骨干类型：name={name!r}，config.model_type={model_type!r}。"
+        f"支持的类型: {SUPPORTED_KINDS}"
+    )
+
+
+@dataclass(frozen=True)
+class BackboneSpec:
+    name: str
+    kind: str
+    trust_remote_code: bool
+    max_length: int
+    hidden_size: int
+    num_layers: int
+    prefer_hidden_states: bool = False
+
+
+def _load_esmc(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
+    """ESMC 走 AutoModelForMaskedLM + trust_remote_code，tokenizer 来自 esm 包。"""
+    from transformers import AutoModelForMaskedLM
+
+    model = AutoModelForMaskedLM.from_pretrained(name, **kwargs)
+    try:
+        from esm.models.esmc import EsmcTokenizer
+    except ImportError as error:
+        raise ImportError(
+            "加载 ESMC 需要 esm 包来提供 EsmcTokenizer（transformers 未注册该名字）。"
+            "请先安装：pip install esm"
+        ) from error
+    return model, EsmcTokenizer(), True
+
+
+def _load_molformer(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
+    """MoLFormer 是 encoder-only，没有 get_encoder()。"""
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(name, **kwargs)
+    return model, tokenizer, False
+
+
+def _load_esm2(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
+    from transformers import EsmModel, EsmTokenizer
+
+    tokenizer = EsmTokenizer.from_pretrained(name)
+    model = EsmModel.from_pretrained(name, **kwargs)
+    return model, tokenizer, False
+
+
+def _load_t5(name: str, **kwargs) -> tuple[nn.Module, Any, bool]:
+    from transformers import T5EncoderModel, T5Tokenizer
+
+    tokenizer = T5Tokenizer.from_pretrained(name)
+    model = T5EncoderModel.from_pretrained(name, **kwargs)
+    return model, tokenizer, False
+
+
+_LOADERS = {
+    KIND_ESMC: _load_esmc,
+    KIND_MOLFORMER: _load_molformer,
+    KIND_ESM2: _load_esm2,
+    KIND_T5: _load_t5,
+}
+
+
+def _load(name: str, *, kind=None, trust_remote_code=None, max_length=None,
+          revision=None) -> tuple[nn.Module, Any, BackboneSpec]:
+    resolved_kind = kind or detect_kind(name)
+    if resolved_kind not in _LOADERS:
+        raise ValueError(f"未知骨干类型: {resolved_kind!r}（支持 {SUPPORTED_KINDS}）")
+
+    if trust_remote_code is None:
+        trust_remote_code = _TRUST_REMOTE_CODE_DEFAULT[resolved_kind]
+
+    kwargs = {}
+    if trust_remote_code:
+        kwargs["trust_remote_code"] = True
+    if revision:
+        kwargs["revision"] = revision
+
+    model, tokenizer, prefer_hidden_states = _LOADERS[resolved_kind](name, **kwargs)
+
+    spec = BackboneSpec(
+        name=name,
+        kind=resolved_kind,
+        trust_remote_code=bool(trust_remote_code),
+        max_length=int(max_length or default_max_length(resolved_kind)),
+        hidden_size=resolve_hidden_size(model.config),
+        num_layers=resolve_num_layers(model.config, model),
+        prefer_hidden_states=prefer_hidden_states,
+    )
+    return model, tokenizer, spec
+
+
+def load_protein_backbone(name: str, *, kind=None, trust_remote_code=None,
+                          max_length=None, revision=None) -> tuple[nn.Module, Any, BackboneSpec]:
+    return _load(name, kind=kind, trust_remote_code=trust_remote_code,
+                 max_length=max_length, revision=revision)
+
+
+def load_ligand_backbone(name: str, *, kind=None, trust_remote_code=None,
+                         max_length=None, revision=None) -> tuple[nn.Module, Any, BackboneSpec]:
+    return _load(name, kind=kind, trust_remote_code=trust_remote_code,
+                 max_length=max_length, revision=revision)
+
+
+def forward_hidden_states(backbone: nn.Module, inputs: dict,
+                          *, output_hidden_states: bool = False) -> torch.Tensor:
+    """取 token 级 hidden state。单次前向，不重复计算。"""
+    if output_hidden_states:
+        outputs = backbone(**inputs, output_hidden_states=True)
+        states = getattr(outputs, "hidden_states", None)
+        if states:
+            return torch.nan_to_num(states[-1])
+        hidden = getattr(outputs, "last_hidden_state", None)
+    else:
+        outputs = backbone(**inputs)
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            states = getattr(outputs, "hidden_states", None)
+            if states:
+                hidden = states[-1]
+
+    if hidden is None:
+        attrs = sorted(vars(outputs)) if hasattr(outputs, "__dict__") else []
+        raise ValueError(
+            "骨干输出里既没有 last_hidden_state 也没有可用的 hidden_states；"
+            f"实际属性: {attrs}。若该模型需要 output_hidden_states=True，请显式传入。"
+        )
+    return torch.nan_to_num(hidden)
+
+
+def _special_token_ids(tokenizer) -> set[int]:
+    ids = set(int(i) for i in (getattr(tokenizer, "all_special_ids", None) or []))
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id", "cls_token_id", "sep_token_id"):
+        value = getattr(tokenizer, attr, None)
+        if isinstance(value, int):
+            ids.add(int(value))
+    return ids
+
+
+def build_token_mask(tokenizer, inputs: dict, *, strip_special: bool = True) -> torch.Tensor:
+    """从 attention_mask 出发；strip_special 时额外剔除 BOS/EOS 等特殊 token。
+
+    ESMC 的输出保留 2 个特殊 token，不剔除会污染下游的 masked_mean 池化。
+    """
+    mask = inputs["attention_mask"].bool().clone()
+    if not strip_special:
+        return mask
+
+    ids = inputs["input_ids"]
+    special_ids = _special_token_ids(tokenizer)
+    if not special_ids:
+        return mask
+
+    special = torch.zeros_like(ids, dtype=torch.bool)
+    for token_id in special_ids:
+        special |= (ids == token_id)
+
+    per_row = special.sum(dim=1)
+    if per_row.numel() > 0:
+        typical = int(per_row.float().median().item())
+        if typical not in (0, 2):
+            warnings.warn(
+                f"特殊 token 数的中位数为 {typical}（预期 0 或 2）。"
+                "tokenizer 的特殊 token 集合可能不完整，请检查 build_token_mask 的输入。",
+                stacklevel=2,
+            )
+
+    return mask & ~special

@@ -296,3 +296,160 @@ def test_discover_matches_spec_required_bare_leaf_forms():
             "fc1", "fc2",
         )
     )
+
+
+import torch
+
+from models.plm_backbones import (
+    KIND_ESM2,
+    KIND_ESMC,
+    KIND_MOLFORMER,
+    KIND_T5,
+    build_token_mask,
+    default_max_length,
+    detect_kind,
+    forward_hidden_states,
+)
+
+
+def test_detect_kind_esmc():
+    assert detect_kind("biohub/ESMC-6B") == KIND_ESMC
+
+
+def test_detect_kind_molformer():
+    assert detect_kind("ibm-research/MoLFormer-XL-both-10pct") == KIND_MOLFORMER
+
+
+def test_detect_kind_t5():
+    assert detect_kind("/models/molt5-base-smiles2caption") == KIND_T5
+
+
+def test_detect_kind_esm2():
+    assert detect_kind("/models/esm2_t33_650M_UR50D") == KIND_ESM2
+
+
+def test_detect_kind_falls_back_to_config_model_type():
+    assert detect_kind("/some/local/dir", SimpleNamespace(model_type="molformer")) == KIND_MOLFORMER
+
+
+def test_detect_kind_raises_for_unknown():
+    with pytest.raises(ValueError):
+        detect_kind("/some/local/dir", SimpleNamespace(model_type="llama"))
+
+
+def test_default_max_length_matches_reference():
+    """MoLFormer 的 token 上限是 202（xtrimofold3 docs/pdbbind_molformer.md:127）。"""
+    assert default_max_length(KIND_MOLFORMER) == 202
+    assert default_max_length(KIND_ESMC) == 1024
+    assert default_max_length(KIND_ESM2) == 640
+    assert default_max_length(KIND_T5) == 384
+
+
+def test_forward_hidden_states_prefers_last_hidden_state():
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            return SimpleNamespace(last_hidden_state=torch.ones(2, 3, 4))
+
+    out = forward_hidden_states(_Backbone(), {})
+    assert out.shape == (2, 3, 4)
+
+
+def test_forward_hidden_states_uses_hidden_states_when_requested():
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            assert kwargs.get("output_hidden_states") is True
+            states = (torch.zeros(2, 3, 4), torch.full((2, 3, 4), 7.0))
+            return SimpleNamespace(hidden_states=states, last_hidden_state=None)
+
+    out = forward_hidden_states(_Backbone(), {}, output_hidden_states=True)
+    assert torch.all(out == 7.0)
+
+
+def test_forward_hidden_states_nan_to_num():
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            return SimpleNamespace(last_hidden_state=torch.tensor([[[float("nan")]]]))
+
+    out = forward_hidden_states(_Backbone(), {})
+    assert torch.isfinite(out).all()
+
+
+def test_forward_hidden_states_raises_with_attr_listing():
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            return SimpleNamespace(logits=torch.zeros(1))
+
+    with pytest.raises(ValueError) as excinfo:
+        forward_hidden_states(_Backbone(), {})
+    assert "logits" in str(excinfo.value)
+
+
+class _FakeTokenizer:
+    all_special_ids = [0, 2]
+
+
+def test_build_token_mask_strips_special_tokens():
+    inputs = {
+        "input_ids": torch.tensor([[0, 5, 6, 2], [0, 7, 2, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]]),
+    }
+    mask = build_token_mask(_FakeTokenizer(), inputs)
+    assert mask.tolist() == [[False, True, True, False], [False, True, False, False]]
+
+
+def test_build_token_mask_keeps_special_when_disabled():
+    inputs = {
+        "input_ids": torch.tensor([[0, 5, 2]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+    }
+    mask = build_token_mask(_FakeTokenizer(), inputs, strip_special=False)
+    assert mask.tolist() == [[True, True, True]]
+
+
+def test_build_token_mask_without_special_ids_is_identity():
+    class _NoSpecial:
+        all_special_ids = []
+
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+    }
+    mask = build_token_mask(_NoSpecial(), inputs)
+    assert mask.tolist() == [[True, True, True]]
+
+
+from models.plm_backbones import load_protein_backbone
+
+
+def test_load_esmc_without_esm_package_raises_install_hint(monkeypatch):
+    """spec §8 错误表：`esm` 包缺失时，ESMC 通路必须在加载期抛出带安装提示的 ImportError。
+
+    只桩掉权重加载那一步（本机无网络也无 ESMC-6B 权重），使流程真正走到 tokenizer 的
+    `from esm.models.esmc import EsmcTokenizer`，避免测试因为更早的失败而假通过。
+    """
+    import transformers
+
+    loaded = []
+
+    def _fake_from_pretrained(cls, name, **kwargs):
+        loaded.append((name, kwargs))
+        return object()
+
+    monkeypatch.setattr(
+        transformers.AutoModelForMaskedLM,
+        "from_pretrained",
+        classmethod(_fake_from_pretrained),
+    )
+
+    with pytest.raises(ImportError) as excinfo:
+        load_protein_backbone("biohub/ESMC-6B", max_length=1024)
+
+    message = str(excinfo.value)
+    assert "esm" in message, message
+    assert "pip install esm" in message, message
+
+    # 证明这个 ImportError 确实源自缺失的 esm 包，而不是任何更早的 import 失败。
+    assert loaded, "模型加载步骤没有被执行，流程没走到 tokenizer 导入"
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ImportError), cause
+    assert getattr(cause, "name", None) == "esm", cause
