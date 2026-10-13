@@ -21,3 +21,5 @@ checkpoints/
 .DS_Store
 .worktrees/
 .superpowers/
+.piptmp/
+pytest-cache-files-*/
