@@ -5,6 +5,7 @@ peft 与 esm 一律在函数内部 lazy import。
 """
 from __future__ import annotations
 
+import functools
 import re
 import warnings
 from dataclasses import dataclass
@@ -422,3 +423,129 @@ def build_token_mask(tokenizer, inputs: dict, *, strip_special: bool = True) -> 
             )
 
     return mask & ~special
+
+
+def count_lora_parameters(model: nn.Module) -> tuple[int, int]:
+    """返回 (可训练 LoRA 参数总数, LoRA 张量数)。"""
+    n_params = 0
+    n_tensors = 0
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            n_tensors += 1
+            if param.requires_grad:
+                n_params += param.numel()
+    return n_params, n_tensors
+
+
+def _layer_containers(model: nn.Module):
+    """产出 (层号, 层模块) 的可迭代序列，用于定位逐层属性。"""
+    containers = (
+        ("encoder", "layer"),
+        ("encoder", "block"),
+        (None, "layers"),
+        (None, "h"),
+    )
+    for holder_name, attr in containers:
+        holder = model if holder_name is None else getattr(model, holder_name, None)
+        if holder is None:
+            continue
+        seq = getattr(holder, attr, None)
+        if seq is not None and hasattr(seq, "__len__") and len(seq) > 0:
+            for index, module in enumerate(seq):
+                yield index, module
+            return
+
+
+def inject_lora(
+    model: nn.Module,
+    *,
+    r: int,
+    alpha: int,
+    dropout: float,
+    policy: str,
+    last_k: int,
+    explicit_layers: Sequence[int] | None = None,
+    suffixes: Sequence[str] | None = None,
+) -> tuple[nn.Module, list[str], list[int]]:
+    """按策略注入 LoRA，返回 (peft 模型, 命中的目标名, 命中的层号)。
+
+    peft 在函数内 lazy import，使本模块在未安装 peft 的环境里仍可导入与测试纯函数。
+    """
+    from peft import LoraConfig, get_peft_model
+
+    num_layers = resolve_num_layers(getattr(model, "config", None) or _NullConfig(), model)
+    layers = resolve_lora_layers(num_layers, policy, last_k, explicit=explicit_layers)
+    targets = discover_lora_targets(model, layers=layers, suffixes=suffixes)
+
+    lora_config = LoraConfig(
+        r=int(r),
+        lora_alpha=int(alpha),
+        target_modules=targets,
+        lora_dropout=float(dropout),
+        bias="none",
+        task_type="FEATURE_EXTRACTION",
+    )
+    peft_model = get_peft_model(model, lora_config)
+
+    n_params, n_tensors = count_lora_parameters(peft_model)
+    if n_tensors == 0 or n_params == 0:
+        raise AssertionError(
+            f"LoRA 注入后没有可训练张量：tensors={n_tensors}, params={n_params}。"
+            f"targets={targets[:10]}..."
+        )
+    return peft_model, targets, layers
+
+
+class _NullConfig:
+    """占位 config，使 resolve_num_layers 走模型结构回退路径。"""
+
+
+def set_backbone_gradient_checkpointing(
+    model: nn.Module,
+    mode: str,
+    *,
+    layers: Sequence[int] | None = None,
+) -> int:
+    """按模式开关骨干的逐层梯度检查点，返回被开启的层数。
+
+    mode='active' 只对 LoRA 命中的层开启：前段层因无 LoRA 而不建图，
+    对它们开检查点只会白白增加重算开销。
+
+    逐层属性成对设置，镜像 transformers 的
+    `PreTrainedModel._set_gradient_checkpointing`：布尔量是唯一的开关，
+    `_gradient_checkpointing_func` 始终指向可用的检查点实现。二者必须同时赋值——
+    `GradientCheckpointingLayer.__call__` 在开关为真时会调用
+    `self._gradient_checkpointing_func`，而基类并不提供该属性，只设布尔量会让真实骨干
+    （EsmLayer 等）的第一次前向抛 AttributeError。
+    这里刻意传 use_reentrant=False：HF 传裸 checkpoint 会触发 torch 的 use_reentrant
+    弃用警告。
+    """
+    if mode not in ("off", "active", "all"):
+        raise ValueError(f"未知的梯度检查点模式: {mode!r}（支持 off / active / all）")
+
+    wanted = None if layers is None else {int(i) for i in layers}
+    checkpoint_func = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+
+    enabled = 0
+    touched = 0
+    for index, module in _layer_containers(model):
+        touched += 1
+        if mode == "off":
+            should_enable = False
+        elif mode == "all":
+            should_enable = True
+        else:
+            should_enable = wanted is not None and index in wanted
+
+        if hasattr(module, "gradient_checkpointing"):
+            module._gradient_checkpointing_func = checkpoint_func
+            module.gradient_checkpointing = should_enable
+        if should_enable:
+            enabled += 1
+
+    if mode != "off" and touched == 0:
+        raise ValueError(
+            "无法定位骨干的层容器（encoder.layer / encoder.block / layers / h），"
+            "梯度检查点未生效。"
+        )
+    return enabled

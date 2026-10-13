@@ -581,3 +581,161 @@ def test_load_threads_revision_and_trust_remote_code_to_tokenizer(monkeypatch):
 
     assert tokenizer_calls == [(name, {"revision": revision})]
     assert model_calls == tokenizer_calls
+
+
+# peft 是可选依赖：用模块级 try/except + 逐条 skipif，绝不能用 pytest.importorskip。
+# importorskip 在模块导入期执行，会把本文件里 Tasks 2-5 的全部测试一起跳过。
+try:
+    import peft  # noqa: F401
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+
+requires_peft = pytest.mark.skipif(not HAS_PEFT, reason="peft not installed")
+
+from transformers.modeling_layers import GradientCheckpointingLayer
+
+from models.plm_backbones import (
+    count_lora_parameters,
+    inject_lora,
+    set_backbone_gradient_checkpointing,
+)
+
+
+class _Block(GradientCheckpointingLayer):
+    """与真骨干同构的层：基类的 __call__ 在开关为真时要求 self._gradient_checkpointing_func。
+
+    用普通 nn.Module 当夹具会让这条代码路径永远走不到，于是"只设布尔量"的实现
+    （真骨干上第一次前向就 AttributeError）能在本地全绿。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.attention = torch.nn.Module()
+        self.attention.self = torch.nn.Module()
+        self.attention.self.query = torch.nn.Linear(8, 8)
+        self.attention.self.key = torch.nn.Linear(8, 8)
+        self.attention.self.value = torch.nn.Linear(8, 8)
+        self.gradient_checkpointing = False
+        self.forward_calls = 0
+
+    def forward(self, hidden_states):
+        # 非重入式检查点在反向时会重算一次，forward_calls 因此能证明检查点真的生效，
+        # 而不只是布尔量被设成了 True。
+        self.forward_calls += 1
+        mixed = self.attention.self.query(hidden_states) + self.attention.self.value(hidden_states)
+        return torch.tanh(mixed)
+
+
+class _PeftableBackbone(torch.nn.Module):
+    def __init__(self, num_layers=6):
+        super().__init__()
+        self.encoder = torch.nn.Module()
+        self.encoder.layer = torch.nn.ModuleList([_Block() for _ in range(num_layers)])
+        self.config = SimpleNamespace(hidden_size=8, num_hidden_layers=num_layers)
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        hidden = input_ids.float()
+        for layer in self.encoder.layer:
+            hidden = layer(hidden)
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
+@requires_peft
+def test_inject_lora_last_k_hits_expected_layers():
+    model, targets, layers = inject_lora(
+        _PeftableBackbone(6), r=4, alpha=8, dropout=0.0,
+        policy="last_k", last_k=2,
+    )
+    assert layers == [4, 5]
+    assert all((".layer.4." in t) or (".layer.5." in t) for t in targets)
+    assert len(targets) == 2 * 3
+
+
+@requires_peft
+def test_inject_lora_produces_trainable_lora_parameters():
+    model, targets, _ = inject_lora(
+        _PeftableBackbone(6), r=4, alpha=8, dropout=0.0,
+        policy="last_k", last_k=2,
+    )
+    n_params, n_tensors = count_lora_parameters(model)
+    # peft 给每个命中模块各建一个 lora_A(r×in) 与一个 lora_B(out×r)，故张量数是目标数的 2 倍；
+    # 夹具里 in = out = 8，每个目标 16·r = 64 个参数，6 个目标共 384。
+    assert n_tensors == 2 * len(targets)
+    assert n_params == 16 * 4 * len(targets)
+
+
+@requires_peft
+def test_inject_lora_r_zero_style_smaller_rank_is_cheaper():
+    small, _, _ = inject_lora(_PeftableBackbone(6), r=2, alpha=8, dropout=0.0,
+                              policy="last_k", last_k=2)
+    large, _, _ = inject_lora(_PeftableBackbone(6), r=8, alpha=8, dropout=0.0,
+                              policy="last_k", last_k=2)
+    assert count_lora_parameters(small)[0] < count_lora_parameters(large)[0]
+
+
+def test_set_gradient_checkpointing_active_only_touches_selected_layers():
+    model = _PeftableBackbone(6)
+    n = set_backbone_gradient_checkpointing(model, "active", layers=[4, 5])
+    assert n == 2
+    flags = [model.encoder.layer[i].gradient_checkpointing for i in range(6)]
+    assert flags == [False, False, False, False, True, True]
+
+
+def test_set_gradient_checkpointing_all_sets_every_layer():
+    model = _PeftableBackbone(6)
+    n = set_backbone_gradient_checkpointing(model, "all", layers=[4, 5])
+    assert n == 6
+    assert all(model.encoder.layer[i].gradient_checkpointing for i in range(6))
+
+
+def test_set_gradient_checkpointing_off_clears_flags():
+    model = _PeftableBackbone(6)
+    set_backbone_gradient_checkpointing(model, "all", layers=[4, 5])
+    n = set_backbone_gradient_checkpointing(model, "off", layers=[4, 5])
+    assert n == 0
+    assert not any(model.encoder.layer[i].gradient_checkpointing for i in range(6))
+
+    # 关掉之后必须真的不再触发检查点：真跑一次前向 + 反向，每层只应前向一次
+    # （若仍有层在检查点里，反向重算会让它的计数变成 2）。
+    out = model(input_ids=torch.randn(2, 3, 8))
+    out.last_hidden_state.sum().backward()
+    assert [layer.forward_calls for layer in model.encoder.layer] == [1] * 6
+
+
+def test_set_gradient_checkpointing_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        set_backbone_gradient_checkpointing(_PeftableBackbone(2), "banana")
+
+
+@requires_peft
+def test_gradient_checkpointing_on_lora_layers_survives_real_forward_and_backward():
+    """只设布尔量时本测试以 AttributeError 失败：GradientCheckpointingLayer.__call__
+    在开关为真时会调用 self._gradient_checkpointing_func，而基类不提供该属性。
+    """
+    backbone = _PeftableBackbone(6)
+    peft_model, _targets, layers = inject_lora(
+        backbone, r=4, alpha=8, dropout=0.0, policy="last_k", last_k=2,
+    )
+    assert layers == [4, 5]
+    assert set_backbone_gradient_checkpointing(peft_model, "active", layers=layers) == 2
+    assert [backbone.encoder.layer[i].gradient_checkpointing for i in range(6)] == [
+        False, False, False, False, True, True,
+    ]
+
+    # simplefilter("error") 同时钉住"不产生 use_reentrant 弃用警告"。
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = peft_model(input_ids=torch.randn(2, 3, 8))
+        assert out.last_hidden_state.shape == (2, 3, 8)
+        out.last_hidden_state.sum().backward()
+
+    # 命中层被重算（前向 1 次 + 反向重算 1 次），未命中层因无 LoRA 不建图、只前向 1 次。
+    assert [layer.forward_calls for layer in backbone.encoder.layer] == [1, 1, 1, 1, 2, 2]
+
+    for index in layers:
+        query = backbone.encoder.layer[index].attention.self.query
+        grad = query.lora_A.default.weight.grad
+        assert grad is not None, f"第 {index} 层的 lora_A 没有拿到梯度"
+        assert torch.isfinite(grad).all()
+        assert query.lora_B.default.weight.grad is not None
