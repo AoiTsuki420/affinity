@@ -95,3 +95,160 @@ def test_lora_layers_rejects_unknown_policy():
 def test_lora_layers_rejects_non_positive_num_layers():
     with pytest.raises(ValueError):
         resolve_lora_layers(0, "all", 30)
+
+
+from models.plm_backbones import discover_lora_targets
+
+
+def _fake_esm2(num_layers: int = 3):
+    """ESM-2 命名：encoder.layer.{i}.attention.self.{query,key,value} 等。"""
+    class _Self(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.query = nn.Linear(8, 8)
+            self.key = nn.Linear(8, 8)
+            self.value = nn.Linear(8, 8)
+
+    class _AttnOut(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dense = nn.Linear(8, 8)
+
+    class _Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self = _Self()
+            self.output = _AttnOut()
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = _Attention()
+            self.intermediate = nn.Module()
+            self.intermediate.dense = nn.Linear(8, 32)
+            self.output = nn.Module()
+            self.output.dense = nn.Linear(32, 8)
+
+    class _Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.ModuleList([_Layer() for _ in range(num_layers)])
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Encoder()
+
+    return _Model()
+
+
+def _fake_t5(num_layers: int = 2):
+    """T5 命名：encoder.block.{i}.layer.0.SelfAttention.{q,k,v,o} 等。"""
+    class _SelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q = nn.Linear(8, 8)
+            self.k = nn.Linear(8, 8)
+            self.v = nn.Linear(8, 8)
+            self.o = nn.Linear(8, 8)
+
+    class _DenseRelu(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wi_0 = nn.Linear(8, 32)
+            self.wi_1 = nn.Linear(8, 32)
+            self.wo = nn.Linear(32, 8)
+
+    class _BlockLayer(nn.Module):
+        """真 T5 的 self-attention 子层位于 block.layer.0。"""
+
+        def __init__(self):
+            super().__init__()
+            self.SelfAttention = _SelfAttn()
+
+    class _FfnLayer(nn.Module):
+        """真 T5 的 FFN 子层位于 block.layer.1。
+
+        旧实现 _build_t5_encoder_targets_exact 用的正是
+        "layer.1.DenseReluDense.wi_0"，故两个子层必须分开挂载。
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.DenseReluDense = _DenseRelu()
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.ModuleList([_BlockLayer(), _FfnLayer()])
+
+    class _Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = nn.ModuleList([_Block() for _ in range(num_layers)])
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Encoder()
+
+    return _Model()
+
+
+def test_discover_esm2_all_layers():
+    targets = discover_lora_targets(_fake_esm2(3))
+    assert len(targets) == 3 * 6  # query/key/value/attn.output.dense/intermediate/output
+    assert "encoder.layer.0.attention.self.query" in targets
+    assert "encoder.layer.2.output.dense" in targets
+
+
+def test_discover_esm2_restricted_to_layers():
+    targets = discover_lora_targets(_fake_esm2(3), layers=[1, 2])
+    assert all(".layer.0." not in t for t in targets)
+    assert len(targets) == 2 * 6
+
+
+def test_discover_t5_all_layers():
+    targets = discover_lora_targets(_fake_t5(2))
+    assert len(targets) == 2 * 7
+    assert "encoder.block.0.layer.0.SelfAttention.q" in targets
+    assert "encoder.block.1.layer.1.DenseReluDense.wo" in targets
+
+
+def test_discover_returns_sorted_unique():
+    targets = discover_lora_targets(_fake_esm2(3))
+    assert targets == sorted(set(targets))
+
+
+def test_discover_raises_and_lists_real_leaf_names_when_nothing_matches():
+    class _Weird(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.my_custom_proj = nn.Linear(4, 4)
+
+    with pytest.raises(AssertionError) as excinfo:
+        discover_lora_targets(_Weird(), layers=[0])
+    message = str(excinfo.value)
+    assert "my_custom_proj" in message
+
+
+def test_discover_respects_custom_suffixes_from_probe():
+    """探针如果在 ESMC-6B 上发现白名单外的名字，调用方应能直接注入。"""
+    class _Esmscish(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module() for _ in range(2)])
+            self.layers[0].mixer = nn.Linear(4, 4)
+
+    targets = discover_lora_targets(_Esmscish(), layers=[0, 1], suffixes=("mixer",))
+    assert targets == ["layers.0.mixer"]
+
+
+def test_discover_min_hits_enforced():
+    class _Empty(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Module()
+
+    with pytest.raises(AssertionError):
+        discover_lora_targets(_Empty(), layers=[0], min_hits=1)
