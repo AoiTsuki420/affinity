@@ -41,6 +41,10 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
     echo "NPROC_PER_NODE (${NPROC_PER_NODE}) must be at least 1" >&2
     exit 1
 fi
+if [ "${MASTER_PORT}" -lt 1 ] || [ "${MASTER_PORT}" -gt 65535 ]; then
+    echo "MASTER_PORT (${MASTER_PORT}) must be in [1, 65535]" >&2
+    exit 1
+fi
 
 if [ "${NNODES}" -gt 1 ]; then
     # multi-node rendezvous: the PyTorchJob must have injected MASTER_ADDR
@@ -74,8 +78,16 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 echo "[kineager] task=${TASK} nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${master_addr}:${MASTER_PORT}"
 
 # --- launch ------------------------------------------------------------------
-# exec: the trainer replaces this wrapper as the container's PID 1, so k8s
-# SIGTERM / preemption reaches torchrun instead of being swallowed here.
+# exec: this wrapper is replaced, so k8s SIGTERM / preemption reaches torchrun
+# instead of being swallowed here. The PyTorchJob also calls this script through
+# `exec bash bin/train/kineager_k8s.sh`, which is what puts torchrun - not the
+# outer bash - at the container's PID 1; a PID-namespace init ignores
+# default-action signals, so a plain child would never see SIGTERM.
+#
+# The caller's arguments are appended with ${1+"$@"} rather than "$@": under
+# `set -u`, bash older than 4.4 reports "$@" as unbound when there are no
+# positional parameters, while ${1+"$@"} expands to zero words in that case and
+# to the (quoted) arguments otherwise - so a bare invocation still works.
 # -esm / -molt5 are the training script's legacy aliases for the two backbone
 # snapshot paths.
 exec python3 -m torch.distributed.run \
@@ -94,4 +106,4 @@ exec python3 -m torch.distributed.run \
         --grad_checkpoint_backbone "${GRAD_CHECKPOINT_BACKBONE:-off}" \
         --iters_to_accumulate "${ITERS_TO_ACCUMULATE:-${KINEAGER_ITERS_TO_ACCUMULATE:-1}}" \
         --num_workers "${NUM_WORKERS:-${KINEAGER_NUM_WORKERS:-8}}" \
-        "$@"
+        ${1+"$@"}
