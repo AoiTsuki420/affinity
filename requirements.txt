@@ -5,6 +5,11 @@ peft
 # 必须 >=3.4.1：ESMC checkpoint 自带的远程加载器在这个版本以下没有 EsmcTokenizer，
 # 不钉版本可能装到过旧的 esm，直到集群上加载模型（几 GB 下载之后）才报错。
 esm>=3.4.1
+# tests/test_k8s_artifacts.py 用 PyYAML 解析 manifest：不声明的话，集群上
+# pip install -r requirements.txt 之后 pytest 会在这个模块的 import 期报
+# ModuleNotFoundError。这里只用 yaml.safe_load（3.x 起 API 稳定），所以不钉下限；
+# 本分支验证过的版本是 6.0.3。
+PyYAML
 pandas
 numpy
 scikit-learn

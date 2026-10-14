@@ -142,7 +142,7 @@ from the environment and execs `torch.distributed.run`; `TASK` defaults to
 name:
 
 ```bash
-CATA_PROFILE=k8s \
+CATA_PROFILE=k8s USER=<user> \
 NNODES=8 NODE_RANK=0 MASTER_ADDR=<master-pod-ip> MASTER_PORT=29500 \
 TRAIN_CSV=/pfs_beijing/<user>/kineager_data/pdbbindv2020_affinity.csv \
 KINEAGER_ESMC_PATH=/models/ESMC-6B \
@@ -154,12 +154,15 @@ bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 8 --split_mode group_pair 
 `bin/train/kineager_k8s.sh` defaults `CATA_PROFILE=k8s` and the manifest sets it
 explicitly, so both routes use the cluster path profile in `path_config.py`; its
 `${USER}` components are resolved from `USER` (else `USERNAME`, else the literal
-`kineager`) at resolve time. The run directories, the checkpoints and the per-epoch
+`kineager`) at resolve time. `USER` is therefore **required** on the k8s profile:
+the launcher refuses to start without it, because the fallback would put the
+write paths in the shared `/pfs_beijing/kineager/kineager_runs`. The run
+directories, the checkpoints and the per-epoch
 `preds_epoch*.npy` / `labels_epoch*.npy` all stay under
 `/pfs_beijing/${USER}/kineager_runs`, and any entry can still be overridden with
 its `CATA_*` variable (e.g. `CATA_TRAIN_DATA_DIR`). The Kubeflow route fills the
 same variables in the manifest (replace every `<REPLACE_ME ...>`, including
-`NNODES` = `Worker.replicas + 1`):
+`USER` and `NNODES` = `Worker.replicas + 1`):
 
 ```bash
 kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml

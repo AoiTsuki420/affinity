@@ -66,6 +66,19 @@ fi
 # overridable for a run that deliberately wants another profile.
 export CATA_PROFILE="${CATA_PROFILE:-k8s}"
 
+# --- write-path scoping: ${USER} must be real, not the shared fallback -------
+# Only the k8s profile uses ${USER}, and path_config._current_user_name()
+# resolves it as USER -> USERNAME -> the literal "kineager". A pod sets neither
+# variable, so an unset USER silently resolves runs_dir AND train_data_dir to the
+# SHARED /pfs_beijing/kineager/kineager_runs. train_data_dir is a write target
+# (train_epoch mkdirs it and np.saves the per-epoch preds_epoch*/labels_epoch*.npy
+# there), so two concurrent users would overwrite each other's artifacts while
+# both runs look healthy -- far harder to notice than a refusal to start.
+if [ "${CATA_PROFILE}" = "k8s" ] && [ -z "${USER:-}" ]; then
+    echo "USER is unset but CATA_PROFILE=k8s: path_config expands \${USER} in runs_dir/train_data_dir, and the fallback /pfs_beijing/kineager/kineager_runs is SHARED, so concurrent runs would overwrite each other's per-epoch .npy artifacts. Export USER=<your username> (the manifest's env block carries a USER entry)." >&2
+    exit 1
+fi
+
 # --- required inputs (fail fast, with the variable name in the message) ------
 export TASK="${TASK:-affinity}"
 export TRAIN_CSV="${TRAIN_CSV:?TRAIN_CSV must point to the PDBbind affinity CSV}"

@@ -23,6 +23,14 @@
 # the path profile in path_config.py (the launcher also defaults it to "k8s");
 # without it the trainer would fall back to the platform default profile and
 # silently read the wrong CSV, run and backbone paths.
+#
+# USER is the other value that must not be left unset, for the same reason: it
+# is what scopes the run's WRITE paths. path_config.py expands ${USER} in the k8s
+# profile's runs_dir / weights_dir / train_data_dir, and bin/train/kineager_k8s.sh
+# now refuses to start when it is unset. A pod sets neither USER nor USERNAME, so
+# without this entry the paths would fall back to the SHARED
+# /pfs_beijing/kineager/kineager_runs, where two concurrent users' per-epoch
+# preds_epoch*/labels_epoch*.npy overwrite each other.
 apiVersion: kubeflow.org/v1
 kind: PyTorchJob
 metadata:
@@ -124,6 +132,15 @@ spec:
                 # changeable without reading bin/train/kineager_k8s.sh.
                 - name: CATA_PROFILE
                   value: "k8s"
+                # ---- write-path scoping: USER is required ----------------------
+                # path_config.py expands ${USER} in the k8s profile's runs_dir,
+                # weights_dir and train_data_dir. Nothing sets USER inside a pod,
+                # and bin/train/kineager_k8s.sh refuses to start without this
+                # value: the fallback is the SHARED
+                # /pfs_beijing/kineager/kineager_runs, where two users' per-epoch
+                # preds_epoch*/labels_epoch*.npy overwrite each other.
+                - name: USER
+                  value: "<REPLACE_ME: your username on the shared filesystem>"
                 # ---- inputs required by bin/train/kineager_k8s.sh --------------
                 - name: TRAIN_CSV
                   value: "<REPLACE_ME: PDBbind v2020 affinity CSV, e.g. data/pdbbindv2020_affinity.csv>"

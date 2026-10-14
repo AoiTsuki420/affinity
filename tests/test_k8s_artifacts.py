@@ -15,6 +15,18 @@ R58 的两半必须一起成立，否则 k8s run 会**静默**用错 profile：
 launcher 传给训练脚本的 flag 都能在训练脚本的 argparse 里找到、两个 shell 面的
 编码卫生（纯 LF / 纯 ASCII / 单个结尾换行）。
 
+R61 的两半也必须一起成立，否则共享目录会被静默写入：k8s profile 的
+`runs_dir` / `train_data_dir` 都含 `${USER}`，pod 里既没有 `USER` 也没有
+`USERNAME`，于是 `path_config` 回退到固定的 `kineager`，两条路径一起变成**共享**的
+`/pfs_beijing/kineager/kineager_runs`；而 `train_data_dir` 是写入目标
+（`train_epoch` 往里 `np.save` 每个 epoch 的 `preds_epoch*` / `labels_epoch*`）。
+所以 1. manifest 的 env 块必须声明操作者填写的 `USER`，头部注释也要说明；
+2. launcher 必须在 `k8s` profile 且 `USER` 未设时拒绝启动（先于 exec）。
+
+R62：本模块对 `yaml` 保持硬 import，**不要**改成 `importorskip`。R60 已让 PyYAML
+成为声明依赖，而 `importorskip` 会静默跳过这个负责校验 k8s 交付物的模块——正好把
+它存在的意义（发现交付物损坏）藏起来。收集期报「装依赖」才是正确的失败方式。
+
 注意：本文件用 PyYAML 解析 manifest（无锚点身份检查就只能靠文本比对）。
 """
 import ast
@@ -28,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "bin" / "train" / "kineager_k8s.sh"
 MANIFEST = REPO_ROOT / "yamls" / "kubeflow" / "kineager_affinity_k8s.yaml"
 TRAINER = REPO_ROOT / "main_train_predictor_multigpu.py"
+REQUIREMENTS = REPO_ROOT / "requirements.txt"
 
 # torchrun 自己的参数（不是训练脚本的 argparse 参数）
 _TORCHRUN_FLAGS = {"-m", "--nnodes", "--node_rank", "--nproc_per_node",
@@ -121,6 +134,110 @@ def test_manifest_env_lists_the_cata_profile():
 
 def test_manifest_header_lists_the_cata_profile():
     assert "CATA_PROFILE" in _header_comment(MANIFEST.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# R61：k8s profile 的写入路径必须落在用户自己的目录下
+# ---------------------------------------------------------------------------
+
+def _launcher_user_guard():
+    """launcher 里那个「k8s profile 且 USER 未设」的守卫块（含条件行与 fi）。
+
+    先去掉 shell 注释再定位：`#` 后面的说明文字里也出现了 CATA_PROFILE / USER，
+    不剥掉就会把注释行也当成候选。返回 (起始行号, 块文本)。
+    """
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    starts = [i for i, line in enumerate(lines)
+              if line.lstrip().startswith("if ")
+              and "CATA_PROFILE" in line and "USER" in line]
+    assert len(starts) == 1, f"USER 守卫必须恰好一处，找到 {len(starts)} 处"
+    ends = [i for i in range(starts[0] + 1, len(lines)) if lines[i].strip() == "fi"]
+    assert ends, "USER 守卫没有 fi 收尾"
+    return starts[0], "\n".join(lines[starts[0]:ends[0] + 1])
+
+
+def test_launcher_refuses_the_k8s_profile_without_user():
+    _, block = _launcher_user_guard()
+    condition = block.splitlines()[0]
+    assert '"${USER:-}"' in condition, "守卫必须测 USER 是否为空（${USER:-} 才不会触发 set -u）"
+    assert "-z" in condition, "守卫必须测「为空」而不是「非空」"
+    assert re.search(r"^\s*exit 1\s*$", block, re.M), "守卫必须 exit 1：拒绝启动才是正确的取舍"
+    assert "USER" in block, "守卫的消息必须点名 USER"
+    lowered = block.lower()
+    assert "shared" in lowered and "kineager_runs" in lowered, (
+        "守卫的消息必须说明理由：回退目录是共享的，并发 run 的产物会互相覆盖"
+    )
+
+
+def test_launcher_user_guard_precedes_the_exec():
+    start, _ = _launcher_user_guard()
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
+    assert exec_lines, "launcher 的 exec 不见了"
+    assert start < exec_lines[0], "USER 守卫必须与其它校验一起先于 exec"
+
+
+def test_manifest_env_declares_user():
+    env = {entry["name"]: entry.get("value") for entry in _container()["env"]}
+    assert "USER" in env, (
+        "manifest 的 env 块没有列出 USER：pod 里 USER/USERNAME 都没设，"
+        "写入路径会回退到共享目录"
+    )
+    value = env["USER"]
+    assert isinstance(value, str) and value.strip(), "USER 不能是空值"
+    assert value.startswith("<REPLACE_ME") and value.endswith(">"), (
+        f"USER 必须写成 <REPLACE_ME: …>，与其它操作者填写的值风格一致（实际 {value!r}）"
+    )
+
+
+def test_manifest_header_lists_user():
+    header = _header_comment(MANIFEST.read_text(encoding="utf-8"))
+    assert "${USER}" in header, "manifest 头部注释没有说明 USER 必须填写及其原因"
+
+
+# ---------------------------------------------------------------------------
+# R60 / R62：PyYAML 是声明依赖；这个模块的 yaml import 保持硬失败
+# ---------------------------------------------------------------------------
+
+def _declared_requirements():
+    """requirements.txt 里声明的发行包名（小写、下划线归一为连字符）。"""
+    names = set()
+    for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+        spec = line.split("#", 1)[0].strip()
+        if not spec:
+            continue
+        names.add(re.split(r"[<>=!~\[; ]", spec, maxsplit=1)[0].strip().lower().replace("_", "-"))
+    return names
+
+
+def test_requirements_declares_pyyaml():
+    """R60：本模块 import yaml，所以 PyYAML 必须在 requirements.txt 里声明。
+
+    不声明的话，集群上 `pip install -r requirements.txt` 之后 pytest 会在**收集期**
+    报 ModuleNotFoundError，而不是报任何真实缺陷。
+    """
+    declared = _declared_requirements()
+    assert "pyyaml" in declared, f"requirements.txt 未声明 PyYAML：{sorted(declared)}"
+
+
+def test_yaml_import_stays_hard_and_is_not_importorskip():
+    """R62：不要把 `import yaml` 改成 `importorskip`，否则本模块会被静默跳过。
+
+    这条断言防的是「后来的读者按 reviewer 的建议把 import 软化」——缺依赖时本模块
+    根本收集不起来，这正是想要的失败方式（见模块 docstring）。用 AST 判断实际调用，
+    这样模块里说明这条 ruling 的注释不会被自己误判。
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    imported = {alias.name for node in tree.body
+                if isinstance(node, ast.Import) for alias in node.names}
+    assert "yaml" in imported, "yaml 必须是模块顶层的硬 import"
+
+    called = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+    called |= {node.func.id for node in ast.walk(tree)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert "importorskip" not in called, "本模块的 PyYAML 依赖不允许被软化跳过"
 
 
 # ---------------------------------------------------------------------------
