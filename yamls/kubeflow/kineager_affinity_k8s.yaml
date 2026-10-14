@@ -25,9 +25,16 @@ metadata:
   namespace: default
 spec:
   runPolicy:
-    # None = keep the pods after the job finishes so `kubectl logs` still works.
-    # The xtrimofold3 reference uses `Running` plus ttlSecondsAfterFinished: 6000.
+    # None = keep the pods after the job finishes so `kubectl logs` still works
+    # (the reference uses `Running` plus ttlSecondsAfterFinished: 6000).
     cleanPodPolicy: None
+    # Seconds after the job finishes before the PyTorchJob object itself is
+    # deleted. This TTL is what stops a re-apply from silently launching
+    # nothing: while the finished job object still exists, `kubectl apply` of
+    # this unchanged file reports `unchanged`, the operator sees a successful
+    # apply, and no new run starts. To start a run before the TTL fires, first
+    # `kubectl delete pytorchjob kineager-affinity`.
+    ttlSecondsAfterFinished: 6000
   # INVARIANT: NNODES (see the env block) == Master.replicas + Worker.replicas.
   # bin/train/kineager_k8s.sh validates NODE_RANK < NNODES and fails fast if the
   # two disagree.
@@ -68,16 +75,27 @@ spec:
                   export NODE_RANK="${PET_NODE_RANK:-${RANK:?PyTorchJob did not inject RANK}}"
                   export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
                   export MASTER_PORT="${MASTER_PORT:-29500}"
-                  export NCCL_SOCKET_IFNAME=eth0
-                  export NCCL_IB_DISABLE=0
-                  export NCCL_IB_GID_INDEX=5
-                  export NCCL_DEBUG=INFO
-                  export NCCL_SOCKET_FAMILY=AF_INET
+                  # Same NCCL names and defaults as the launcher and the
+                  # xtrimofold3 reference. Every one is a ${VAR:-default}, so
+                  # adding the name to the env block overrides it per run.
+                  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+                  export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+                  export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-5}"
+                  export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+                  export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
 
                   # Declared once and called from both branches so the master and
                   # the workers can never run different hyperparameters.
+                  #
+                  # `exec` is an improvement on the reference, which called its
+                  # bash_command as a plain child: the outer bash here is the
+                  # container's PID 1, and a PID-namespace init ignores
+                  # default-action signals, so a non-exec'd launcher would be
+                  # SIGKILLed at the end of the grace period and torchrun's own
+                  # SIGTERM handling would never run. With exec, the launcher's
+                  # own exec makes torchrun PID 1 and preemption is handled.
                   run_trainer() {
-                    bash bin/train/kineager_k8s.sh \
+                    exec bash bin/train/kineager_k8s.sh \
                       -epochs "${EPOCHS}" \
                       -batch_size "${BATCH_SIZE}" \
                       --split_mode group_pair \
@@ -139,13 +157,16 @@ spec:
               resources:
                 requests:
                   nvidia.com/gpu: 1
-                  # The reference asks for rdma/hca: "501" on its cluster.
-                  rdma/hca: "<REPLACE_ME: RDMA resource name/count your nodes expose>"
+                  # The resource KEY is `rdma/hca` on the reference cluster (the
+                  # reference asks for "501"); only the COUNT belongs in the value.
+                  # A wrong key stays invisible until the pod sits Pending.
+                  rdma/hca: "<REPLACE_ME: count, e.g. 1>"
                   cpu: "<REPLACE_ME: e.g. 16>"
                   memory: "<REPLACE_ME: e.g. 200Gi>"
                 limits:
                   nvidia.com/gpu: 1
-                  rdma/hca: "<REPLACE_ME: RDMA resource name/count your nodes expose>"
+                  # Keep identical to requests (Guaranteed QoS), as in the reference.
+                  rdma/hca: "<REPLACE_ME: count, e.g. 1>"
                   cpu: "<REPLACE_ME: e.g. 16>"
                   memory: "<REPLACE_ME: e.g. 200Gi>"
               volumeMounts:
