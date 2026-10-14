@@ -70,9 +70,9 @@ spec:
           hostNetwork: false
           containers:
             - name: pytorch
-              image: "<REPLACE_ME: KinEAGER training image reference>"
+              image: "harbor.biomap-int.com/xinran_2026/kineager:affinity-v1"
               imagePullPolicy: IfNotPresent
-              workingDir: "<REPLACE_ME: KinEAGER repo root inside that image>"
+              workingDir: "/workspace/kineager"
               command:
                 - /bin/bash
                 - -lc
@@ -140,19 +140,19 @@ spec:
                 # /pfs_beijing/kineager/kineager_runs, where two users' per-epoch
                 # preds_epoch*/labels_epoch*.npy overwrite each other.
                 - name: USER
-                  value: "<REPLACE_ME: your username on the shared filesystem>"
+                  value: "xinran_2026"
                 # ---- inputs required by bin/train/kineager_k8s.sh --------------
                 - name: TRAIN_CSV
-                  value: "<REPLACE_ME: PDBbind v2020 affinity CSV, e.g. data/pdbbindv2020_affinity.csv>"
+                  value: "/pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv"
                 - name: KINEAGER_ESMC_PATH
-                  value: "<REPLACE_ME: local ESMC-6B directory visible inside the pod>"
+                  value: "/pfs_beijing/xinran_2026/models/ESMC-6B2026.9.15"
                 - name: KINEAGER_MOLFORMER_PATH
-                  value: "<REPLACE_ME: local MoLFormer snapshot directory visible inside the pod>"
+                  value: "/pfs_beijing/xinran_2026/models/molformer/models--ibm-research--MoLFormer-XL-both-10pct/snapshots/7b12d946c181a37f6012b9dc3b002275de070314"
                 - name: LOG_PATH
-                  value: "<REPLACE_ME: rank-0 log file, e.g. /shared/runs/kineager_affinity/rank0.log>"
+                  value: "/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log"
                 # Only consulted when the operator does not inject PET_NNODES.
                 - name: NNODES
-                  value: "<REPLACE_ME: Worker.replicas + 1>"
+                  value: "2"
                 # ---- task and hyperparameters, passed through "$@" ------------
                 # EPOCHS / BATCH_SIZE are the plan's runbook values; tune freely.
                 # The launcher additionally honours LORA_LAYER_POLICY,
@@ -189,15 +189,15 @@ spec:
                   # The resource KEY is `rdma/hca` on the reference cluster (the
                   # reference asks for "501"); only the COUNT belongs in the value.
                   # A wrong key stays invisible until the pod sits Pending.
-                  rdma/hca: "<REPLACE_ME: count, e.g. 1>"
-                  cpu: "<REPLACE_ME: e.g. 16>"
-                  memory: "<REPLACE_ME: e.g. 200Gi>"
+                  rdma/hca: 1
+                  cpu: 16
+                  memory: 200Gi
                 limits:
                   nvidia.com/gpu: 1
                   # Keep identical to requests (Guaranteed QoS), as in the reference.
-                  rdma/hca: "<REPLACE_ME: count, e.g. 1>"
-                  cpu: "<REPLACE_ME: e.g. 16>"
-                  memory: "<REPLACE_ME: e.g. 200Gi>"
+                  rdma/hca: 1
+                  cpu: 16
+                  memory: 200Gi
               volumeMounts:
                 - name: shm-volume
                   mountPath: /dev/shm
@@ -220,8 +220,8 @@ spec:
             - name: shm-volume
               emptyDir:
                 medium: Memory
-                sizeLimit: "<REPLACE_ME: /dev/shm size, e.g. 64Gi>"
+                sizeLimit: "64Gi"
     Worker:
-      replicas: "<REPLACE_ME: NNODES - 1>"
+      replicas: 1
       restartPolicy: OnFailure
       template: *pytorch-template

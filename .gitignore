@@ -21,6 +21,7 @@ checkpoints/
 .DS_Store
 .worktrees/
 .superpowers/
+docs/superpowers/
 .piptmp/
 pytest-cache-files-*/
 probe-mode-dir/
