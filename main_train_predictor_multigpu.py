@@ -1819,13 +1819,21 @@ final_contact_store=None):
             if use_onecycle and (onecycle is not None):
                 if global_step < onecycle.total_steps:
                     onecycle.step()
-                for g in optimizer.param_groups:
-                    if g.get("tag","") not in {"head", "lora", "lora_prot", "lora_lig"}:
-                        g["lr"] = g.get("base_lr", g["lr"])
             elif scheduler is not None:
                 scheduler.step_and_clip()
 
             global_step += 1
+
+        # R54：非调度组（head/lora 之外的组）的 base_lr 钉住必须**每批**执行。
+        # OneCycleLR 的构造函数把每个参数组都设成 max_lr / div_factor（默认
+        # div_factor=10，即 base_lr/10），而 onecycle.step() 只在窗口末尾调用；
+        # 钉在 do_step 门控里时，iters_to_accumulate=k 会让这些组在窗口内部的
+        # 第 0..k-1 批按 base_lr/10 训练，而不是只在第 0 批。放在门控外后，
+        # 只有第 0 批沿用构造值；窗口末尾仍是先 onecycle.step() 再钉回 base_lr。
+        if use_onecycle and (onecycle is not None):
+            for g in optimizer.param_groups:
+                if g.get("tag","") not in {"head", "lora", "lora_prot", "lora_lig"}:
+                    g["lr"] = g.get("base_lr", g["lr"])
         
         
         if (i+1) % 10 == 0:  # 每10步打印一次（可调）

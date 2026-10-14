@@ -830,6 +830,79 @@ def test_train_epoch_affinity_accumulation_advances_bookkeeping_per_optimizer_st
 
 
 # ---------------------------------------------------------------------------
+# R54：OneCycleLR 的构造函数把**每个**参数组都设成 max_lr / div_factor（默认
+# div_factor=10，即 base_lr/10），而 onecycle.step() 只在累积窗口末尾调用。
+# 非调度组（tag 不在 head/lora*）的 base_lr 钉住必须在每个 batch 都执行。
+# ---------------------------------------------------------------------------
+
+class _TaggedLrRecorder(AdamW):
+    """记录每次 step() 时被跟踪 tag 的参数组 lr。"""
+
+    def __init__(self, param_groups, watched_tag):
+        super().__init__(param_groups, lr=1e-3)
+        self.watched_tag = watched_tag
+        self.watched_lrs = []
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            if group.get("tag") == self.watched_tag:
+                self.watched_lrs.append(float(group["lr"]))
+        return super().step(closure)
+
+
+@pytest.mark.filterwarnings(_NO_CUDA_WARNING)
+def test_train_epoch_pins_non_scheduled_lr_every_batch_under_accumulation(monkeypatch):
+    """R54：累积 2 时第一个窗口末尾的 optimizer.step() 必须已经用回 base_lr。
+
+    OneCycleLR 构造后非调度组是 base_lr/10；钉住在 do_step 门控里时，窗口内部
+    的第 0..k-1 批都不会恢复它，于是第一个窗口末尾那次 step 仍按 base_lr/10 走
+    （旧实现的 watched_lrs 是 [base/10, base]），门控外执行后是 [base, base]。
+    """
+    import pathlib
+    import shutil
+
+    from torch.optim.lr_scheduler import OneCycleLR
+
+    import main_train_predictor_multigpu as training
+
+    base_head, base_backbone = 1e-3, 3e-2
+    model = _VaryingAffinity()
+    optimizer = _TaggedLrRecorder(
+        [
+            {"params": [model.p_mu], "lr": base_head, "tag": "head", "base_lr": base_head},
+            {"params": [model.p_log_var], "lr": base_backbone, "tag": "backbone",
+             "base_lr": base_backbone},
+        ],
+        watched_tag="backbone",
+    )
+
+    args = _AffinityArgs()
+    args.iters_to_accumulate = 2
+    args.batch_size = 2
+    # 4 个 optimizer step（8 批 / 累积 2），pct_start=0.3 让第 0 步落在 warmup 里，
+    # 于是构造后的初值正好是 max_lr/div_factor —— 与生产默认值同形。
+    onecycle = OneCycleLR(optimizer, max_lr=[base_head, base_backbone], epochs=1,
+                          steps_per_epoch=4, div_factor=10.0, final_div_factor=1e4,
+                          cycle_momentum=False)
+    assert [float(g["lr"]) for g in optimizer.param_groups] == [
+        pytest.approx(base_head / 10), pytest.approx(base_backbone / 10),
+    ]
+
+    monkeypatch.setattr(training.swanlab, "log", lambda payload: None)
+    scratch = pathlib.Path("_scratch_onecycle_pin")
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setitem(training.RUNTIME_PATHS, "train_data_dir", scratch)
+    try:
+        training.train_epoch(model, _affinity_loader(8, 2, _affinity_scaler(16)), optimizer,
+                             None, _NoOpScaler(), _CountingEMA(), 0, args, None, None, 0,
+                             use_onecycle=True, onecycle=onecycle)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    assert optimizer.watched_lrs == [pytest.approx(base_backbone)] * 4
+
+
+# ---------------------------------------------------------------------------
 # Task 17：推理侧的 affinity 单路输出。--task affinity 走 (mu, log_var) 两路解包，
 # 其余仍走 kcat/Km/ratio 三路；format_affinity_prediction 是 CSV 字段的唯一出口。
 # ---------------------------------------------------------------------------

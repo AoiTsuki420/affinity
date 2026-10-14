@@ -35,6 +35,18 @@ PATH_PROFILES = {
         "esm_model_path": "./backbone/esm2_t6_8M_UR50D",
         "molt5_model_path": "./backbone/molt5-base-smiles2caption",
     },
+    # ${USER} 不是 shell 展开：它由 resolve_runtime_paths 在解析时按环境替换
+    # （见 _expand_user_placeholder）。留着字面量就会写出名为 "${USER}" 的目录。
+    "k8s": {
+        "project_root": "/workspace/kineager",
+        "runs_dir": "/pfs_beijing/${USER}/kineager_runs",
+        "weights_dir": "/pfs_beijing/${USER}/kineager_runs",
+        "train_data_dir": "/pfs_beijing/xumeng/general_protein_dir/Affinity/dataset/PDBbind_v2020",
+        "train_csv_path": "/pfs_beijing/${USER}/kineager_data/pdbbindv2020_affinity.csv",
+        "val_csv_path": "/pfs_beijing/${USER}/kineager_data/pdbbindv2020_affinity_val.csv",
+        "esm_model_path": "/pfs_beijing/xinran_2026/models/biohub--ESMC-6B",
+        "molt5_model_path": "/pfs_beijing/xinran_2026/models/molformer/models--ibm-research--MoLFormer-XL-both-10pct/snapshots/7b12d946c181a37f6012b9dc3b002275de070314",
+    },
 }
 
 
@@ -73,7 +85,29 @@ FILESYSTEM_PATH_KEYS = {
     "val_csv_path",
     "scaler_json_path",
     "metrics_json_path",
+    "esm_model_path",
+    "molt5_model_path",
 }
+
+
+# profile 里可以写 ${USER}；path_config 不做 shell 展开，只在解析时替换一次。
+_USER_PLACEHOLDER = "${USER}"
+_DEFAULT_USER_NAME = "kineager"
+
+
+def _current_user_name() -> str:
+    """当前用户名：USER → USERNAME（Windows）→ 固定回退。
+
+    容器里两个变量常常都没有，所以回退值是必需的：宁可落到一个共享但可覆盖的
+    目录（CATA_RUNS_DIR 等），也不能把字面量 ${USER} 写进路径。
+    """
+    return os.getenv("USER") or os.getenv("USERNAME") or _DEFAULT_USER_NAME
+
+
+def _expand_user_placeholder(value):
+    if isinstance(value, str) and (_USER_PLACEHOLDER in value):
+        return value.replace(_USER_PLACEHOLDER, _current_user_name())
+    return value
 
 
 def resolve_runtime_paths(profile=None):
@@ -89,6 +123,9 @@ def resolve_runtime_paths(profile=None):
         env_value = os.getenv(env_name)
         if env_value:
             raw[key] = env_value
+
+    # ${USER} 在这里、也只在这里展开：profile 值是字符串，Path 转换之前必须干净。
+    raw = {key: _expand_user_placeholder(value) for key, value in raw.items()}
 
     paths: dict[str, Any] = {
         k: (Path(v) if (k in FILESYSTEM_PATH_KEYS and v) else (v or None))

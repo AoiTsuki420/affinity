@@ -109,6 +109,69 @@ torchrun --nproc_per_node=1 main_train_predictor_multigpu.py \
 
 Each run writes metrics, split metadata, experiment manifest, predictions, and checkpoints under the configured run directory.
 
+## PDBbind v2020 Protein-Ligand Affinity Training
+
+Single-task affinity regression over `-log10(Kd/Ki/IC50)` using ESMC-6B and
+MoLFormer with last-30-layer LoRA. The ESMC tokenizer comes from the
+`esm>=3.4.1` pin in `requirements.txt`. The kinetics three-task recipe is
+unchanged and still selected by default.
+
+Build the training table (on a host that can read the PDBbind index):
+
+```bash
+python tools/build_pdbbind_affinity_csv.py \
+  --index-csv /path/to/PDBbind_v2020/pdbbind_2020_feats.csv \
+  --out-csv data/pdbbindv2020_affinity.csv \
+  --kd-col Kd --ki-col Ki --ic50-col IC50
+```
+
+Confirm the LoRA target names against the real backbones before the first run:
+
+```bash
+python tools/probe_backbone_modules.py --model "$KINEAGER_ESMC_PATH" --kind esmc \
+  --out probe_esmc.json
+python tools/probe_backbone_modules.py --model "$KINEAGER_MOLFORMER_PATH" --kind molformer \
+  --out probe_molformer.json
+```
+
+Train on k8s (one GPU per pod). `bin/train/kineager_k8s.sh` validates the topology
+from the environment and execs `torch.distributed.run`; `TASK` defaults to
+`affinity` there, and every training hyperparameter is appended after the script
+name:
+
+```bash
+CATA_PROFILE=k8s \
+NNODES=8 NODE_RANK=0 MASTER_ADDR=<master-pod-ip> MASTER_PORT=29500 \
+TRAIN_CSV=/pfs_beijing/<user>/kineager_data/pdbbindv2020_affinity.csv \
+KINEAGER_ESMC_PATH=/models/ESMC-6B \
+KINEAGER_MOLFORMER_PATH=/models/MoLFormer-XL-both-10pct \
+bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 8 --split_mode group_pair \
+  --task affinity
+```
+
+`CATA_PROFILE=k8s` selects the cluster path profile in `path_config.py`; its
+`${USER}` components are resolved from `USER` (else `USERNAME`, else the literal
+`kineager`) at resolve time. Without it the run silently falls back to the
+`autodl` paths. The k8s profile's `train_data_dir` is the shared PDBbind dataset
+directory, so point `CATA_TRAIN_DATA_DIR` at a writable location as well: the
+per-epoch `preds_epoch*.npy` / `labels_epoch*.npy` are written there. The Kubeflow
+route fills the same variables in the manifest (replace every `<REPLACE_ME ...>`,
+including `NNODES` = `Worker.replicas + 1`, and add `CATA_PROFILE` to its env
+block):
+
+```bash
+kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml
+```
+
+That job is named `kineager-affinity` and keeps its pods after finishing, so
+re-applying an unchanged manifest while the old job object still exists reports
+`unchanged` and launches nothing; run `kubectl delete pytorchjob kineager-affinity`
+before a re-run, and never start two runs at once — they would collide on that one
+name.
+
+Do **not** pass `--use_struct_branch` or `--final_contact_npz`: the structure
+branch is disabled for this task.
+
 ## kcat Expert and MoE Inference
 
 Train the kcat specialist:

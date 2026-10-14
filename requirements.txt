@@ -1,5 +1,10 @@
 torch
 transformers
+# models/predictor.py 的 LoRA 注入依赖 peft（原先漏了）。
+peft
+# 必须 >=3.4.1：ESMC checkpoint 自带的远程加载器在这个版本以下没有 EsmcTokenizer，
+# 不钉版本可能装到过旧的 esm，直到集群上加载模型（几 GB 下载之后）才报错。
+esm>=3.4.1
 pandas
 numpy
 scikit-learn
