@@ -201,6 +201,24 @@ def check_model_weights(model, ckpt):
     else:
         print("✅ 所有模型层权重已正确加载。")
 
+def format_affinity_prediction(mu: float, log_var: float) -> dict:
+    """把 (mu, log_sigma2) 转成可写 CSV 的字段。
+
+    log_var 先夹到 [-20, 20]：上界挡住 math.exp 的上溢（未夹取时
+    math.exp(1000.0) 直接抛 OverflowError），下界挡住下溢（exp(-1000.0) == 0.0
+    会让 sigma 也变成 0）。
+    """
+    import math
+
+    log_var = float(min(max(float(log_var), -20.0), 20.0))
+    sigma2 = math.exp(log_var)
+    return {
+        "pred_pKaffinity": float(mu),
+        "sigma": math.sqrt(sigma2),
+        "sigma2": sigma2,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-csv", type=str, required=True, help="输入CSV文件")
@@ -211,8 +229,8 @@ def main():
     p.add_argument("-scaler", type=str, default=None, help="可选：当前推理不会使用 scaler；训练标签已在 log10 空间")
     p.add_argument("--lora_r", type=int, default=None, help="可选：手动指定 LoRA rank；不传则从 ckpt 自动推断")
     p.add_argument("--lora_alpha", type=int, default=None, help="可选：手动指定 LoRA alpha；不传则默认 2*lora_r")
-    p.add_argument("--task", type=str, choices=["kcat", "km"], default="kcat",
-                   help="任务类型：kcat（默认）或 km，决定 SMILES 列名和真实值字段")
+    p.add_argument("--task", type=str, choices=["kcat", "km", "affinity"], default="kcat",
+                   help="任务类型：kcat（默认）或 km 走 kinetics 三头输出，affinity 走单头亲和力输出")
     p.add_argument("--smiles-col", type=str, default=None,
                    help="手动指定 SMILES 列名；不传则根据 --task 自动推断")
     p.add_argument("--use_first_component", action="store_true", default=False,
@@ -300,36 +318,52 @@ def main():
             preds_list = []
             for _ in range(mc_samples):
                 out = model([seq], [smi], source_ids=source_tensor, use_mask=False)
-                pred_kcat, pred_km, _pred_ratio = out[:3]
-                pred_ratio = pred_kcat - pred_km + 3.0
-                preds_list.append(torch.stack([pred_kcat, pred_km, pred_ratio], dim=-1).cpu().numpy())
+                if str(getattr(args, "task", "kinetics")) == "affinity":
+                    # affinity 是单头 (mu, log_sigma2)，没有 ratio 可重算
+                    mu, log_var = out
+                    preds_list.append(
+                        torch.stack([mu.reshape(-1), log_var.reshape(-1)], dim=-1).cpu().numpy()
+                    )
+                else:
+                    pred_kcat, pred_km, _pred_ratio = out[:3]
+                    pred_ratio = pred_kcat - pred_km + 3.0
+                    preds_list.append(torch.stack([pred_kcat, pred_km, pred_ratio], dim=-1).cpu().numpy())
 
-            preds_arr = np.stack(preds_list, axis=0)   # (5, 1, 3)
-            preds_mean = preds_arr.mean(axis=0)         # (1, 3) — MC-Dropout 均值
-            preds_std  = preds_arr.std(axis=0)          # (1, 3) — MC-Dropout 不确定性
+            preds_arr = np.stack(preds_list, axis=0)   # (5, 1, C)
+            preds_mean = preds_arr.mean(axis=0)         # (1, C) — MC-Dropout 均值
+            preds_std  = preds_arr.std(axis=0)          # (1, C) — MC-Dropout 不确定性
 
-            pred_kcat_log  = preds_mean[:, 0]
-            pred_Km_log    = preds_mean[:, 1]
-            pred_ratio_log = preds_mean[:, 2]           # 直接使用 MC 平均的 ratio（log10 空间）
+            if str(getattr(args, "task", "kinetics")) == "affinity":
+                mu_mean = preds_mean[:, 0]
+                log_var_mean = preds_mean[:, 1]
+                res = {
+                    # pdb_id 是与真值表（pKaffinity 列）对齐的键
+                    "pdb_id": row["pdb_id"] if "pdb_id" in row.index else None,
+                    **format_affinity_prediction(float(mu_mean[0]), float(log_var_mean[0])),
+                }
+            else:
+                pred_kcat_log  = preds_mean[:, 0]
+                pred_Km_log    = preds_mean[:, 1]
+                pred_ratio_log = preds_mean[:, 2]           # 直接使用 MC 平均的 ratio（log10 空间）
 
-            kcat_pred_linear  = np.power(10.0, pred_kcat_log)
-            Km_pred_linear    = np.power(10.0, pred_Km_log) / 1000.0
-            ratio_pred_linear = np.power(10.0, pred_ratio_log)
+                kcat_pred_linear  = np.power(10.0, pred_kcat_log)
+                Km_pred_linear    = np.power(10.0, pred_Km_log) / 1000.0
+                ratio_pred_linear = np.power(10.0, pred_ratio_log)
 
-            res = {
-                "sequence": seq,
-                "smiles": smi,
-                "source_id": source_id,
-                "pred_kcat_log": pred_kcat_log[0],
-                "pred_Km_log": pred_Km_log[0],
-                "pred_ratio_log": pred_ratio_log[0],
-                "pred_kcat": kcat_pred_linear[0],
-                "pred_Km": Km_pred_linear[0],
-                "pred_kcat_div_Km": ratio_pred_linear[0],
-                "unc_kcat_log": preds_std[0, 0],
-                "unc_Km_log": preds_std[0, 1],
-                "unc_ratio_log": preds_std[0, 2],
-            }
+                res = {
+                    "sequence": seq,
+                    "smiles": smi,
+                    "source_id": source_id,
+                    "pred_kcat_log": pred_kcat_log[0],
+                    "pred_Km_log": pred_Km_log[0],
+                    "pred_ratio_log": pred_ratio_log[0],
+                    "pred_kcat": kcat_pred_linear[0],
+                    "pred_Km": Km_pred_linear[0],
+                    "pred_kcat_div_Km": ratio_pred_linear[0],
+                    "unc_kcat_log": preds_std[0, 0],
+                    "unc_Km_log": preds_std[0, 1],
+                    "unc_ratio_log": preds_std[0, 2],
+                }
 
             true_log = np.nan
             if args.task == "kcat":
@@ -360,11 +394,17 @@ def main():
                     res["true_Km_log"] = true_log     # log10(mM)，已在读取时统一转换
                     res["true_Km"] = float(np.power(10.0, true_log)) / 1000.0  # 还原为 M
 
-            print(
-                f"Predicted values: kcat={kcat_pred_linear[0]:.4g} s^-1 (±{preds_std[0,0]:.3f} log), "
-                f"Km={Km_pred_linear[0]:.4g} M (±{preds_std[0,1]:.3f} log), "
-                f"kcat/Km={ratio_pred_linear[0]:.4g} M⁻¹s⁻¹ (±{preds_std[0,2]:.3f} log)"
-            )
+            if str(getattr(args, "task", "kinetics")) == "affinity":
+                print(
+                    f"Predicted affinity: pKaffinity={res['pred_pKaffinity']:.4g} "
+                    f"(sigma={res['sigma']:.4g})"
+                )
+            else:
+                print(
+                    f"Predicted values: kcat={kcat_pred_linear[0]:.4g} s^-1 (±{preds_std[0,0]:.3f} log), "
+                    f"Km={Km_pred_linear[0]:.4g} M (±{preds_std[0,1]:.3f} log), "
+                    f"kcat/Km={ratio_pred_linear[0]:.4g} M⁻¹s⁻¹ (±{preds_std[0,2]:.3f} log)"
+                )
             results.append(res)
 
     out_csv = f"predictions_{args.task}.csv"

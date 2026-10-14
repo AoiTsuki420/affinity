@@ -827,3 +827,132 @@ def test_train_epoch_affinity_accumulation_advances_bookkeeping_per_optimizer_st
     assert sched.steps == 3
     assert global_step == 3
     assert ema.updates == 3
+
+
+# ---------------------------------------------------------------------------
+# Task 17：推理侧的 affinity 单路输出。--task affinity 走 (mu, log_var) 两路解包，
+# 其余仍走 kcat/Km/ratio 三路；format_affinity_prediction 是 CSV 字段的唯一出口。
+# ---------------------------------------------------------------------------
+
+class _FakeAffinityInferModel(nn.Module):
+    """main_infer_predictor.main() 的亲和力替身：常量 (mu, log_var)，不碰权重。"""
+
+    def forward(self, seqs, smiles, source_ids=None, use_mask=False):
+        import math
+
+        batch = len(seqs)
+        return (torch.full((batch,), 7.5),
+                torch.full((batch,), math.log(0.25)))
+
+
+class _FakeKineticsInferModel(nn.Module):
+    """kinetics 替身：脚本只取 out[:3]，ratio 由 pred_kcat - pred_km + 3 重算。"""
+
+    def forward(self, seqs, smiles, source_ids=None, use_mask=False):
+        batch = len(seqs)
+        return (torch.full((batch,), 1.0),
+                torch.full((batch,), -3.0),
+                torch.zeros(batch))
+
+
+def _run_infer_main(monkeypatch, model, frame, task):
+    """在一次性的顶层目录里跑 main_infer_predictor.main()，返回写出的 CSV。
+
+    checkpoint 加载被替身顶掉，所以脚本不读真实权重、不下载任何东西；
+    脚本按 cwd 写 predictions_<task>.csv，因此必须在一次性目录里跑。
+    """
+    import os
+    import pathlib
+    import shutil
+
+    import main_infer_predictor as infer
+
+    scratch = pathlib.Path(f"_scratch_infer_{task}")
+    scratch.mkdir(exist_ok=True)
+    original_cwd = pathlib.Path.cwd()
+    try:
+        frame.to_csv(scratch / "input.csv", index=False)
+        monkeypatch.setattr(infer, "build_model_from_ckpt", lambda *a, **k: (model, None, {}))
+        monkeypatch.setattr(infer, "check_model_weights", lambda m, ckpt: None)
+        monkeypatch.setattr(sys, "argv", [
+            "main_infer_predictor.py", "-csv", "input.csv", "-weights", "fake.pt",
+            "--task", task,
+        ])
+        monkeypatch.chdir(scratch)
+        infer.main()
+        return pd.read_csv(f"predictions_{task}.csv")
+    finally:
+        os.chdir(original_cwd)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_format_affinity_prediction_round_trips_sigma():
+    import math
+
+    from main_infer_predictor import format_affinity_prediction
+
+    out = format_affinity_prediction(mu=7.5, log_var=math.log(0.25))
+    assert abs(out["pred_pKaffinity"] - 7.5) < 1e-6
+    assert abs(out["sigma"] - 0.5) < 1e-6
+    assert abs(out["sigma2"] - 0.25) < 1e-6
+
+
+def test_format_affinity_prediction_clamps_log_variance_overflow():
+    """R48：夹取守的是 math.exp 的**上溢**，不是「负方差」——exp 永远为正。
+
+    未夹取时 math.exp(1000.0) 抛 OverflowError（math range error），
+    math.exp(-1000.0) 则下溢成 0.0；所以下面两组断言在删掉夹取后都会失败。
+    """
+    import math
+
+    from main_infer_predictor import format_affinity_prediction
+
+    high = format_affinity_prediction(mu=5.0, log_var=1000.0)
+    assert high["sigma2"] == pytest.approx(math.exp(20.0))
+    assert high["sigma"] == pytest.approx(math.exp(10.0))
+    assert math.isfinite(high["sigma2"]) and math.isfinite(high["sigma"])
+
+    low = format_affinity_prediction(mu=5.0, log_var=-1000.0)
+    assert low["sigma2"] == pytest.approx(math.exp(-20.0))
+    assert low["sigma"] > 0.0
+
+
+def test_main_infer_predictor_affinity_task_writes_pkabind_columns(monkeypatch):
+    """Task 17 的两个 affinity 分支：解析 --task affinity、两路解包、写 4 列。"""
+    out = _run_infer_main(
+        monkeypatch,
+        _FakeAffinityInferModel(),
+        pd.DataFrame({
+            "pdb_id": ["1abc", "2def"],
+            "sequence": ["MKT", "MKT"],
+            "smiles": ["CCO", "CCO"],
+        }),
+        "affinity",
+    )
+
+    assert list(out.columns) == ["pdb_id", "pred_pKaffinity", "sigma", "sigma2"]
+    assert out["pdb_id"].tolist() == ["1abc", "2def"]
+    assert np.allclose(out["pred_pKaffinity"], 7.5)
+    assert np.allclose(out["sigma"], 0.5)
+    assert np.allclose(out["sigma2"], 0.25)
+
+
+def test_main_infer_predictor_kinetics_task_keeps_three_head_columns(monkeypatch):
+    """kinetics 路径的对外形状不变：三头解包 + 10 的幂还原 + true_kcat 字段。"""
+    out = _run_infer_main(
+        monkeypatch,
+        _FakeKineticsInferModel(),
+        pd.DataFrame({
+            "sequence": ["MKT", "MKT"],
+            "smiles": ["CCO", "CCO"],
+            "kcat(s^-1)": [1.0, 1.0],
+        }),
+        "kcat",
+    )
+
+    assert "sigma" not in out.columns and "sigma2" not in out.columns
+    assert np.allclose(out["pred_kcat"], 10.0)
+    assert np.allclose(out["pred_Km"], 1e-6)
+    assert np.allclose(out["pred_kcat_div_Km"], 1e7)
+    assert np.allclose(out["true_kcat"], 1.0)
+    assert out["source_id"].tolist() == [0, 0]
