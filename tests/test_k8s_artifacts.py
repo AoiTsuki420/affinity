@@ -15,13 +15,20 @@ R58 的两半必须一起成立，否则 k8s run 会**静默**用错 profile：
 launcher 传给训练脚本的 flag 都能在训练脚本的 argparse 里找到、两个 shell 面的
 编码卫生（纯 LF / 纯 ASCII / 单个结尾换行）。
 
-R61 的两半也必须一起成立，否则共享目录会被静默写入：k8s profile 的
-`runs_dir` / `train_data_dir` 都含 `${USER}`，pod 里既没有 `USER` 也没有
-`USERNAME`，于是 `path_config` 回退到固定的 `kineager`，两条路径一起变成**共享**的
-`/pfs_beijing/kineager/kineager_runs`；而 `train_data_dir` 是写入目标
+R61：k8s profile 的 `runs_dir` / `train_data_dir` 都含 `${USER}`，pod 里既没有
+`USER` 也没有 `USERNAME`，于是 `path_config` 回退到固定的 `kineager`，两条路径一起
+变成**共享**的 `/pfs_beijing/kineager/kineager_runs`；而 `train_data_dir` 是写入目标
 （`train_epoch` 往里 `np.save` 每个 epoch 的 `preds_epoch*` / `labels_epoch*`）。
 所以 1. manifest 的 env 块必须声明操作者填写的 `USER`，头部注释也要说明；
-2. launcher 必须在 `k8s` profile 且 `USER` 未设时拒绝启动（先于 exec）。
+2. launcher 必须在 `k8s` profile 下拒绝不安全的 `USER`，先于 exec。这个守卫有四件事
+都要成立，缺一件它就只是**看起来**安全：
+   * R63 接受 `USER` 或 `USERNAME`（`path_config` 的解析顺序），否则解析器认可的
+     配置会被启动器拒绝；
+   * R61 两者都没有时拒绝启动，而不是共享目录；
+   * R65 拒绝仍然是 manifest 占位符（`<REPLACE_ME…>`）的值——它是非空字符串，
+     否则会变成一个以占位符命名的目录；
+   * R64 `export` 校验过的那个值：`${USER:-}` 能看到**未导出**的 shell 变量，而
+     exec 出去的训练进程只继承环境，`path_config` 读的是 `os.getenv`。
 
 R62：本模块对 `yaml` 保持硬 import，**不要**改成 `importorskip`。R60 已让 PyYAML
 成为声明依赖，而 `importorskip` 会静默跳过这个负责校验 k8s 交付物的模块——正好把
@@ -30,11 +37,16 @@ R62：本模块对 `yaml` 保持硬 import，**不要**改成 `importorskip`。R
 注意：本文件用 PyYAML 解析 manifest（无锚点身份检查就只能靠文本比对）。
 """
 import ast
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+
+from path_config import resolve_runtime_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "bin" / "train" / "kineager_k8s.sh"
@@ -137,44 +149,199 @@ def test_manifest_header_lists_the_cata_profile():
 
 
 # ---------------------------------------------------------------------------
-# R61：k8s profile 的写入路径必须落在用户自己的目录下
+# R61 / R63 / R64 / R65：k8s profile 的写入路径必须落在用户自己的目录下
 # ---------------------------------------------------------------------------
 
 def _launcher_user_guard():
-    """launcher 里那个「k8s profile 且 USER 未设」的守卫块（含条件行与 fi）。
+    """launcher 里那个 k8s-profile USER 守卫的整块（含结尾 fi）。返回 (首行, 末行, 文本)。
 
     先去掉 shell 注释再定位：`#` 后面的说明文字里也出现了 CATA_PROFILE / USER，
-    不剥掉就会把注释行也当成候选。返回 (起始行号, 块文本)。
+    不剥掉就会把注释行也当成候选。锚点是「唯一一条提到 CATA_PROFILE 的 if」——
+    条件行本身不再直接出现 USER（R63/R65 之后用户名归一到了块内的变量），所以
+    USER 的存在性在块上校验。块内有嵌套的 if/case，结尾要按深度配对，不能取第一个 fi。
     """
     lines = _strip_shell_comments(_launcher_text()).splitlines()
     starts = [i for i, line in enumerate(lines)
-              if line.lstrip().startswith("if ")
-              and "CATA_PROFILE" in line and "USER" in line]
-    assert len(starts) == 1, f"USER 守卫必须恰好一处，找到 {len(starts)} 处"
-    ends = [i for i in range(starts[0] + 1, len(lines)) if lines[i].strip() == "fi"]
-    assert ends, "USER 守卫没有 fi 收尾"
-    return starts[0], "\n".join(lines[starts[0]:ends[0] + 1])
+              if line.lstrip().startswith("if ") and "CATA_PROFILE" in line]
+    assert len(starts) == 1, f"USER 守卫必须恰好一处（唯一的 CATA_PROFILE if），找到 {len(starts)} 处"
+
+    depth = 0
+    end = None
+    for index in range(starts[0], len(lines)):
+        stripped = lines[index].strip()
+        if re.match(r"(if|case)\b", stripped):
+            depth += 1
+        if re.match(r"(fi|esac)\b", stripped):
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    assert end is not None, "USER 守卫的 if 没有配对的 fi"
+    block = "\n".join(lines[starts[0]:end + 1])
+    assert "USER" in block, "提到 CATA_PROFILE 的那个 if 不是 USER 守卫"
+    return starts[0], end, block
+
+
+def _guard_user_variable(block):
+    """守卫里承接 `${USER:-${USERNAME:-}}` 的那个变量名（R63 的两种形式）。
+
+    从源码里取变量名而不是硬编码，这样「校验的那个值」与「导出的那个值」可以
+    相互对照：R64 的失败模式正是两者脱钩。
+    """
+    match = re.search(r'^\s*([A-Za-z_]\w*)=["\']?\$\{USER:-\$\{USERNAME:-\}\}',
+                      block, re.M)
+    assert match, (
+        "守卫没有以 ${USER:-${USERNAME:-}} 的形式承接用户名："
+        "path_config 接受 USER 或 USERNAME，守卫必须接受同样的两种形式"
+    )
+    return match.group(1)
+
+
+def _guard_messages(block):
+    """守卫里 echo 出去的文本（注释已被 _strip_shell_comments 去掉）。"""
+    return "\n".join(line for line in block.splitlines()
+                     if line.strip().startswith("echo "))
+
+
+def _guard_case_region(block):
+    """`case … esac` 那一段（R65 的占位符拒绝分支）。"""
+    assert "case " in block and "esac" in block, "守卫缺少 case/esac 的占位符拒绝分支"
+    start = block.index("case ")
+    end = block.index("esac", start)
+    return block[start:end]
+
+
+def _guard_unset_region(block, variable):
+    """`if [ -z "${var}" ]; then … fi` 那一段（R61 的缺用户名拒绝分支）。"""
+    match = re.search(rf'^\s*if \[ -z "\$\{{{variable}\}}" \]; then\s*$', block, re.M)
+    assert match, f'守卫缺少 if [ -z "${{{variable}}}" ] 分支'
+    tail = block[match.end():]
+    end = re.search(r"^\s*fi\s*$", tail, re.M)
+    assert end, "缺用户名的 if 分支没有 fi 收尾"
+    return tail[:end.start()]
 
 
 def test_launcher_refuses_the_k8s_profile_without_user():
-    _, block = _launcher_user_guard()
-    condition = block.splitlines()[0]
-    assert '"${USER:-}"' in condition, "守卫必须测 USER 是否为空（${USER:-} 才不会触发 set -u）"
-    assert "-z" in condition, "守卫必须测「为空」而不是「非空」"
-    assert re.search(r"^\s*exit 1\s*$", block, re.M), "守卫必须 exit 1：拒绝启动才是正确的取舍"
-    assert "USER" in block, "守卫的消息必须点名 USER"
-    lowered = block.lower()
+    _, _, block = _launcher_user_guard()
+    variable = _guard_user_variable(block)
+    unset = _guard_unset_region(block, variable)
+
+    assert '[ "${CATA_PROFILE}" = "k8s" ]' in block, "守卫必须只作用于 k8s profile"
+    assert re.search(r"^\s*exit 1\s*$", unset, re.M), (
+        "缺用户名这一支必须 exit 1：拒绝启动才是正确的取舍"
+    )
+    assert "USER" in unset, "消息必须点名 USER"
+    lowered = unset.lower()
     assert "shared" in lowered and "kineager_runs" in lowered, (
-        "守卫的消息必须说明理由：回退目录是共享的，并发 run 的产物会互相覆盖"
+        "消息必须说明理由：回退目录是共享的，并发 run 的产物会互相覆盖"
     )
 
 
+def test_launcher_accepts_user_or_username_like_path_config():
+    """R63：守卫接受的两种形式必须与 path_config 的解析顺序一致。"""
+    _, _, block = _launcher_user_guard()
+    _guard_user_variable(block)          # USER -> USERNAME，缺一不可
+    assert "USERNAME" in _guard_messages(block), (
+        "拒绝消息里必须点名 USERNAME，否则补救办法不可发现"
+    )
+
+
+def test_launcher_rejects_the_manifest_user_placeholder():
+    """R65：manifest 的 `<REPLACE_ME: …>` 是非空字符串，忘了填也能过原来的检查。"""
+    _, _, block = _launcher_user_guard()
+    placeholder = _guard_case_region(block)
+
+    assert re.search(r'["\']<REPLACE_ME["\']\*', placeholder), (
+        "守卫必须用 case 模式拒绝仍然留着 <REPLACE_ME 前缀的 USER"
+    )
+    assert re.search(r"^\s*exit 1\s*$", placeholder, re.M), "占位符这一支必须 exit 1"
+    assert "placeholder" in placeholder.lower(), "消息必须说明「占位符还在」"
+
+
+def test_launcher_exports_the_validated_user():
+    """R64：被校验的值必须 export —— exec 出去的训练进程继承的是环境。
+
+    `${USER:-}` 能看到未导出的 shell 变量，但 `USER=alice; bash …` 里的值不会
+    进入环境，`path_config` 的 `os.getenv("USER")` 于是看不到它，还会落到共享目录。
+    bash 在本机起不来，所以这里是源码级断言：export 存在、在守卫之内、在最后一条
+    exit 1 之后、且导出的是**守卫校验过的那个变量**（不是另写的表达式）。
+    """
+    start, end, block = _launcher_user_guard()
+    variable = _guard_user_variable(block)
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+
+    exports = [i for i, line in enumerate(lines[start:end + 1], start=start)
+               if re.fullmatch(rf'export USER="\$\{{{variable}\}}"', line.strip())]
+    assert len(exports) == 1, (
+        f'守卫内必须恰好一条 export USER="${{{variable}}}"，找到 {len(exports)} 条'
+    )
+    export_index = exports[0]
+
+    exits = [i for i, line in enumerate(lines[start:end + 1], start=start)
+             if line.strip() == "exit 1"]
+    assert exits and max(exits) < export_index, "export 必须跟在所有拒绝分支之后"
+    assert export_index < end, "export 必须在守卫块内（k8s profile 才需要它）"
+
+    exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
+    assert exec_lines, "launcher 的 exec 不见了"
+    assert export_index < exec_lines[0], "export 必须先于 exec，否则训练进程看不到它"
+
+
+def test_an_unexported_value_never_reaches_a_child_process():
+    """R64 的机制，用真实子进程演示：环境才是子进程能看到的通道。
+
+    bash 在本机起不来，所以用 Python 复现同一语义——父进程里存在一个名为 USER
+    的变量，但只有把它放进环境，子进程的 `os.getenv("USER")` 才能看到。这正是
+    `USER=alice; bash …` 与 `export USER=alice; bash …` 的差别，也是 R64 要求
+    export 的原因：`path_config` 读的是环境。
+    """
+    probe = "import os; print(os.getenv('USER') or '<unset>')"
+    env_without = {k: v for k, v in os.environ.items() if k not in ("USER", "USERNAME")}
+
+    USER = "alice"          # noqa: F841 — 父进程里的变量，等价于未 export 的 shell 变量
+    assert USER == "alice"  # 值确实存在，只是不在环境里
+
+    unseen = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                            text=True, env=env_without)
+    assert unseen.stdout.strip() == "<unset>", "未导出的值居然被子进程看到了"
+
+    seen = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, env={**env_without, "USER": "alice"})
+    assert seen.stdout.strip() == "alice", "环境里的值必须被子进程看到"
+
+
+def test_path_config_accepts_username_when_user_is_unset(monkeypatch):
+    """R63 的解析器一侧：只设 USERNAME 时解析出的是该用户自己的目录。
+
+    这条断言把守卫接受的形式钉在解析器的真实行为上；两个都未设时才回退到共享
+    目录（`tests/test_path_config.py::test_k8s_profile_falls_back_when_no_user_variable_is_set`）。
+    """
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setenv("USERNAME", "alice")
+    resolved = str(resolve_runtime_paths(profile="k8s")["train_data_dir"]).replace("\\", "/")
+
+    assert resolved == "/pfs_beijing/alice/kineager_runs"
+    assert "kineager/kineager_runs" not in resolved
+
+
 def test_launcher_user_guard_precedes_the_exec():
-    start, _ = _launcher_user_guard()
+    start, _, _ = _launcher_user_guard()
     lines = _strip_shell_comments(_launcher_text()).splitlines()
     exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
     assert exec_lines, "launcher 的 exec 不见了"
     assert start < exec_lines[0], "USER 守卫必须与其它校验一起先于 exec"
+
+
+def test_launcher_user_guard_precedes_the_required_input_checks():
+    """守卫必须先于 `:?` 必填检查 —— runbook §8 第 11 条据此断言「不必再设别的」。
+
+    否则把守卫挪到 TRAIN_CSV 之后就没人发现：套件仍然全绿，runbook 却变成错的。
+    """
+    start, _, _ = _launcher_user_guard()
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    required = [i for i, line in enumerate(lines) if ":?" in line]
+    assert required, "launcher 的必填变量检查（${VAR:?…}）不见了"
+    assert start < min(required), "USER 守卫必须先于 ${VAR:?…} 必填检查"
 
 
 def test_manifest_env_declares_user():
@@ -224,8 +391,9 @@ def test_yaml_import_stays_hard_and_is_not_importorskip():
     """R62：不要把 `import yaml` 改成 `importorskip`，否则本模块会被静默跳过。
 
     这条断言防的是「后来的读者按 reviewer 的建议把 import 软化」——缺依赖时本模块
-    根本收集不起来，这正是想要的失败方式（见模块 docstring）。用 AST 判断实际调用，
-    这样模块里说明这条 ruling 的注释不会被自己误判。
+    根本收集不起来，这正是想要的失败方式（见模块 docstring）。用 AST 判断是否有
+    `importorskip` **调用**，这样本文件里说明这条 ruling 的注释和消息不会被误判，
+    而真正的 `pytest.importorskip(...)` 一定跑不掉。
     """
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
 

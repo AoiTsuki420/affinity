@@ -148,11 +148,12 @@ hatch. Two further details: an explicitly **empty** sequence means "use the
 defaults" (the truthiness test above), and `--lora_target_suffixes` takes
 `nargs="+"`, so pass the names space-separated.
 
-The launcher does **not** set this flag — it only forwards `--lora_layer_policy`,
-`--lora_last_k`, `--grad_checkpoint_backbone`, `--iters_to_accumulate`,
-`--num_workers` and then the caller's `"$@"`. In the Kubeflow route, add it to
-the `run_trainer()` argument list in the manifest; standalone, append it to the
-launcher command line.
+The launcher does **not** set this flag: it sets only the five LoRA/throughput
+flags (`--lora_layer_policy`, `--lora_last_k`, `--grad_checkpoint_backbone`,
+`--iters_to_accumulate`, `--num_workers`) plus the required
+`--task`/`-csv`/`-esm`/`-molt5`, and then appends the caller's `"$@"`. In the
+Kubeflow route, add `--lora_target_suffixes` to the `run_trainer()` argument list
+in the manifest; standalone, append it to the launcher command line.
 
 ---
 
@@ -269,8 +270,21 @@ Three invariants that are not obvious from the file:
    creates it and `:1874-1875` save the per-epoch `preds_epoch*.npy` /
    `labels_epoch*.npy` there), so two concurrent users would overwrite each
    other's artifacts while both runs look healthy. `bin/train/kineager_k8s.sh`
-   therefore **refuses to start** when `CATA_PROFILE=k8s` and `USER` is unset
-   (R61). Leave `CATA_PROFILE` at `k8s`: without it the trainer falls back to the
+   therefore refuses to start (R61) when the k8s profile is in use and the value
+   is unsafe. Three details of that refusal matter to an operator:
+   * it accepts **`USER` or `USERNAME`**, the same two forms and the same
+     precedence `path_config` uses (R63), and exports whichever one supplied the
+     value so the trainer's environment carries exactly the value that was
+     checked (R64) — a plain `USER=alice; bash bin/train/kineager_k8s.sh …`
+     without `export` would otherwise pass the check and still resolve to the
+     shared directory;
+   * it also rejects a value that still starts with `<REPLACE_ME` (R65): the
+     manifest's placeholder is a non-empty string, which Kubernetes happily
+     accepts, and the run would otherwise create a directory named after the
+     placeholder;
+   * the remedy is in the message itself, so a failure tells you what to export.
+
+   Leave `CATA_PROFILE` at `k8s`: without it the trainer falls back to the
    platform default profile (`autodl` on Linux) and silently reads the wrong
    paths (R58).
 
@@ -408,7 +422,7 @@ one that decides a code default.
 | 8 | 2-GPU smoke run completes | the standalone launcher command in §6 with `ITERS_TO_ACCUMULATE=2`, `-epochs 1 -batch_size 2`, a small CSV subset | both ranks rendezvous, 1 epoch finishes, both `DistributedSampler enabled. World size = 2` and `[DDP] trainable params` appear, no NaN/Inf loss |
 | 9 | Accumulation really runs | the same run with `ITERS_TO_ACCUMULATE=2` vs `1` | optimizer steps ≈ `ceil(batches/2)`, and the LR actually anneals across the epoch count instead of stalling or completing early. The three schedule-length wiring sites are verified only by code review plus a unit-tested pure helper, so this is the end-to-end confirmation |
 | 10 | Checkpoint is written and loadable | look for `predictor_best_ema.pt` under `/pfs_beijing/$USER/kineager_runs`; load it in a pod | the file exists and loads with `strict=True` |
-| 11 | `USER` scoping holds in the pod | `[PATHS] train_data_dir=…` in the log; then, in a pod shell, `unset USER; bash bin/train/kineager_k8s.sh -epochs 1` (the guard runs before the other required-input checks, so nothing else needs to be set) | the log names **your** user; the unset-`USER` run exits 1 with the message naming `USER` and the shared fallback, and never reaches torchrun |
+| 11 | `USER` scoping holds in the pod | `[PATHS] train_data_dir=…` in the log; then, in a pod shell: (a) `unset USER USERNAME; bash bin/train/kineager_k8s.sh -epochs 1` (the guard runs before the other required-input checks, so nothing else needs setting); (b) `USER='<REPLACE_ME: x>' bash bin/train/kineager_k8s.sh -epochs 1`; (c) `USER=alice bash bin/train/kineager_k8s.sh -epochs 1` | the log names **your** user (`/pfs_beijing/<you>/kineager_runs`), never `kineager`; (a) exits 1 naming `USER`/`USERNAME` and the shared fallback; (b) exits 1 saying the placeholder is still in place; (c) gets past the guard — the next failure is the `TRAIN_CSV` check, not a `USER` refusal — which a full run sees as a user-scoped `[PATHS]` line, proving the validated value reached the trainer's environment |
 | 12 | The training CSV and the split look sane | the builder's statistics from §4, plus the run's `Train samples:`/`Val samples:` lines | non-zero counts, pKaffinity in a plausible range, `--split_mode group_pair --split_seed 42` recorded in the run's split metadata |
 | 13 | bf16 is stable | watch the first epoch's loss and the recorded metrics | no NaN/Inf loss; if one appears, note the module and consider `autocast(enabled=False)` for it |
 

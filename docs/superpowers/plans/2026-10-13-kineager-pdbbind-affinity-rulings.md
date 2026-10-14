@@ -1,9 +1,14 @@
-# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R61)
+# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R66)
 
 Controller rulings made while executing
 `docs/superpowers/plans/2026-10-13-kineager-pdbbind-affinity.md` on the
 `feat/pdbbind-affinity` branch, transcribed out of the (git-ignored) SDD ledger
 `.superpowers/sdd/2026-10-13-kineager-pdbbind-affinity/progress.md`.
+
+Scope: **R1–R61** are the execution rulings this appendix was commissioned for.
+**R62** (the test-dependency/import decision) and **R63–R66** (the task-review
+round that amended R61's guard) were recorded afterwards and are marked as such
+where they appear.
 
 This appendix exists because the rulings are the part of the work that is hardest
 to re-derive: several of them record failures that the unit tests of the day
@@ -90,7 +95,8 @@ the later entry says so, and §9 collects those links.
   module.** Placed after Tasks 2–5's tests it aborts the whole module at import,
   silently disabling ~40 unrelated tests on any machine without peft. Replaced by
   a `HAS_PEFT` try/except plus `skipif` marks on the seven peft-dependent tests;
-  the `importorskip` token must appear in no `.py` file.
+  no `importorskip` **call** may appear in a `.py` file (the token itself survives
+  as prose explaining this ruling, which is exactly why R62's check is AST-based).
 - **R2 — the constructor must take and thread the new LoRA/PLM options.**
   `KineticsPredictor.__init__` gains `lora_layer_policy`, `lora_last_k`,
   `lora_explicit_layers`, `lora_target_suffixes`, `plm_max_len_prot`,
@@ -526,25 +532,95 @@ the later entry says so, and §9 collects those links.
   which is the opposite of what this project enforced all session. A collection
   error that says "install your dependencies" is the correct failure.
 
+### Review round (R63–R66)
+
+Recorded after the R1–R62 body above. R63–R65 amend R61's guard, which the task
+review found to be too weak in three independent ways; R66 concerns the audit's
+stated range rather than any code.
+
+- **R63 — the guard must accept exactly the forms the resolver accepts.**
+  `path_config._current_user_name()` resolves `USER → USERNAME → the literal`, but
+  the guard tested `USER` alone, so a host with only `USERNAME` set was refused
+  even though resolution would have produced a valid per-user directory — the
+  launcher was **stricter than the resolver**, and `README.md` still documented
+  the `USER`-else-`USERNAME` order. Ruled: accept `${USER:-${USERNAME:-}}` and
+  export whichever supplied the value (R64), or at minimum name `USERNAME` in the
+  refusal message. Implemented as the former, with the refusal naming both.
+- **R64 — the guard could be defused by an *unexported* assignment of the very
+  variable it checks.** `${USER:-}` sees a shell variable whether or not it is
+  exported, but the `exec`'d `torch.distributed.run` inherits only the
+  **environment**, and `path_config._current_user_name()` reads
+  `os.getenv("USER")`. On a host where `USER` is not already in the environment —
+  a minimal container, which is exactly the k8s case —
+  `USER=alice; bash bin/train/kineager_k8s.sh …` set a shell variable, **passed
+  the guard**, and still resolved to the shared
+  `/pfs_beijing/kineager/kineager_runs`. The guard therefore *certified* the very
+  run it exists to prevent, which made it worse than useless. Ruled: `export` the
+  validated value so the value that was checked is the value the trainer
+  receives, pinned by an assertion.
+- **R65 — an unfilled `USER` placeholder passed the guard.** The manifest's value
+  is `"<REPLACE_ME: your username on the shared filesystem>"`, which is
+  non-empty, so an operator who forgot to replace it passed the guard and the run
+  created `/pfs_beijing/<REPLACE_ME: your username on the shared filesystem>/kineager_runs`.
+  The manifest's "an unedited apply fails loudly" property does not extend to this
+  value, because any string is a valid Kubernetes env value. Ruled: also reject a
+  `USER` matching `^<REPLACE_ME`, with a message that says the placeholder is
+  still in place.
+- **R66 — the audit's range label was challenged; re-measurement upheld it, and
+  both views are now stated.** The review read the `8607086..2c54e9d` stat
+  (README `6/3` inside `1144 insertions(+), 3 deletions(-)`) as proof that three
+  README deletions fall inside the audit's `3497a5e..HEAD` range, which would make
+  the deletion set span five files and contradict the whole-branch totals.
+  Re-measured at the final HEAD: `git diff --stat 3497a5e..HEAD` is 28 files,
+  **+7858/−856**, and `--numstat` puts all 856 deletions in exactly four files
+  (`main_infer_predictor` 63, `main_train_predictor_multigpu` 519,
+  `models/encoders` 100, `models/predictor` 174); `README.md` is **68/0** for that
+  range and was 65/0 at `8607086`. The three lines my commit changed were
+  themselves part of Task 20's added README block, so they are deletions only
+  relative to `8607086`, not to the branch base — against `3497a5e` the README
+  delta stays purely additive, and those three lines are documentation in the
+  affinity README section (no kinetics relevance). The report now prints both
+  ranges side by side precisely so neither label can be misread.
+
 ---
 
 ## 9. Supersessions, corrections and dismissed concerns
 
-Read this before acting on any entry above that a later one amended.
+Read this before acting on any entry above that a later one amended. The table
+below contains only genuine **earlier → later** links; rulings that were revised
+in place are listed separately, because a row whose two columns name the same
+ruling is not a link.
 
 | Earlier | Later | What changed |
 |---|---|---|
 | R2 | **R36** | R2's constructor list was missing the checkpointing `mode`; without R36 the `--grad_checkpoint_backbone` flag was dead. |
-| R28 | **R28 (revised)** | The controller's premise — that the kcat expert's protein LoRA never trained — was refuted by reading the source (`train_backbone=True` at `:128`). The ruling's *action* narrowed to `torch.is_grad_enabled() and any(...)`. |
 | R30 | **R32** | R30's `unpack_batch` slot mapping was backwards; the real binding puts the label in the row-id slot and the affinity-type string in the labels slot. |
 | R31 | **R47**, **R51** | R31 placed the boundary in `train_epoch`; R47 gated the schedule/EMA counters on it, and R51 sized the LR plan in optimizer steps so the schedule can actually finish. |
-| R37 | **R37 (premise corrected)** | The action (explicit `(B, 2)` labels) stands. The rationale was wrong: numpy **raises** on `(B,)` → `(B, 2)`; the silently-accepted shapes are `(B, 1)` and a scalar. |
 | R40 | **R42**, **R43** | R42 dropped R40's general rule because it broke partial-head inference checkpoints; R43 extended what remained to test `active_heads` as well as `head_specs`. |
-| R46 | **R46** | R46 does not correct the implementation — it corrects the brief's own test, which contradicted the brief's next test. |
 | R47 | **R54**, **R55** | R54 hoisted a `base_lr` pin that R47's gate had moved; R55 recorded that R47's bitwise default-path equivalence rests on a deleted transcript, not a committed artifact. |
 | R49 | **R61** | R49's user fallback became unsafe once R57 made `train_data_dir` a write target; R61 requires `USER` rather than allowing the shared fallback. |
-| R53 | **R53** | Dismisses the cross-version-resume concern: accumulation is new, so every pre-existing checkpoint ran at `accum == 1`, where the counters coincide by construction. |
-| R56 | **R56 (item 6 improved)** | The implementer's `${1+"$@"}` is better than either form the ruling offered, because `"${@:-}"` expands to one empty word that argparse rejects. |
+| R61 | **R63**, **R64**, **R65** | R61's guard was too weak in three ways, all found by review: it tested `USER` only while the resolver also accepts `USERNAME` (R63); a shell variable that was never `export`ed satisfied it yet never reached the trainer's environment (R64); and the manifest's non-empty `<REPLACE_ME: …>` placeholder passed it (R65). |
+
+### Revised in place (not supersessions)
+
+These rulings were corrected or refined within their own entry; there is no
+"later ruling" to follow, so read the entry as it now stands.
+
+* **R28** — the controller's premise (that the kcat expert's protein LoRA never
+  trained) was refuted by reading the source (`train_backbone=True` at
+  `main_train_kcat_expert.py:128`); the ruling's *action* narrowed to
+  `torch.is_grad_enabled() and any(p.requires_grad …)`.
+* **R37** — the action (explicit `(B, 2)` labels) stands; the rationale was
+  wrong. numpy **raises** on `(B,)` → `(B, 2)`; the silently-accepted shapes are
+  `(B, 1)` and a scalar.
+* **R46** — does not correct the implementation: it corrects the *brief's own
+  test*, which contradicted the brief's next test.
+* **R53** — dismisses the cross-version-resume concern rather than amending a
+  ruling: accumulation is new, so every pre-existing checkpoint ran at
+  `accum == 1`, where the counters coincide by construction.
+* **R56 (item 6)** — the implementer's `${1+"$@"}` is better than either form the
+  ruling offered, because `"${@:-}"` expands to one empty word that argparse
+  rejects.
 
 ### The controller errors this session, in one place
 

@@ -66,17 +66,38 @@ fi
 # overridable for a run that deliberately wants another profile.
 export CATA_PROFILE="${CATA_PROFILE:-k8s}"
 
-# --- write-path scoping: ${USER} must be real, not the shared fallback -------
+# --- write-path scoping: ${USER} must be real, exported and filled in -------
 # Only the k8s profile uses ${USER}, and path_config._current_user_name()
-# resolves it as USER -> USERNAME -> the literal "kineager". A pod sets neither
-# variable, so an unset USER silently resolves runs_dir AND train_data_dir to the
-# SHARED /pfs_beijing/kineager/kineager_runs. train_data_dir is a write target
+# resolves it as USER -> USERNAME -> the literal "kineager" (the R63 order, so
+# this guard accepts exactly the same two forms). A pod sets neither variable, so
+# an unset value silently resolves runs_dir AND train_data_dir to the SHARED
+# /pfs_beijing/kineager/kineager_runs. train_data_dir is a write target
 # (train_epoch mkdirs it and np.saves the per-epoch preds_epoch*/labels_epoch*.npy
 # there), so two concurrent users would overwrite each other's artifacts while
 # both runs look healthy -- far harder to notice than a refusal to start.
-if [ "${CATA_PROFILE}" = "k8s" ] && [ -z "${USER:-}" ]; then
-    echo "USER is unset but CATA_PROFILE=k8s: path_config expands \${USER} in runs_dir/train_data_dir, and the fallback /pfs_beijing/kineager/kineager_runs is SHARED, so concurrent runs would overwrite each other's per-epoch .npy artifacts. Export USER=<your username> (the manifest's env block carries a USER entry)." >&2
-    exit 1
+#
+# Two ways past a naive check, both closed here:
+#   * an UNSET-but-unexported assignment (`USER=alice; bash ...`) satisfies
+#     ${USER:-} -- a shell variable needs no export to be seen by this script --
+#     yet the exec'd trainer inherits only the ENVIRONMENT and os.getenv("USER")
+#     sees nothing. So the validated value is exported below, making the value
+#     that was checked the value the trainer receives.
+#   * the manifest's own placeholder is a non-empty string, so an operator who
+#     forgets to fill it in would otherwise create a directory named after the
+#     placeholder. Kubernetes accepts any string as an env value; this rejects it.
+if [ "${CATA_PROFILE}" = "k8s" ]; then
+    kineager_user="${USER:-${USERNAME:-}}"
+    case "${kineager_user}" in
+        "<REPLACE_ME"*)
+            echo "USER is still the manifest placeholder (${kineager_user}) but CATA_PROFILE=k8s: fill in the USER entry in the PyTorchJob's env block. The placeholder is a non-empty string, so it would otherwise become a literal path component under /pfs_beijing/." >&2
+            exit 1
+            ;;
+    esac
+    if [ -z "${kineager_user}" ]; then
+        echo "Neither USER nor USERNAME is set but CATA_PROFILE=k8s: path_config expands \${USER} in runs_dir/train_data_dir, and with neither set it falls back to the SHARED /pfs_beijing/kineager/kineager_runs, where concurrent runs overwrite each other's per-epoch .npy artifacts. Export USER=<your username> (or USERNAME), or fill in the manifest's USER entry." >&2
+        exit 1
+    fi
+    export USER="${kineager_user}"
 fi
 
 # --- required inputs (fail fast, with the variable name in the message) ------
