@@ -141,12 +141,40 @@ def test_arg_parser_accepts_affinity_task():
     assert args.task == "affinity"
 
 
-def test_arg_parser_lora_defaults_to_last_k_30():
+def test_arg_parser_lora_policy_default_is_neutral():
+    """R70：argparse 的默认值必须是 None，由 main() 按 task 解析。
+
+    固定成 "last_k" 会覆盖 models/predictor.py 自己的 "all" 缺省值，把同一条 kinetics
+    命令的 LoRA 层从 0..32 改成 3..32（198 个目标模块少 18 个），基线行为就变了。
+    """
     from main_train_predictor_multigpu import build_arg_parser
 
     args = build_arg_parser().parse_args(["-csv", "x.csv", "-esm", "a", "-molt5", "b"])
-    assert args.lora_layer_policy == "last_k"
+    assert args.lora_layer_policy is None
     assert args.lora_last_k == 30
+
+
+@pytest.mark.parametrize("task,expected", [("kinetics", "all"), ("affinity", "last_k")])
+def test_arg_parser_lora_policy_default_resolves_per_task(task, expected):
+    """R70：不传 flag 时 kinetics 回到 "all"（基线），affinity 是设计要求的 last_k。
+
+    这条断言在修复前必然失败：既没有 resolve_lora_layer_policy，默认值也停在 "last_k"。
+    """
+    from main_train_predictor_multigpu import build_arg_parser, resolve_lora_layer_policy
+
+    args = build_arg_parser().parse_args(
+        ["-csv", "x.csv", "-esm", "a", "-molt5", "b", "--task", task]
+    )
+    assert resolve_lora_layer_policy(args.lora_layer_policy, args.task) == expected
+
+
+@pytest.mark.parametrize("explicit", ["all", "last_k", "explicit"])
+def test_explicit_lora_policy_overrides_the_task_default(explicit):
+    """R70：显式传值（消融用）永远优先于任务默认值。"""
+    from main_train_predictor_multigpu import resolve_lora_layer_policy
+
+    for task in ("kinetics", "affinity"):
+        assert resolve_lora_layer_policy(explicit, task) == explicit
 
 
 def test_arg_parser_accepts_lora_target_suffixes_override():
@@ -928,10 +956,27 @@ class _FakeKineticsInferModel(nn.Module):
                 torch.zeros(batch))
 
 
+def _cfg_for_task(task):
+    """替身也要给出**正确的 task cfg**（R69）。
+
+    真实 build_model_from_ckpt 现在按 checkpoint 决定 cfg.task，main() 会用
+    cfg.task 与 args.task 对齐（构造与循环必须一致）。替身返回 cfg=None 时那三个
+    e2e 测试会因为「--task affinity 但 checkpoint 没有亲和力头」而失败——那正是
+    守卫在正确工作，所以这里让替身说实话。
+    """
+    from main_infer_predictor import PredictorConfig
+
+    return PredictorConfig.for_task("affinity" if task == "affinity" else "kinetics")
+
+
 def _run_infer_main(monkeypatch, model, frame, task):
     """在一次性的顶层目录里跑 main_infer_predictor.main()，返回写出的 CSV。
 
-    checkpoint 加载被替身顶掉，所以脚本不读真实权重、不下载任何东西；
+    **build_model_from_ckpt 在这里被替身顶掉**，所以脚本不读真实权重、不下载任何东西；
+    这是有意的：这三个测试断言的是循环侧的输出形状（列名、两路/三路解包、真值列门），
+    不是加载器。加载器本身的真实覆盖由
+    `tests/test_predictor_construction.py::test_affinity_checkpoint_rebuilds_as_an_affinity_model`
+    提供——R69 正是被这个 lambda 模式漏掉的，所以那条测试**不**打桩。
     脚本按 cwd 写 predictions_<task>.csv，因此必须在一次性目录里跑。
     """
     import os
@@ -945,7 +990,9 @@ def _run_infer_main(monkeypatch, model, frame, task):
     original_cwd = pathlib.Path.cwd()
     try:
         frame.to_csv(scratch / "input.csv", index=False)
-        monkeypatch.setattr(infer, "build_model_from_ckpt", lambda *a, **k: (model, None, {}))
+        ckpt_cfg = _cfg_for_task(task)
+        monkeypatch.setattr(infer, "build_model_from_ckpt",
+                            lambda *a, **k: (model, ckpt_cfg, {}))
         monkeypatch.setattr(infer, "check_model_weights", lambda m, ckpt: None)
         monkeypatch.setattr(sys, "argv", [
             "main_infer_predictor.py", "-csv", "input.csv", "-weights", "fake.pt",
@@ -975,19 +1022,49 @@ def test_format_affinity_prediction_clamps_log_variance_overflow():
 
     未夹取时 math.exp(1000.0) 抛 OverflowError（math range error），
     math.exp(-1000.0) 则下溢成 0.0；所以下面两组断言在删掉夹取后都会失败。
+    夹取上界取 ±10（= 训练期 models/affinity_loss.py 的 _LOG_VAR_MIN/_LOG_VAR_MAX），
+    见 AFFINITY_LOG_VAR_BOUND 的注释。
     """
     import math
 
-    from main_infer_predictor import format_affinity_prediction
+    from main_infer_predictor import AFFINITY_LOG_VAR_BOUND, format_affinity_prediction
 
     high = format_affinity_prediction(mu=5.0, log_var=1000.0)
-    assert high["sigma2"] == pytest.approx(math.exp(20.0))
-    assert high["sigma"] == pytest.approx(math.exp(10.0))
+    assert high["sigma2"] == pytest.approx(math.exp(AFFINITY_LOG_VAR_BOUND))
+    assert high["sigma"] == pytest.approx(math.exp(AFFINITY_LOG_VAR_BOUND / 2.0))
     assert math.isfinite(high["sigma2"]) and math.isfinite(high["sigma"])
 
     low = format_affinity_prediction(mu=5.0, log_var=-1000.0)
-    assert low["sigma2"] == pytest.approx(math.exp(-20.0))
+    assert low["sigma2"] == pytest.approx(math.exp(-AFFINITY_LOG_VAR_BOUND))
     assert low["sigma"] > 0.0
+
+
+def test_affinity_inference_clamp_matches_the_training_loss():
+    """推理端的夹取必须与训练期的同一约定一致，否则 sigma 会跑到标定之外。
+
+    两边各自持有一个常量（推理端 AFFINITY_LOG_VAR_BOUND，损失里 _LOG_VAR_MIN/MAX），
+    这条断言把二者钉在一起：谁改了一边而没改另一边，它就会红。
+    """
+    from main_infer_predictor import AFFINITY_LOG_VAR_BOUND
+    from models.affinity_loss import _LOG_VAR_MAX, _LOG_VAR_MIN
+
+    assert _LOG_VAR_MIN == -_LOG_VAR_MAX        # 损失自己的对称性
+    assert AFFINITY_LOG_VAR_BOUND == _LOG_VAR_MAX
+
+
+def test_lr_find_is_refused_for_the_affinity_task():
+    """Important 3：--lr_find 走三头损失，affinity 的单头输出会在解包处 ValueError。
+
+    拒绝比跑到第 50 个 batch 才炸更有用；kinetics 下不受影响。
+    """
+    from main_train_predictor_multigpu import validate_task_option_compatibility
+
+    with pytest.raises(ValueError, match=r"--lr_find"):
+        validate_task_option_compatibility("affinity", True)
+
+    # kinetics 用同一个开关是合法的，affinity 不打开 lr_find 也合法
+    validate_task_option_compatibility("kinetics", True)
+    validate_task_option_compatibility("affinity", False)
 
 
 def test_main_infer_predictor_affinity_task_writes_pkabind_columns(monkeypatch):

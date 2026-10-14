@@ -172,3 +172,80 @@ def test_predictor_rejects_gradient_checkpointing_without_lora():
     with pytest.raises(ValueError, match="grad_checkpoint_backbone"):
         KineticsPredictor(device="cpu", esm_model="esm-local", molt5_model="molt5-local",
                           cfg=cfg, use_lora=False, grad_checkpoint_backbone="active")
+
+
+# ---------------------------------------------------------------------------
+# R69：真实 affinity state_dict 必须能走**真实** build_model_from_ckpt
+# ---------------------------------------------------------------------------
+
+# depth/dropout 无法从 state_dict 反推，推理侧（_infer_predictor_cfg_from_ckpt）沿用
+# 与 kinetics 头相同的固定值 3 / 0.10；训练侧 for_task("affinity") 用的也正是这两个值，
+# 所以夹具必须一致，否则重建出来的是另一个形状的头。
+_AFFINITY_CKPT_HEAD = {"type": "mlp", "hidden_dim": 16, "depth": 3, "dropout": 0.10,
+                       "out_dim": 2}
+
+
+def _affinity_ckpt_source_model(monkeypatch):
+    """造一个「可以存成 checkpoint」的真实亲和力模型（骨干仍是 config 构造的）。"""
+    protein_loader, ligand_loader, _ = _loader_calls()
+    monkeypatch.setattr("models.plm_backbones.load_protein_backbone", protein_loader)
+    monkeypatch.setattr("models.plm_backbones.load_ligand_backbone", ligand_loader)
+
+    cfg_kwargs = _small_cfg("affinity")
+    cfg_kwargs["head_specs"] = {"affinity": dict(_AFFINITY_CKPT_HEAD)}
+    cfg = PredictorConfig.for_task("affinity", **cfg_kwargs)
+    return KineticsPredictor(device="cpu", esm_model="esm-local",
+                             molt5_model="molt5-local", cfg=cfg, use_lora=False)
+
+
+def test_affinity_checkpoint_rebuilds_as_an_affinity_model(monkeypatch):
+    """R69：真实 state_dict 走**真实** build_model_from_ckpt，不能打桩。
+
+    这条测试刻意不 monkeypatch build_model_from_ckpt：tests/test_predictor_import.py 的
+    lambda 替身正是让这个缺陷溜过去的原因。修复前 `PredictorConfig(**cfg_updates)` 建的是
+    kinetics 三头配置——active_heads 变成 ["kcat","Km","ratio"]，训练好的
+    multi_head.heads.affinity.* 成了 unexpected keys，forward 返回 7 元组，
+    main() 里的两路解包随即 ValueError：整条 affinity 推理路径实际不可用。
+    """
+    import pathlib
+    import shutil
+
+    import torch
+
+    import main_infer_predictor as infer
+
+    scratch = pathlib.Path("_scratch_affinity_ckpt")
+    scratch.mkdir(exist_ok=True)
+    try:
+        saved = _affinity_ckpt_source_model(monkeypatch).state_dict()
+        ckpt_path = scratch / "affinity.pt"
+        torch.save(saved, ckpt_path)
+
+        rebuilt, cfg, _ckpt = infer.build_model_from_ckpt(
+            str(ckpt_path), device="cpu",
+            esm_model="esm-local", molt5_model="molt5-local",
+        )
+
+        assert cfg.task == "affinity"
+        assert cfg.active_heads == ["affinity"]
+
+        rebuilt.eval()
+        with torch.no_grad():
+            out = rebuilt(["MKTAYIAK", "MKTAYIAL"], ["CCO", "CCC"], use_mask=False)
+        assert isinstance(out, tuple) and len(out) == 2, (
+            f"affinity 必须返回 (mu, log_sigma2) 两路，实际得到 "
+            f"{len(out) if isinstance(out, tuple) else type(out).__name__}"
+        )
+        mu, log_var = out
+        assert mu.shape == (2,) and log_var.shape == (2,)
+
+        # 训练好的亲和力头必须被真正用上，而不是重建一个同名的随机头。
+        head_keys = sorted(k for k in saved if k.startswith(infer.AFFINITY_HEAD_PREFIX))
+        assert head_keys, "夹具没有造出亲和力头，这条测试就没有意义了"
+        rebuilt_state = rebuilt.state_dict()
+        for key in head_keys:
+            assert key in rebuilt_state, f"重建后的模型里没有 {key}"
+            assert rebuilt_state[key].shape == saved[key].shape, f"{key} 形状不一致"
+            assert torch.allclose(rebuilt_state[key], saved[key]), f"{key} 没有被加载回训练值"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)

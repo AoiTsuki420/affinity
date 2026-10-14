@@ -48,6 +48,16 @@ def _infer_lora_rank_from_ckpt(ckpt: dict) -> int | None:
     return max(ranks)
 
 
+# R69：亲和力头的参数名前缀。checkpoint 里有没有它就是「这是不是一个亲和力模型」的
+# 权威信号——`--task` 只在推理循环里被读，构造期从不看它，而且这个脚本经常不带
+# --task 被调用（例如 pod 里手敲一条命令）。
+AFFINITY_HEAD_PREFIX = "multi_head.heads.affinity."
+
+
+def _is_affinity_checkpoint(ckpt: dict) -> bool:
+    return any(str(k).startswith(AFFINITY_HEAD_PREFIX) for k in ckpt.keys())
+
+
 def _infer_predictor_cfg_from_ckpt(ckpt: dict) -> dict:
     cfg_updates = {}
 
@@ -98,6 +108,18 @@ def _infer_predictor_cfg_from_ckpt(ckpt: dict) -> dict:
                 "dropout": 0.10,
                 "out_dim": 1,
             }
+    # R69：亲和力头同样从 checkpoint 的权重形状还原。out_dim 固定是 2（mu + log_var），
+    # hidden_dim 取自第一层权重；depth/dropout 无法从 state_dict 反推，沿用 kinetics
+    # 分支同样的固定值——训练侧的 for_task("affinity") 用的也正是 depth=3 / dropout=0.10。
+    k_affinity = f"{AFFINITY_HEAD_PREFIX}net.0.weight"
+    if k_affinity in ckpt and hasattr(ckpt[k_affinity], "shape") and len(ckpt[k_affinity].shape) == 2:
+        head_specs["affinity"] = {
+            "type": "mlp",
+            "hidden_dim": int(ckpt[k_affinity].shape[0]),
+            "depth": 3,
+            "dropout": 0.10,
+            "out_dim": 2,
+        }
     if head_specs:
         cfg_updates["head_specs"] = head_specs
 
@@ -139,7 +161,15 @@ def build_model_from_ckpt(ckpt_path, device="cuda", esm_model=None, molt5_model=
     ckpt_keys = ckpt.keys()
 
     cfg_updates = _infer_predictor_cfg_from_ckpt(ckpt)
-    config = PredictorConfig(**cfg_updates)
+    # R69：亲和力 checkpoint 必须按自己的 task preset 构造。默认的 PredictorConfig()
+    # 是 kinetics 三头配置，会建出 kcat/Km/ratio 头，把训练好的
+    # multi_head.heads.affinity.* 当 unexpected keys 丢掉，forward 返回 7 元组，于是
+    # 循环里的两路解包当场 ValueError——整条 affinity 推理路径实际不可用。
+    if _is_affinity_checkpoint(ckpt):
+        config = PredictorConfig.for_task("affinity", **cfg_updates)
+        print(f"[AUTO-CONFIG] task -> affinity (checkpoint has {AFFINITY_HEAD_PREFIX}*)")
+    else:
+        config = PredictorConfig(**cfg_updates)
     if cfg_updates:
         print(f"[AUTO-CONFIG] inferred cfg keys -> {sorted(cfg_updates.keys())}")
 
@@ -201,16 +231,25 @@ def check_model_weights(model, ckpt):
     else:
         print("✅ 所有模型层权重已正确加载。")
 
+# 夹取上界与训练期的 **同一个** 约定：models/affinity_loss.py 把 log_var 夹在
+# ±10（_LOG_VAR_MIN/_LOG_VAR_MAX），模型就是在这个区间里被优化的。推理端曾经用 ±20，
+# 那会输出 exp(20)≈4.85e8 的方差——没有任何标定意义，只是听起来更"宽容"。
+# 上界仍然远低于 math.exp 的上溢阈值（约 709），所以 R48 的上溢防护不变；
+# 下界挡住下溢（exp(-1000.0) == 0.0 会让 sigma 也变成 0）。
+AFFINITY_LOG_VAR_BOUND = 10.0
+
+
 def format_affinity_prediction(mu: float, log_var: float) -> dict:
     """把 (mu, log_sigma2) 转成可写 CSV 的字段。
 
-    log_var 先夹到 [-20, 20]：上界挡住 math.exp 的上溢（未夹取时
-    math.exp(1000.0) 直接抛 OverflowError），下界挡住下溢（exp(-1000.0) == 0.0
-    会让 sigma 也变成 0）。
+    log_var 先夹到 ±AFFINITY_LOG_VAR_BOUND（= 训练期 models/affinity_loss.py 的
+    ±10）：上界挡住 math.exp 的上溢（未夹取时 math.exp(1000.0) 直接抛
+    OverflowError），下界挡住下溢（exp(-1000.0) == 0.0 会让 sigma 也变成 0）。
     """
     import math
 
-    log_var = float(min(max(float(log_var), -20.0), 20.0))
+    bound = AFFINITY_LOG_VAR_BOUND
+    log_var = float(min(max(float(log_var), -bound), bound))
     sigma2 = math.exp(log_var)
     return {
         "pred_pKaffinity": float(mu),
@@ -260,6 +299,19 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
+    # R69：构造按 checkpoint 的 task 走，而下面的循环按 args.task 分支。两者必须一致，
+    # 否则 7 元组/2 元组的解包会以裸 ValueError 的形式炸在循环里（或者更糟：把
+    # kinetics 权重按 affinity 解释）。
+    ckpt_task = str(getattr(cfg, "task", "kinetics"))
+    if ckpt_task == "affinity":
+        if args.task != "affinity":
+            print(f"[INFO] checkpoint 带亲和力头：按 affinity 推理（--task {args.task} 被覆盖）")
+        args.task = "affinity"
+    elif args.task == "affinity":
+        raise ValueError(
+            f"--task affinity 但 checkpoint 里没有亲和力头（{AFFINITY_HEAD_PREFIX}*）："
+            "这份权重是 kinetics 三头模型，用 affinity 的两路解包跑会得到错误结果。"
+        )
     check_model_weights(model, ckpt)
     del ckpt  # 释放内存
     model.to(device)

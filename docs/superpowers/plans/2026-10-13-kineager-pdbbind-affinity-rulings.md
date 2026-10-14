@@ -1,4 +1,4 @@
-# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R68)
+# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R70)
 
 Controller rulings made while executing
 `docs/superpowers/plans/2026-10-13-kineager-pdbbind-affinity.md` on the
@@ -6,9 +6,10 @@ Controller rulings made while executing
 `.superpowers/sdd/2026-10-13-kineager-pdbbind-affinity/progress.md`.
 
 Scope: **R1–R61** are the execution rulings this appendix was commissioned for.
-**R62** (the test-dependency/import decision) and **R63–R68** (the task-review and
+**R62** (the test-dependency/import decision), **R63–R68** (the task-review and
 documentation rounds that amended R61's guard and this appendix's own statements)
-were recorded afterwards and are marked as such where they appear.
+and **R69–R70** (the whole-branch review's two CRITICAL findings) were recorded
+afterwards and are marked as such where they appear.
 
 This appendix exists because the rulings are the part of the work that is hardest
 to re-derive: several of them record failures that the unit tests of the day
@@ -531,6 +532,72 @@ the later entry says so, and §9 collects those links.
   artifacts** — hiding exactly the class of problem that module exists to catch,
   which is the opposite of what this project enforced all session. A collection
   error that says "install your dependencies" is the correct failure.
+
+### Whole-branch review round (R69–R70)
+
+Recorded after the R1–R68 body above: the whole-branch review returned "Ready with
+caveats" with two **CRITICAL** findings, both gaps the per-task reviews could not
+see because each task was reviewed against its own brief.
+
+- **R69 — the affinity inference path could not run at all.** `main_infer_predictor.py`
+  built `config = PredictorConfig(**cfg_updates)`, and `_infer_predictor_cfg_from_ckpt`
+  never set `task`, so it defaulted to `"kinetics"` and `MultiHead` built the
+  kcat/Km/ratio heads — while `--task affinity` was only consulted *inside the
+  inference loop*, never at construction. Reproduced with a real affinity
+  `state_dict`: the model built as `task='kinetics'` with
+  `active_heads=['kcat','Km','ratio']`, reported `Missing keys: 21 | Unexpected
+  keys: 6` (the six unexpected being the entire trained
+  `multi_head.heads.affinity.*`), returned a **7-tuple**, and `main()` then died
+  with `ValueError: too many values to unpack (expected 2)`. The whole Task 17
+  path was unreachable in practice, and a "does the checkpoint load" check could
+  not catch it because the load succeeds either way — the affinity head is simply
+  ignored.
+  **Why the tests missed it:** `tests/test_predictor_import.py` monkeypatched
+  `build_model_from_ckpt` to a lambda, so no test ever loaded a checkpoint through
+  the real builder. Ruled: infer the task **from the checkpoint**
+  (`multi_head.heads.affinity.*`, which is also the right signal when the script is
+  called without `--task`), build through `PredictorConfig.for_task("affinity", …)`
+  in that case, refine the affinity head's `hidden_dim` from its weights the same
+  way the kinetics heads already are, leave the kinetics construction path exactly
+  as it is, and add a test that uses a real `state_dict` through the real builder —
+  no lambda. Also added: `--task affinity` with a kinetics checkpoint is now a
+  named error rather than a mis-typed run.
+- **R70 — the kinetics default LoRA layer policy silently changed.** Task 14 made
+  the trainer always pass `--lora_layer_policy` (argparse default `"last_k"` with
+  `lora_last_k=30`), which **overrode** `KineticsPredictor.__init__`'s own default
+  of `"all"` (`models/predictor.py:519`, verified unchanged from base). Same
+  command, different trainable set: the historical recipe used to attach LoRA on
+  ESM-2 layers 0..32 and now attached it on 3..32 — 18 fewer target modules out of
+  198, about **−9%** of the protein-side LoRA — so kinetics numbers would differ
+  from an identical invocation. This was the one place the branch failed the
+  standing requirement that `task=kinetics` stays behaviourally unchanged; no
+  existing ruling covered it (R18 is about the suffix whitelist, and the design
+  mandates last-K for the **affinity** path only). Ruled: make the default
+  task-conditional — argparse default `None`, resolved in `main()` as
+  `lora_layer_policy or ("last_k" if task == "affinity" else "all")` — so kinetics
+  keeps `"all"` exactly as before, affinity still defaults to last-30, and an
+  explicit flag always wins. Landed as the pure helper
+  `resolve_lora_layer_policy(explicit, task)`, pinned by tests that must fail
+  against the old default.
+
+**Decided in the same round (judgement calls, not rulings), for the record:**
+
+* **The inference clamp is now ±10, matching the training loss.**
+  `format_affinity_prediction` clamped `log_var` to ±20 while
+  `models/affinity_loss.py` clamps to ±10. The loss is the training-time contract
+  the model was optimised under, and ±20 would emit `exp(20) ≈ 4.85e8` as a
+  "variance", which no calibration supports. The inference module now carries a
+  named constant that a test ties to the loss's `_LOG_VAR_MIN`/`_LOG_VAR_MAX`, so
+  the two can no longer drift apart silently.
+* **`AffinityDataset` drops rows with a missing `Sequence`/`Smiles`, loudly.**
+  `__getitem__` does `str(row[col])`, so a NaN cell became the literal string
+  `"nan"` and was encoded as if it were a real sequence or molecule — no error,
+  just a poisoned sample. The dataset already filtered rows by a finite label, so
+  the same predicate now also requires the two input columns, and the dropped
+  count is printed. Dropping rather than raising keeps a mostly-good table
+  runnable while making the loss visible; `len(dataset)` and `self.df` stay in
+  step, and `PredictionRecorder` is sized from `batch_size × n_batches` rather
+  than the dataset length, so a shorter table cannot overrun it.
 
 ### Review rounds (R63–R68)
 

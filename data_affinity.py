@@ -77,6 +77,10 @@ class AffinityDataset(Dataset):
 
     ``supervised`` 只是接受并保存，affinity 通路始终携带标签，不会因为
     ``supervised=False`` 而省略 ``y``。
+
+    构造期会过滤两处坏行：标签非有限的行，以及 ``Sequence``/``Smiles`` 缺失的行
+    （后者经 ``str()`` 会变成字面量 ``"nan"``，见 ``__init__`` 里的注释）。过滤是
+    带告警的，不是静默的；``len(self)`` 与 ``self.df`` 始终一致。
     """
 
     SEQ_COLUMNS = ("Sequence", "sequence", "Protein Sequence", "protein_sequence")
@@ -105,17 +109,33 @@ class AffinityDataset(Dataset):
                 f"标签列 {label_col!r} 里没有任何有限值，共 {len(df)} 行。"
             )
 
-        self.df = df.loc[finite].reset_index(drop=True)
-        raw_labels = labels[finite]
+        # 列名要在过滤之前解析：下面的输入缺失过滤依赖它们。
+        self.seq_col = self._first_present(df, self.SEQ_COLUMNS, "蛋白序列")
+        self.smi_col = self._first_present(df, self.SMI_COLUMNS, "配体 SMILES")
+
+        # 输入缺失与标签缺失同源地过滤。`__getitem__` 用 str(row[col]) 取值，所以 NaN
+        # 会变成**字面量字符串 "nan"** 送进编码器——既不是真实序列也不是真实分子，
+        # 而且不会抛错，只会静默污染训练（AffinityScaler.fit 对标签里的 NaN 已经是
+        # 这个策略：告警 + 过滤）。放在构造期过滤可以让 len(self) 与 self.df 保持一致；
+        # 注意 PredictionRecorder 的容量来自 args.batch_size * n_batches 而不是
+        # len(dataset)，所以少掉的这几行不会让 recorder 越界。
+        inputs_present = df[self.seq_col].notna() & df[self.smi_col].notna()
+        dropped = int((finite & ~inputs_present.to_numpy()).sum())
+        keep = finite & inputs_present.to_numpy()
+        if dropped:
+            print(
+                f"[AffinityDataset] 丢弃 {dropped} 行：{self.seq_col!r} 或 "
+                f"{self.smi_col!r} 缺失（str(NaN) 会变成字面量 \"nan\" 送进编码器）。"
+            )
+
+        self.df = df.loc[keep].reset_index(drop=True)
+        raw_labels = labels[keep]
 
         self.scaler = scaler
         if scaler is not None:
             self.labels = scaler.transform(raw_labels).astype(np.float32)
         else:
             self.labels = raw_labels.astype(np.float32)
-
-        self.seq_col = self._first_present(df, self.SEQ_COLUMNS, "蛋白序列")
-        self.smi_col = self._first_present(df, self.SMI_COLUMNS, "配体 SMILES")
 
         self.return_source = bool(return_source)
         self.source_col = source_col

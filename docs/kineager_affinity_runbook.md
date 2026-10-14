@@ -12,9 +12,9 @@ appendix `docs/superpowers/plans/2026-10-13-kineager-pdbbind-affinity-rulings.md
 and the README section `README.md` → "PDBbind v2020 Protein-Ligand Affinity
 Training".
 
-Scope note: §8 (and the §2 probe checks) can only be done on the cluster — this
-branch was developed and tested on CPU only, with no GPU, no CUDA, no `esm`
-package, no network and no backbone weights. The two shell surfaces
+Scope note: the §9 checklist (and the §2 probe checks) can only be done on the
+cluster — this branch was developed and tested on CPU only, with no GPU, no CUDA,
+no `esm` package, no network and no backbone weights. The two shell surfaces
 (`bin/train/kineager_k8s.sh` and the manifest's embedded `args[0]` block) have
 been parse-checked with `bash -n` (exit 0 each); nothing has been executed.
 
@@ -350,6 +350,20 @@ the reference cluster. `29500` is the launcher's own default; in the Kubeflow
 route the training-operator derives the rendezvous port from the container port
 named `pytorchjob-port`, and the manifest's comment says to keep the two in sync.
 
+Two option notes for the training side:
+
+* **`--lora_layer_policy` defaults per task** (R70). Left unset, a kinetics run
+  uses `all` (the historical behaviour) and an affinity run uses `last_k` with
+  `--lora_last_k 30` (the design's last-30-layer LoRA). The launcher passes
+  `--lora_layer_policy "${LORA_LAYER_POLICY:-last_k}"` explicitly because it is
+  the affinity entry point — a deliberate kinetics run through this launcher
+  needs `LORA_LAYER_POLICY=all` to keep the historical layer set.
+* **`--lr_find` is refused under `--task affinity`.** The LR range test scores
+  batches with the three-head `compute_multihead_loss`, which cannot consume the
+  affinity path's `(mu, log_sigma2)` output; the trainer now raises a named error
+  up front instead of failing mid-scan. Scan the LR on a kinetics run, or add a
+  dedicated range test for the affinity criterion if you need one.
+
 ---
 
 ## 7. Verify multi-GPU actually engaged
@@ -404,11 +418,59 @@ Everything below is in the pod log. The decisive lines are 3 and 4.
 
 ---
 
-## 8. Cluster-only smoke checklist
+## 8. Run inference on a trained checkpoint
+
+The branch's inference entry point is `main_infer_predictor.py`. It reads a CSV
+row by row, builds the model **from the checkpoint**, and writes one CSV.
+
+```bash
+export CATA_PROFILE=k8s
+export USER=<user>
+
+python main_infer_predictor.py \
+  -csv /pfs_beijing/$USER/kineager_data/pdbbindv2020_affinity_val.csv \
+  -weights /pfs_beijing/$USER/kineager_runs/predictor_best_ema.pt \
+  -device cuda \
+  -esm /models/ESMC-6B \
+  -molt5 /models/MoLFormer-XL-both-10pct \
+  --task affinity
+```
+
+What the operator must know:
+
+* **The task comes from the checkpoint, not from the flag** (R69). The script
+  builds through `PredictorConfig.for_task("affinity")` as soon as the checkpoint
+  contains `multi_head.heads.affinity.*`, and it also refines the head's
+  `hidden_dim` from those weights. Before this was fixed the script always built
+  the kinetics three-head config, so an affinity checkpoint loaded with 6
+  unexpected keys (the whole trained head), the forward returned a 7-tuple, and
+  the script died with `ValueError: too many values to unpack`. Passing
+  `--task affinity` explicitly is still correct and is what the command above
+  does; passing it with a **kinetics** checkpoint is now a named error instead of
+  a confusing crash.
+* Input CSV: needs a `sequence` column and a SMILES column (`smiles`; the header
+  is lower-cased and `--smiles-col` overrides the guess), plus `pdb_id` if you
+  want to align against the truth table. The builder's table from §4 satisfies all
+  three.
+* Output: `predictions_affinity.csv` in the current working directory, with
+  exactly four columns — `pdb_id`, `pred_pKaffinity`, `sigma`, `sigma2`. `sigma2`
+  is the predictive variance `exp(log_var)` and `sigma` its square root; the
+  log-variance is clamped to ±10, the same bound the training loss uses, so a
+  badly-calibrated checkpoint cannot emit an astronomically large `sigma2`.
+* Every row also prints `Predicted affinity: pKaffinity=… (sigma=…)`, so a quick
+  `head` of the run shows whether the numbers are sane before you read the CSV.
+* The script does **not** compute metrics: it predicts and exports. `true_kcat` /
+  `true_Km` columns exist only for the kinetics tasks, and the affinity path never
+  writes them (R59).
+
+---
+
+## 9. Cluster-only smoke checklist
 
 Every item below needs GPUs, the weights or the `esm` package, so none of it
 could be checked while building this branch. Run them in order; item 6 is the
-one that decides a code default.
+one that decides a code default, and item 14 is the check that would have caught
+the inference defect described in §8.
 
 | # | Check | How | Expected result |
 |---|---|---|---|
@@ -425,6 +487,7 @@ one that decides a code default.
 | 11 | `USER` scoping holds in the pod | `[PATHS] train_data_dir=…` in the log; then, in a pod shell: (a) `unset USER USERNAME; bash bin/train/kineager_k8s.sh -epochs 1` (the guard runs before the other required-input checks, so nothing else needs setting); (b) `USER='<REPLACE_ME: x>' bash bin/train/kineager_k8s.sh -epochs 1`; (c) `USER=alice bash bin/train/kineager_k8s.sh -epochs 1` | the log names **your** user (`/pfs_beijing/<you>/kineager_runs`), never `kineager`; (a) exits 1 naming `USER`/`USERNAME` and the shared fallback; (b) exits 1 saying the placeholder is still in place; (c) gets past the guard — the next failure is the `TRAIN_CSV` check, not a `USER` refusal — which a full run sees as a user-scoped `[PATHS]` line, proving the validated value reached the trainer's environment |
 | 12 | The training CSV and the split look sane | the builder's statistics from §4, plus the run's `Train samples:`/`Val samples:` lines | non-zero counts, pKaffinity in a plausible range, `--split_mode group_pair --split_seed 42` recorded in the run's split metadata |
 | 13 | bf16 is stable | watch the first epoch's loss and the recorded metrics | no NaN/Inf loss; if one appears, note the module and consider `autocast(enabled=False)` for it |
+| 14 | **The affinity inference path runs end to end** | run §8's command on a small CSV (the val split from §4) | exit 0, `predictions_affinity.csv` exists with exactly the columns `pdb_id,pred_pKaffinity,sigma,sigma2`, and `pred_pKaffinity` is non-degenerate: finite, not all-identical, and in the rough range of the training labels (~2–12). The run must also print `[AUTO-CONFIG] task -> affinity (checkpoint has multi_head.heads.affinity.*)`, and the load must **not** report the affinity head as unexpected keys. This is the check that would have caught the defect §8 describes — a checkpoint that loads and predicts nothing useful still passes item 10 |
 
 ### Recorded acceptance data (plan Step 5)
 

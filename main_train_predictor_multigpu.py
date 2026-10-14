@@ -1206,6 +1206,40 @@ def optimizer_steps_per_epoch(n_batches: int, iters_to_accumulate: int) -> int:
     return (n + accum - 1) // accum
 
 
+def resolve_lora_layer_policy(explicit_policy, task: str) -> str:
+    """LoRA 层策略的默认值按 task 解析（R70）。
+
+    Task 14 起训练脚本**总是**把 --lora_layer_policy 透传给 KineticsPredictor，而
+    argparse 的默认值曾是 "last_k"/30 —— 它覆盖了模型自己 "all" 的缺省值，于是同一条
+    kinetics 命令的 LoRA 从 ESM-2 的 0..32 层缩到 3..32 层（198 个目标模块里少 18 个，
+    蛋白侧可训练参数约 -9%），kinetics 的数值因此改变，直接违反「task=kinetics 行为
+    不变」这条贯穿全分支的硬约束。设计要求 last-30 只针对 affinity 通路，所以：
+
+    * 显式传值永远优先（包括 explicit / all，供消融使用）；
+    * 不传时：kinetics → "all"（与基线逐字一致），affinity → "last_k"（§5 D1）。
+    """
+    if explicit_policy:
+        return str(explicit_policy)
+    return "last_k" if str(task) == "affinity" else "all"
+
+
+def validate_task_option_compatibility(task: str, lr_find: bool) -> None:
+    """拒绝与 task 不兼容的选项组合（Important 3）。
+
+    --lr_find 走 lr_range_test_for_tag → compute_multihead_loss，后者按三头解包
+    `model_out[:3]`；affinity 的 forward 返回 (mu, log_sigma2) 两路，会在那里抛
+    `ValueError: not enough values to unpack`，而且是在扫完 50 个 batch 之后才炸。
+    这里提前报错，比让它跑到一半失败更有用。
+    """
+    if str(task) == "affinity" and lr_find:
+        raise ValueError(
+            "--lr_find 与 --task affinity 不兼容：lr_range_test_for_tag 用 "
+            "compute_multihead_loss 计算三头损失，而 affinity 是单头 (mu, log_sigma2)，"
+            "会在 model_out[:3] 解包处 ValueError。需要扫 LR 请在 kinetics 下扫，"
+            "或为 affinity 单独实现 range test。"
+        )
+
+
 def train_step(model, batch, optimizer, scaler, recorder=None,
                lam_l1=0, lam_tv=0,
                microbatch_size: int | None = None,
@@ -2658,8 +2692,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    choices=["abs", "ratio"])
 
     # ---- LoRA 与骨干 ----
-    p.add_argument("--lora_layer_policy", type=str, default="last_k",
-                   choices=["all", "last_k", "explicit"])
+    # R70：默认值必须是「未指定」，由 main() 按 task 解析——固定成 last_k 会覆盖
+    # models/predictor.py 自己的 "all" 缺省，从而改变同一条 kinetics 命令的 LoRA 层集合。
+    p.add_argument("--lora_layer_policy", type=str, default=None,
+                   choices=["all", "last_k", "explicit"],
+                   help="LoRA 层策略。不传时按 task 决定：kinetics 用 all（与基线一致），"
+                        "affinity 用 last_k（设计要求的后 30 层）。显式传值始终优先。")
     p.add_argument("--lora_last_k", type=int, default=30)
     p.add_argument("--lora_explicit_layers", type=int, nargs="+", default=None)
     p.add_argument("--lora_target_suffixes", type=str, nargs="+", default=None,
@@ -2688,6 +2726,12 @@ def main():
         )
     if AutoConfig is None:
         raise ImportError("transformers is required for training. Please install transformers.")
+
+    # R70：把 LoRA 层策略解析成具体值再往下传。kinetics 不传 flag 时必须是 "all"，
+    # 否则会覆盖模型自己的缺省值、改变基线行为；affinity 保持设计要求的 last_k。
+    args.lora_layer_policy = resolve_lora_layer_policy(args.lora_layer_policy, args.task)
+    # Important 3：与 task 不兼容的选项在动手之前就拒绝。
+    validate_task_option_compatibility(args.task, bool(getattr(args, "lr_find", False)))
 
     RUNTIME_PATHS = resolve_runtime_paths()
     ensure_paths(
