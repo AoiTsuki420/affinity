@@ -365,6 +365,33 @@ def test_forward_hidden_states_uses_hidden_states_when_requested():
     assert torch.all(out == 7.0)
 
 
+def test_forward_hidden_states_accepts_tensor_hidden_states():
+    """esm 包的 hidden_states 是张量（(n_layers+1, B, L, H)），不是元组；
+    对它做 `if states:` 会抛 "Boolean value of Tensor with more than one value is
+    ambiguous"（集群 smoke 实测）。张量形态必须与元组语义一致：取 states[-1]。"""
+
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            assert kwargs.get("output_hidden_states") is True
+            states = torch.stack(
+                [torch.zeros(2, 3, 4), torch.full((2, 3, 4), 7.0)], dim=0)
+            return SimpleNamespace(hidden_states=states, last_hidden_state=None)
+
+    out = forward_hidden_states(_Backbone(), {}, output_hidden_states=True)
+    assert torch.all(out == 7.0)
+
+
+def test_forward_hidden_states_tolerates_empty_states():
+    """空的 hidden_states 序列（元组）不能触发 IndexError，应当回落到 last_hidden_state。"""
+
+    class _Backbone(torch.nn.Module):
+        def forward(self, **kwargs):
+            return SimpleNamespace(hidden_states=(), last_hidden_state=torch.full((1, 2), 3.0))
+
+    out = forward_hidden_states(_Backbone(), {}, output_hidden_states=True)
+    assert torch.all(out == 3.0)
+
+
 def test_forward_hidden_states_nan_to_num():
     class _Backbone(torch.nn.Module):
         def forward(self, **kwargs):
@@ -596,6 +623,7 @@ requires_peft = pytest.mark.skipif(not HAS_PEFT, reason="peft not installed")
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from models.plm_backbones import (
+    _absorb_peft_inputs_embeds,
     count_lora_parameters,
     inject_lora,
     set_backbone_gradient_checkpointing,
@@ -641,6 +669,25 @@ class _PeftableBackbone(torch.nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
+class _StrictEsmcLikeBackbone(torch.nn.Module):
+    """复刻 esm 包 EsmcForMaskedLM.forward 的真实签名（3.4.1 / 3.4.1.post1 实测）：
+    参数表里没有 inputs_embeds，也没有 **kwargs——这正是 _PeftableBackbone 用
+    **kwargs 时覆盖不到的差异（集群 smoke 的第一次前向就栽在这上面）。"""
+
+    def __init__(self, num_layers=6):
+        super().__init__()
+        self.encoder = torch.nn.Module()
+        self.encoder.layer = torch.nn.ModuleList([_Block() for _ in range(num_layers)])
+        self.config = SimpleNamespace(hidden_size=8, num_hidden_layers=num_layers)
+
+    def forward(self, input_ids=None, attention_mask=None, sequence_id=None,
+                output_hidden_states=None, output_attentions=None, return_dict=None):
+        hidden = input_ids.float()
+        for layer in self.encoder.layer:
+            hidden = layer(hidden)
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
 @requires_peft
 def test_inject_lora_last_k_hits_expected_layers():
     model, targets, layers = inject_lora(
@@ -672,6 +719,54 @@ def test_inject_lora_r_zero_style_smaller_rank_is_cheaper():
     large, _, _ = inject_lora(_PeftableBackbone(6), r=8, alpha=8, dropout=0.0,
                               policy="last_k", last_k=2)
     assert count_lora_parameters(small)[0] < count_lora_parameters(large)[0]
+
+
+def test_absorb_peft_inputs_embeds_absorbs_none_and_rejects_tensors():
+    """peft 的 FEATURE_EXTRACTION 包装会无条件显式传 inputs_embeds（即使为 None）；
+    严格签名的骨干必须能吸收它，但真张量必须显式报错而不是被静默丢弃。"""
+    model = _absorb_peft_inputs_embeds(_StrictEsmcLikeBackbone(1))
+
+    out = model(input_ids=torch.ones(2, 8), attention_mask=torch.ones(2, 8),
+                inputs_embeds=None, output_attentions=None,
+                output_hidden_states=True, return_dict=None)
+    assert out.last_hidden_state.shape == (2, 8)
+
+    with pytest.raises(TypeError) as excinfo:
+        model(inputs_embeds=torch.zeros(2, 8))
+    assert "inputs_embeds" in str(excinfo.value)
+
+
+def test_absorb_peft_inputs_embeds_leaves_accepting_forward_untouched():
+    """已经声明 inputs_embeds 的骨干（ESM-2 / T5 等）必须原样返回，不做任何改动。"""
+
+    class _Accepting(torch.nn.Module):
+        def forward(self, input_ids=None, inputs_embeds=None):
+            return input_ids
+
+    model = _Accepting()
+    original = model.forward
+    assert _absorb_peft_inputs_embeds(model) is model
+    assert model.forward == original
+
+
+@requires_peft
+def test_inject_lora_output_survives_peft_feature_extraction_kwargs():
+    """端到端回归（集群 smoke 2026-10-14 报错的最小复现）：注入 LoRA 后，模型必须吃下
+    peft 自己发出的那组关键字参数（含无条件显式传入的 inputs_embeds=None）。
+
+    修复前：PeftModelForFeatureExtraction.forward -> EsmcForMaskedLM.forward() got an
+    unexpected keyword argument 'inputs_embeds'。"""
+    model, targets, _ = inject_lora(_StrictEsmcLikeBackbone(6), r=4, alpha=8,
+                                    dropout=0.0, policy="last_k", last_k=2)
+    assert targets
+
+    out = model(input_ids=torch.ones(2, 8), attention_mask=torch.ones(2, 8),
+                inputs_embeds=None, output_attentions=None,
+                output_hidden_states=True, return_dict=None)
+    assert out is not None
+
+    with pytest.raises(TypeError):
+        model(inputs_embeds=torch.zeros(2, 8))
 
 
 def test_set_gradient_checkpointing_active_only_touches_selected_layers():

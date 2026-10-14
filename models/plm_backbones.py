@@ -6,6 +6,7 @@ peft 与 esm 一律在函数内部 lazy import。
 from __future__ import annotations
 
 import functools
+import inspect
 import re
 import warnings
 from dataclasses import dataclass
@@ -357,21 +358,41 @@ def load_ligand_backbone(name: str, *, kind=None, trust_remote_code=None,
                  max_length=max_length, revision=revision)
 
 
+def _available_states(outputs) -> Any:
+    """取逐层 hidden states 序列；没有可用序列时返回 None。
+
+    不能写 `if states:`：esm 包的 EsmcOutput.hidden_states 是**张量**
+    （(n_layers+1, B, L, H)，esm/models/esmc/model.py 文档写明），对多元素张量
+    做布尔运算会抛 "Boolean value of Tensor with more than one value is
+    ambiguous"（集群 smoke 实测）。transformers 系的元组输出则一直是这么判空的，
+    len() 对元组和张量都成立，且 states[-1] 在两种布局下都取最后一层。
+    """
+    states = getattr(outputs, "hidden_states", None)
+    if states is None:
+        return None
+    try:
+        if len(states) == 0:
+            return None
+    except TypeError:
+        return None
+    return states
+
+
 def forward_hidden_states(backbone: nn.Module, inputs: dict,
                           *, output_hidden_states: bool = False) -> torch.Tensor:
     """取 token 级 hidden state。单次前向，不重复计算。"""
     if output_hidden_states:
         outputs = backbone(**inputs, output_hidden_states=True)
-        states = getattr(outputs, "hidden_states", None)
-        if states:
+        states = _available_states(outputs)
+        if states is not None:
             return torch.nan_to_num(states[-1])
         hidden = getattr(outputs, "last_hidden_state", None)
     else:
         outputs = backbone(**inputs)
         hidden = getattr(outputs, "last_hidden_state", None)
         if hidden is None:
-            states = getattr(outputs, "hidden_states", None)
-            if states:
+            states = _available_states(outputs)
+            if states is not None:
                 hidden = states[-1]
 
     if hidden is None:
@@ -453,6 +474,40 @@ def _layer_containers(model: nn.Module):
             return
 
 
+def _absorb_peft_inputs_embeds(model: nn.Module) -> nn.Module:
+    """为不接受 inputs_embeds 的骨干补一个吸收该关键字的实例级 forward。
+
+    背景（集群 smoke 实测，2026-10-14）：peft 的 PeftModelForFeatureExtraction.forward
+    会**无条件**把 inputs_embeds（包括 None）显式传给底层模型
+    （peft_model.py: self.base_model(input_ids=..., inputs_embeds=inputs_embeds, ...)），
+    而 esm 包的 EsmcForMaskedLM.forward 没有这个形参——LoRA 包装后的第一次前向就
+    TypeError: "EsmcForMaskedLM.forward() got an unexpected keyword argument
+    'inputs_embeds'"。单测夹具的 forward 带 **kwargs，覆盖不到这条真实签名差异。
+
+    规则：
+    - 骨干 forward 已声明 inputs_embeds（ESM-2 / T5 等）→ 原样返回，不做任何改动；
+    - 未声明 → 只在**实例**上替换 forward：吸收 inputs_embeds=None；真张量仍然显式
+      TypeError（本仓库没有任何调用方直接喂 embedding，静默丢弃会改变语义）。
+    - 不套 nn.Module 壳、不改类：named_modules() 限定名与 state_dict 键名保持逐字不变，
+      LoRA 目标发现与既有 checkpoint 都按名字工作，任何包装层都会破坏它们。
+    """
+    original = model.forward
+    if "inputs_embeds" in inspect.signature(original).parameters:
+        return model
+
+    def forward(*args, inputs_embeds=None, **kwargs):
+        if inputs_embeds is not None:
+            raise TypeError(
+                f"{type(model).__name__}.forward() 只接受 token 输入，不支持真正的 "
+                "inputs_embeds：适配器只为吸收 peft 无条件传入的 inputs_embeds=None "
+                "而存在。"
+            )
+        return original(*args, **kwargs)
+
+    model.forward = forward  # type: ignore[method-assign]
+    return model
+
+
 def inject_lora(
     model: nn.Module,
     *,
@@ -482,6 +537,9 @@ def inject_lora(
         bias="none",
         task_type="FEATURE_EXTRACTION",
     )
+    # peft 的 FEATURE_EXTRACTION 包装会无条件显式传 inputs_embeds（含 None），
+    # 在包装之前吸收掉与严格签名骨干的差异（见 _absorb_peft_inputs_embeds）。
+    model = _absorb_peft_inputs_embeds(model)
     peft_model = get_peft_model(model, lora_config)
 
     n_params, n_tensors = count_lora_parameters(peft_model)

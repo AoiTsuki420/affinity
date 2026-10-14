@@ -653,11 +653,43 @@ def _get_backbone_num_layers(backbone, is_esm: bool) -> int:
     return int(L)                
 
 
+def _strip_ddp_prefix(name: str) -> str:
+    """去掉 DDP 包装在 named_parameters() 名字上叠加的 `module.` 前缀。
+
+    freeze_backbone 是在 DDP 包装之后调用的（train_one_stage 里），此前的
+    前缀匹配因此对 `module.esm....` 全部失手——和旧命名模式一样落入"匹配不到
+    任何骨干参数"的事故形态。
+    """
+    n = name.lower()
+    while n.startswith("module."):
+        n = n[len("module."):]
+    return n
+
+
+def _is_backbone_param(name: str) -> bool:
+    """骨干参数判定，兼容两代命名与 DDP 前缀。
+
+    旧布局把骨干注册在 protein.backbone / ligand.backbone 下；本分支的
+    KineticsPredictor 同时以 esm / molt5 别名注册同一个模块
+    （models/predictor.py:573-574：self.esm = protein_encoder.backbone），
+    named_parameters() 对共享模块只按其中一个路径枚举。只认旧模式的话一个参数
+    都匹配不到：6.5B 骨干会全部落进 else 分支被解冻（集群 smoke 实测 freeze 后
+    requires_grad = 6.5B，LoRA 设计名存实亡）。
+    """
+    n = name.lower()
+    bare = _strip_ddp_prefix(n)
+    return (
+        ("protein.backbone" in n) or ("ligand.backbone" in n)
+        or bare.startswith("esm.") or bare.startswith("molt5.")
+    )
+
+
 def freeze_backbone(model, keep_protein_lora: bool = True, keep_ligand_lora: bool = True):
     for name, p in model.named_parameters():
         n = name.lower()
-        is_prot_bb = ("protein.backbone" in n)
-        is_lig_bb  = ("ligand.backbone"  in n)
+        bare = _strip_ddp_prefix(n)
+        is_prot_bb = ("protein.backbone" in n) or bare.startswith("esm.")
+        is_lig_bb  = ("ligand.backbone"  in n) or bare.startswith("molt5.")
 
         is_lora = ("lora" in n)
 
@@ -674,6 +706,23 @@ def freeze_backbone(model, keep_protein_lora: bool = True, keep_ligand_lora: boo
         else:
             p.requires_grad_(True)
 
+    # 冻结结果自检：名字像 transformer 堆栈的、仍可训练的非 LoRA 参数，说明骨干
+    # 前缀没被识别（正是上面注释里那个 6.5B 解冻事故的形态）。宁可在这里炸掉，
+    # 也不要带着"每步全量训练 6.5B 参数"的假象跑 30 个 epoch。
+    leftover = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and ("lora" not in name.lower())
+        and any(marker in name.lower()
+                for marker in (".transformer.", ".encoder.layer.", ".encoder.block.",
+                               ".layers.", "blocks."))
+    ]
+    if leftover:
+        raise AssertionError(
+            f"freeze_backbone 后仍有 {len(leftover)} 个非 LoRA 堆栈参数可训练，"
+            f"首个：{leftover[0]}。骨干命名与 is_prot_bb/is_lig_bb 的前缀不一致，"
+            "新增骨干命名时必须同步更新匹配模式，否则骨干会静默参与全量训练。"
+        )
+
     has_trainable_params = any(p.requires_grad for _, p in model.named_parameters())
     model.train() if has_trainable_params else model.eval()
 
@@ -681,7 +730,7 @@ def freeze_backbone(model, keep_protein_lora: bool = True, keep_ligand_lora: boo
     n_nonbb_tr = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if ("protein.backbone" not in n.lower()) and ("ligand.backbone" not in n.lower()) and p.requires_grad
+        if (not _is_backbone_param(n)) and p.requires_grad
     )
     print(f"[INFO] Backbone frozen. LoRA trainable params={n_lora_tr}, Non-backbone trainable params={n_nonbb_tr}")
 
@@ -1911,18 +1960,42 @@ final_contact_store=None):
     return global_step,last_ckpt_time
 
 
+def _ema_backup_params(real_model, ema) -> dict:
+    """备份 EMA.copy_to 可能改写的参数（ema.shadow 覆盖的参数），不含冻结骨干。
+
+    val_epoch_with_ema 原先整份 `state_dict().clone()` 到 GPU：6.5B 冻结骨干也
+    一并复制（约 +24GB），集群 smoke 实测把验证步抬到 ~60GB 触顶。copy_to 只会
+    写 ema.shadow 里的参数（即全部可训练参数），其余参数在验证期间不会被动过，
+    没有备份的必要。
+    """
+    shadow = ema.shadow
+    backup = {}
+    for name, p in real_model.named_parameters():
+        key = name
+        if key not in shadow and not key.startswith("module."):
+            key = f"module.{name}"
+        if key not in shadow and key.startswith("module."):
+            key = key[len("module."):]
+        if key in shadow:
+            backup[name] = p.detach().clone()
+    return backup
+
+
 def val_epoch_with_ema(model, ema, val_loader, ep, args, use_ema=True, final_contact_store=None):
     if (ema is None) or (not use_ema):
         return val_epoch(model, val_loader, ep, args, final_contact_store=final_contact_store)
 
     real_model = getattr(model, "module", model)
-    backup = {k: v.detach().clone() for k, v in real_model.state_dict().items()}
+    backup = _ema_backup_params(real_model, ema)
     ema.copy_to(real_model)
     
     try:
         val_loss = val_epoch(model, val_loader, ep, args, final_contact_store=final_contact_store)  # 这里仍然把 wrapper model 传给 val_epoch 没问题
     finally:
-        real_model.load_state_dict(backup, strict=True)
+        params_by_name = dict(real_model.named_parameters())
+        with torch.no_grad():
+            for name, tensor in backup.items():
+                params_by_name[name].data.copy_(tensor)
     return val_loss
     
     
