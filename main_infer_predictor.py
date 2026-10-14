@@ -366,33 +366,38 @@ def main():
                 }
 
             true_log = np.nan
-            if args.task == "kcat":
-                linear_candidates = ["kcat(s^-1)", "kcat", "kcat_value", "value"]
-            else:
-                linear_candidates = ["km(m)", "km", "km_value", "value"]
-
-            if "log10_value" in row.index:
-                true_log = pd.to_numeric(pd.Series([row["log10_value"]]), errors="coerce").iloc[0]
-                if args.task == "km" and np.isfinite(true_log):
-                    true_log = true_log + 3.0   # log10(M) → log10(mM)
-            else:
-                for col in linear_candidates:
-                    if col in row.index:
-                        v = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
-                        if np.isfinite(v) and v > 0:
-                            if args.task == "km":
-                                true_log = np.log10(v * 1000.0)  # M → mM → log10
-                            else:
-                                true_log = np.log10(v)
-                        break
-
-            if np.isfinite(true_log):
+            # R59：真值提取是 kinetics 专用的（kcat/Km 的线性列名 + log10_value 的
+            # mM 偏移）。affinity 的真值列是 pKaffinity，本身就在 -log10 空间，由
+            # pdb_id 在外部对齐；不设这道门时，带 value / log10_value 列的 affinity
+            # CSV 会被 else 分支按 Km 读走，然后写成 true_Km* —— 下游无法察觉的错标签。
+            if str(getattr(args, "task", "kinetics")) != "affinity":
                 if args.task == "kcat":
-                    res["true_kcat_log"] = true_log   # log10(s^-1)
-                    res["true_kcat"] = float(np.power(10.0, true_log))
+                    linear_candidates = ["kcat(s^-1)", "kcat", "kcat_value", "value"]
                 else:
-                    res["true_Km_log"] = true_log     # log10(mM)，已在读取时统一转换
-                    res["true_Km"] = float(np.power(10.0, true_log)) / 1000.0  # 还原为 M
+                    linear_candidates = ["km(m)", "km", "km_value", "value"]
+
+                if "log10_value" in row.index:
+                    true_log = pd.to_numeric(pd.Series([row["log10_value"]]), errors="coerce").iloc[0]
+                    if args.task == "km" and np.isfinite(true_log):
+                        true_log = true_log + 3.0   # log10(M) → log10(mM)
+                else:
+                    for col in linear_candidates:
+                        if col in row.index:
+                            v = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+                            if np.isfinite(v) and v > 0:
+                                if args.task == "km":
+                                    true_log = np.log10(v * 1000.0)  # M → mM → log10
+                                else:
+                                    true_log = np.log10(v)
+                            break
+
+                if np.isfinite(true_log):
+                    if args.task == "kcat":
+                        res["true_kcat_log"] = true_log   # log10(s^-1)
+                        res["true_kcat"] = float(np.power(10.0, true_log))
+                    else:
+                        res["true_Km_log"] = true_log     # log10(mM)，已在读取时统一转换
+                        res["true_Km"] = float(np.power(10.0, true_log)) / 1000.0  # 还原为 M
 
             if str(getattr(args, "task", "kinetics")) == "affinity":
                 print(

@@ -1010,6 +1010,27 @@ def test_main_infer_predictor_affinity_task_writes_pkabind_columns(monkeypatch):
     assert np.allclose(out["sigma2"], 0.25)
 
 
+@pytest.mark.parametrize("injected", [{"value": [6.0, 6.0]}, {"log10_value": [0.8, 0.8]}])
+def test_main_infer_predictor_affinity_never_writes_kinetics_truth_columns(monkeypatch,
+                                                                          injected):
+    """R59：真值提取是 kinetics 专用的。
+
+    affinity 的真值列是 pKaffinity（已是 -log10 空间，由 pdb_id 在外部对齐）。
+    没有任务门时，带 value / log10_value 列的 affinity CSV 会被 else 分支按 Km 的
+    线性列名读走，然后写出 true_Km_log / true_Km —— 下游读者无法察觉的错标签。
+    """
+    frame = pd.DataFrame({
+        "pdb_id": ["1abc", "2def"],
+        "sequence": ["MKT", "MKT"],
+        "smiles": ["CCO", "CCO"],
+        **injected,
+    })
+    out = _run_infer_main(monkeypatch, _FakeAffinityInferModel(), frame, "affinity")
+
+    assert list(out.columns) == ["pdb_id", "pred_pKaffinity", "sigma", "sigma2"]
+    assert [c for c in out.columns if c.startswith("true")] == []
+
+
 def test_main_infer_predictor_kinetics_task_keeps_three_head_columns(monkeypatch):
     """kinetics 路径的对外形状不变：三头解包 + 10 的幂还原 + true_kcat 字段。"""
     out = _run_infer_main(

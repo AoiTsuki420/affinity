@@ -41,7 +41,10 @@ PATH_PROFILES = {
         "project_root": "/workspace/kineager",
         "runs_dir": "/pfs_beijing/${USER}/kineager_runs",
         "weights_dir": "/pfs_beijing/${USER}/kineager_runs",
-        "train_data_dir": "/pfs_beijing/xumeng/general_protein_dir/Affinity/dataset/PDBbind_v2020",
+        # train_data_dir 是**写入**目标：train_epoch 往里 np.save 每个 epoch 的
+        # preds/labels .npy。所以它指向用户自己的目录，而不是 PDBbind 数据集目录
+        # （那是别人共读的数据：写进去要么 PermissionError，要么污染共享数据集）。
+        "train_data_dir": "/pfs_beijing/${USER}/kineager_runs",
         "train_csv_path": "/pfs_beijing/${USER}/kineager_data/pdbbindv2020_affinity.csv",
         "val_csv_path": "/pfs_beijing/${USER}/kineager_data/pdbbindv2020_affinity_val.csv",
         "esm_model_path": "/pfs_beijing/xinran_2026/models/biohub--ESMC-6B",

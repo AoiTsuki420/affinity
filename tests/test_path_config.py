@@ -58,6 +58,26 @@ def test_k8s_profile_expands_the_user_at_resolve_time(monkeypatch):
     )
 
 
+def test_k8s_train_data_dir_is_in_the_users_own_area(monkeypatch):
+    """R57：train_data_dir 是**写入**目标（train_epoch 往里 np.save 每个 epoch 的
+    preds/labels .npy），不能指向别人的数据集目录：要么 epoch 0 直接 PermissionError，
+    要么静默把训练产物写进别人共读的数据集目录。"""
+    monkeypatch.setenv("USER", "alice")
+    resolved = str(resolve_runtime_paths(profile="k8s")["train_data_dir"]).replace("\\", "/")
+
+    assert "xumeng" not in resolved
+    assert resolved == "/pfs_beijing/alice/kineager_runs"
+    assert "$" not in resolved
+
+
+def test_k8s_train_data_dir_stays_overridable(monkeypatch):
+    """R57：换成用户自己的目录后，CATA_TRAIN_DATA_DIR 仍然优先。"""
+    monkeypatch.setenv("CATA_TRAIN_DATA_DIR", "/scratch/kineager_train_data")
+    paths = resolve_runtime_paths(profile="k8s")
+    assert str(paths["train_data_dir"]).replace("\\", "/") == "/scratch/kineager_train_data"
+    assert isinstance(paths["train_data_dir"], Path)
+
+
 def test_k8s_profile_falls_back_when_no_user_variable_is_set(monkeypatch):
     """容器里 USER/USERNAME 常常都没设：回退成一个固定目录名，但绝不留 `$`。"""
     monkeypatch.delenv("USER", raising=False)

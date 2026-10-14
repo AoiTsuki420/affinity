@@ -116,7 +116,9 @@ MoLFormer with last-30-layer LoRA. The ESMC tokenizer comes from the
 `esm>=3.4.1` pin in `requirements.txt`. The kinetics three-task recipe is
 unchanged and still selected by default.
 
-Build the training table (on a host that can read the PDBbind index):
+Build the training table (on a host that can read the PDBbind index; on the
+reference cluster the index sits under
+`/pfs_beijing/xumeng/general_protein_dir/Affinity/dataset/PDBbind_v2020`):
 
 ```bash
 python tools/build_pdbbind_affinity_csv.py \
@@ -149,15 +151,15 @@ bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 8 --split_mode group_pair 
   --task affinity
 ```
 
-`CATA_PROFILE=k8s` selects the cluster path profile in `path_config.py`; its
+`bin/train/kineager_k8s.sh` defaults `CATA_PROFILE=k8s` and the manifest sets it
+explicitly, so both routes use the cluster path profile in `path_config.py`; its
 `${USER}` components are resolved from `USER` (else `USERNAME`, else the literal
-`kineager`) at resolve time. Without it the run silently falls back to the
-`autodl` paths. The k8s profile's `train_data_dir` is the shared PDBbind dataset
-directory, so point `CATA_TRAIN_DATA_DIR` at a writable location as well: the
-per-epoch `preds_epoch*.npy` / `labels_epoch*.npy` are written there. The Kubeflow
-route fills the same variables in the manifest (replace every `<REPLACE_ME ...>`,
-including `NNODES` = `Worker.replicas + 1`, and add `CATA_PROFILE` to its env
-block):
+`kineager`) at resolve time. The run directories, the checkpoints and the per-epoch
+`preds_epoch*.npy` / `labels_epoch*.npy` all stay under
+`/pfs_beijing/${USER}/kineager_runs`, and any entry can still be overridden with
+its `CATA_*` variable (e.g. `CATA_TRAIN_DATA_DIR`). The Kubeflow route fills the
+same variables in the manifest (replace every `<REPLACE_ME ...>`, including
+`NNODES` = `Worker.replicas + 1`):
 
 ```bash
 kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml

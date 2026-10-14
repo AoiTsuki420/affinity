@@ -57,6 +57,15 @@ else
     master_addr="${MASTER_ADDR:-127.0.0.1}"
 fi
 
+# --- path profile ------------------------------------------------------------
+# path_config.resolve_runtime_paths() falls back to the platform default
+# ("autodl" on Linux) when CATA_PROFILE is unset, and *nothing else* would select
+# the k8s profile: an unset profile silently reads the training CSV, the run
+# directories and the backbone snapshots from the wrong profile. This script is
+# the k8s entrypoint by name, so default it here; the ${VAR:-...} form keeps it
+# overridable for a run that deliberately wants another profile.
+export CATA_PROFILE="${CATA_PROFILE:-k8s}"
+
 # --- required inputs (fail fast, with the variable name in the message) ------
 export TASK="${TASK:-affinity}"
 export TRAIN_CSV="${TRAIN_CSV:?TRAIN_CSV must point to the PDBbind affinity CSV}"
@@ -75,7 +84,7 @@ export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
-echo "[kineager] task=${TASK} nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${master_addr}:${MASTER_PORT}"
+echo "[kineager] task=${TASK} profile=${CATA_PROFILE} nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${master_addr}:${MASTER_PORT}"
 
 # --- launch ------------------------------------------------------------------
 # exec: this wrapper is replaced, so k8s SIGTERM / preemption reaches torchrun

@@ -18,6 +18,11 @@
 # real image, path or hardware size for this project. They are deliberately not
 # valid Kubernetes quantities/replica counts, so an unedited apply fails loudly
 # instead of silently landing on the wrong hardware.
+#
+# The env block below is the run's configuration surface. CATA_PROFILE selects
+# the path profile in path_config.py (the launcher also defaults it to "k8s");
+# without it the trainer would fall back to the platform default profile and
+# silently read the wrong CSV, run and backbone paths.
 apiVersion: kubeflow.org/v1
 kind: PyTorchJob
 metadata:
@@ -112,6 +117,13 @@ spec:
                     run_trainer
                   fi
               env:
+                # ---- path profile ----------------------------------------------
+                # Key into path_config.PATH_PROFILES chosen by
+                # resolve_runtime_paths(). The launcher defaults it to "k8s";
+                # this entry exists so the profile in use is visible and
+                # changeable without reading bin/train/kineager_k8s.sh.
+                - name: CATA_PROFILE
+                  value: "k8s"
                 # ---- inputs required by bin/train/kineager_k8s.sh --------------
                 - name: TRAIN_CSV
                   value: "<REPLACE_ME: PDBbind v2020 affinity CSV, e.g. data/pdbbindv2020_affinity.csv>"
