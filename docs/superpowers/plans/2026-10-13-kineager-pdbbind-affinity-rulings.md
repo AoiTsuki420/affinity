@@ -1,4 +1,4 @@
-# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R66)
+# Ruling appendix — KinEAGER PDBbind v2020 affinity (R1–R68)
 
 Controller rulings made while executing
 `docs/superpowers/plans/2026-10-13-kineager-pdbbind-affinity.md` on the
@@ -6,9 +6,9 @@ Controller rulings made while executing
 `.superpowers/sdd/2026-10-13-kineager-pdbbind-affinity/progress.md`.
 
 Scope: **R1–R61** are the execution rulings this appendix was commissioned for.
-**R62** (the test-dependency/import decision) and **R63–R66** (the task-review
-round that amended R61's guard) were recorded afterwards and are marked as such
-where they appear.
+**R62** (the test-dependency/import decision) and **R63–R68** (the task-review and
+documentation rounds that amended R61's guard and this appendix's own statements)
+were recorded afterwards and are marked as such where they appear.
 
 This appendix exists because the rulings are the part of the work that is hardest
 to re-derive: several of them record failures that the unit tests of the day
@@ -532,11 +532,12 @@ the later entry says so, and §9 collects those links.
   which is the opposite of what this project enforced all session. A collection
   error that says "install your dependencies" is the correct failure.
 
-### Review round (R63–R66)
+### Review rounds (R63–R68)
 
 Recorded after the R1–R62 body above. R63–R65 amend R61's guard, which the task
 review found to be too weak in three independent ways; R66 concerns the audit's
-stated range rather than any code.
+stated range; R67 and R68 are the documentation round that followed, and both are
+about statements rather than behaviour.
 
 - **R63 — the guard must accept exactly the forms the resolver accepts.**
   `path_config._current_user_name()` resolves `USER → USERNAME → the literal`, but
@@ -546,18 +547,30 @@ stated range rather than any code.
   the `USER`-else-`USERNAME` order. Ruled: accept `${USER:-${USERNAME:-}}` and
   export whichever supplied the value (R64), or at minimum name `USERNAME` in the
   refusal message. Implemented as the former, with the refusal naming both.
-- **R64 — the guard could be defused by an *unexported* assignment of the very
-  variable it checks.** `${USER:-}` sees a shell variable whether or not it is
-  exported, but the `exec`'d `torch.distributed.run` inherits only the
-  **environment**, and `path_config._current_user_name()` reads
-  `os.getenv("USER")`. On a host where `USER` is not already in the environment —
-  a minimal container, which is exactly the k8s case —
-  `USER=alice; bash bin/train/kineager_k8s.sh …` set a shell variable, **passed
-  the guard**, and still resolved to the shared
-  `/pfs_beijing/kineager/kineager_runs`. The guard therefore *certified* the very
-  run it exists to prevent, which made it worse than useless. Ruled: `export` the
-  validated value so the value that was checked is the value the trainer
-  receives, pinned by an assertion.
+- **R64 — the guard could be defused by a shell variable that never reached the
+  environment.** The guard read a **shell variable** — `${USER:-}` sees one whether
+  or not it is exported — while the `exec`'d `torch.distributed.run` inherits only
+  the **environment** and `path_config._current_user_name()` reads
+  `os.getenv("USER")`. Any route that makes those two disagree defeats the check,
+  and on a host where `USER` is not already in the environment (a minimal
+  container, which is exactly the k8s case) it does so silently:
+  * a **sourced** invocation — `USER=alice; source bin/train/kineager_k8s.sh` — runs
+    the guard in the caller's own shell, where the unexported variable is visible,
+    so the guard passed; `exec python3 -m torch.distributed.run` then handed the
+    trainer an environment without `USER`, and the run resolved to the shared
+    `/pfs_beijing/kineager/kineager_runs`;
+  * a `BASH_ENV`/startup file that sets `USER` without exporting it has the same
+    effect for a normal `bash bin/train/kineager_k8s.sh` invocation.
+
+  (A bare `USER=alice; bash bin/train/kineager_k8s.sh`, by contrast, is **not** a
+  defeating form: the child bash inherits only the environment, so the pre-fix
+  guard saw nothing and refused. An earlier draft of this entry offered it as the
+  repro; the mechanism above is the accurate one — R68.)
+
+  The guard therefore *certified* a run that was about to write to a shared
+  directory, which made it worse than useless. Ruled: `export` the validated value
+  so the value that was checked is the value the trainer receives, pinned by an
+  assertion.
 - **R65 — an unfilled `USER` placeholder passed the guard.** The manifest's value
   is `"<REPLACE_ME: your username on the shared filesystem>"`, which is
   non-empty, so an operator who forgot to replace it passed the guard and the run
@@ -569,18 +582,53 @@ stated range rather than any code.
 - **R66 — the audit's range label was challenged; re-measurement upheld it, and
   both views are now stated.** The review read the `8607086..2c54e9d` stat
   (README `6/3` inside `1144 insertions(+), 3 deletions(-)`) as proof that three
-  README deletions fall inside the audit's `3497a5e..HEAD` range, which would make
-  the deletion set span five files and contradict the whole-branch totals.
-  Re-measured at the final HEAD: `git diff --stat 3497a5e..HEAD` is 28 files,
-  **+7858/−856**, and `--numstat` puts all 856 deletions in exactly four files
-  (`main_infer_predictor` 63, `main_train_predictor_multigpu` 519,
-  `models/encoders` 100, `models/predictor` 174); `README.md` is **68/0** for that
-  range and was 65/0 at `8607086`. The three lines my commit changed were
-  themselves part of Task 20's added README block, so they are deletions only
-  relative to `8607086`, not to the branch base — against `3497a5e` the README
-  delta stays purely additive, and those three lines are documentation in the
-  affinity README section (no kinetics relevance). The report now prints both
-  ranges side by side precisely so neither label can be misread.
+  README deletions fall inside the audit's branch range, which would make the
+  deletion set span five files and contradict the whole-branch totals. Measured at
+  the round-1 commit, with the range named so the number cannot go stale:
+
+  | range | files | insertions | deletions | README.md |
+  |---|---|---|---|---|
+  | `3497a5e..161c1ea` (branch vs base) | 28 | **8137** | **856** | 68 / 0 |
+  | `3497a5e..161c1ea`, whitespace-ignored (`-w`) | 28 | 7558 | 277 | — |
+  | `8607086..161c1ea` (this task's commits) | 7 | 1423 | 3 | 6 / 3 |
+
+  All 856 deletions sit in exactly four files (`main_infer_predictor` 63,
+  `main_train_predictor_multigpu` 519, `models/encoders` 100,
+  `models/predictor` 174 — unchanged since the round-0 measurement; only the
+  insertion count moves as documentation is added). The three lines the R61 commit
+  changed were themselves part of Task 20's added README block, so they are
+  deletions only relative to `8607086`, not to the branch base — against
+  `3497a5e` the README delta stays purely additive (65/0 at `8607086`, 68/0 now),
+  and those three lines are documentation in the affinity README section (no
+  kinetics relevance). An earlier draft of this entry quoted **+7858/−856** and
+  labelled it "the final HEAD": 7858 was correct at `2c54e9d` and stopped being
+  correct the moment round 1 committed, which is the same label-vs-number defect
+  this ruling is about (R67). The report prints both ranges side by side for the
+  same reason.
+- **R67 — the appendix repeated the very label-vs-number defect R66 was about.**
+  The R66 entry said "Re-measured at the final HEAD … **+7858/−856**": 7858 was the
+  round-0 total at `2c54e9d`, and round 1 (which nets +279) had already made it
+  wrong, so the appendix and the report stated different numbers for the same
+  measurement while both called it final. Ruled: put the current numbers in, with
+  the **range named explicitly** (`3497a5e..161c1ea`) rather than a moving label
+  such as "final HEAD", so the number and its label stay consistent as later
+  commits land. The deletion set (856, four files), `README.md` 68/0 and every
+  kinetics conclusion are unaffected — and the fix doubles as the demonstration:
+  only insertions move when documentation is added, which is exactly why a range
+  label must name its range.
+- **R68 — R64's stated reproduction did not reproduce as written.** The launcher
+  comment and the R64 entry both offered `USER=alice; bash bin/train/kineager_k8s.sh …`
+  as the form that defused the pre-fix guard. It is not: the child bash inherits
+  only the environment, so the pre-fix guard saw no `USER` and **refused** that
+  literal form. The hazard R64 describes is real and the `export` is the right fix;
+  what was wrong is the repro. The unexported variable bites when the guard's shell
+  inherits it by a route other than the environment — a **sourced** invocation
+  (`USER=alice; source bin/train/kineager_k8s.sh`, where the guard runs in the
+  caller's own shell and the `exec`'d trainer does not), or a `BASH_ENV`/startup
+  file that sets `USER` without exporting it. Ruled: restate the mechanism
+  accurately in both places — the guard read a shell variable while the trainer
+  reads the environment, so any route that makes the two disagree defeats the
+  check — and keep the export and its tests unchanged.
 
 ---
 

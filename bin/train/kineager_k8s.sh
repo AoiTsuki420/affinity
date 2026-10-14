@@ -77,11 +77,16 @@ export CATA_PROFILE="${CATA_PROFILE:-k8s}"
 # both runs look healthy -- far harder to notice than a refusal to start.
 #
 # Two ways past a naive check, both closed here:
-#   * an UNSET-but-unexported assignment (`USER=alice; bash ...`) satisfies
-#     ${USER:-} -- a shell variable needs no export to be seen by this script --
-#     yet the exec'd trainer inherits only the ENVIRONMENT and os.getenv("USER")
-#     sees nothing. So the validated value is exported below, making the value
-#     that was checked the value the trainer receives.
+#   * this guard reads a SHELL VARIABLE (`${USER:-}` sees one whether or not it is
+#     exported), while the exec'd trainer inherits only the ENVIRONMENT and
+#     path_config reads os.getenv("USER"). Any route that makes those two disagree
+#     defeats the check: a SOURCED invocation (`USER=alice; source
+#     bin/train/kineager_k8s.sh`, where the caller's shell variables are visible to
+#     the guard but not to the exec'd child), or a BASH_ENV/startup file that sets
+#     USER without exporting it. (A plain `USER=alice; bash ...` is a different
+#     case: the child bash inherits only the environment, so the guard sees
+#     nothing and refuses.) The validated value is therefore exported below --
+#     the value that was checked becomes the value the trainer receives.
 #   * the manifest's own placeholder is a non-empty string, so an operator who
 #     forgets to fill it in would otherwise create a directory named after the
 #     placeholder. Kubernetes accepts any string as an env value; this rejects it.
