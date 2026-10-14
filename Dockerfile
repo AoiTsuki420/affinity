@@ -32,6 +32,11 @@ RUN pip install --no-cache-dir \
         pytest \
         biopython
 
+# The trainer logs through swanlab (main_train_predictor_multigpu.py: swanlab.init
+# with a stub fallback when missing); this deployment switched to it. Kept as a
+# separate layer so the heavy dependency layer above stays cached.
+RUN pip install --no-cache-dir swanlab
+
 # /etc/profile resets PATH in login shells, and the Kubeflow manifest launches
 # the container as `bash -lc ...` -- without this, that shell would drop the
 # conda env and pick the system python (3.10, no torch) instead. profile.d runs

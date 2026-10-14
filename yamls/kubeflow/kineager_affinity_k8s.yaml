@@ -153,6 +153,13 @@ spec:
                 # Only consulted when the operator does not inject PET_NNODES.
                 - name: NNODES
                   value: "2"
+                # ---- swanlab logging -------------------------------------------
+                # The trainer logs through swanlab (main_train_predictor_multigpu.py
+                # calls swanlab.init with project=enzyme-kinetics-cv). The API key
+                # is inlined here on purpose: this repo is the operator's own
+                # deployment copy, not a shared template.
+                - name: SWANLAB_API_KEY
+                  value: "LjZwDjUAxKIzS86yP9mhG"
                 # ---- task and hyperparameters, passed through "$@" ------------
                 # EPOCHS / BATCH_SIZE are the plan's runbook values; tune freely.
                 # The launcher additionally honours LORA_LAYER_POLICY,
