@@ -2535,7 +2535,10 @@ def train_one_stage(model, train_loader, val_loader, args,
             final_contact_store=final_contact_store,
         )
         
-        if is_main_process() and (((ep + 1) % 5 == 0) or (ep == epochs - 1)):
+        # 6B 骨干的完整断点约 27GB：原先每 5 轮才写一次，中断后最多丢 4 轮，且
+        # 不到第 5 轮时只能从 best 权重重启（2026-10-15 实测：第 1 轮 OOM 时没有
+        # 完整断点可续）。改为每轮都写——文件名固定、覆盖式写入，代价约 2 分钟/轮。
+        if is_main_process():
             save_training_checkpoint(model, optimizer, (onecycle if use_onecycle else scheduler), scaler, ema,
                                      epoch=ep, global_step=global_step,
                                      weights_dir=run_dir, tag="epoch")
@@ -2553,12 +2556,20 @@ def train_one_stage(model, train_loader, val_loader, args,
             best_val = val_loss
             no_improve = 0
 
-            backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # 只备份 EMA 会改写的（可训练）参数。整份 state_dict 的 GPU clone 会常驻
+            # ~26GB（backup 在本函数作用域内一直存活），每次验证改善后 rank0 显存从
+            # ~52GB 涨到 ~78GB，下一个长序列 batch 即 OOM（2026-10-15 实测：batch 8 与
+            # batch 4 的两次 OOM 都由此引起，与 batch 大小无关）。
             real_model = getattr(model, "module", model)
+            backup = _ema_backup_params(real_model, ema)
             ema.copy_to(real_model)
             to_save = model.module.state_dict() if is_ddp else model.state_dict()
             torch.save(to_save, best_ema_path)
-            model.load_state_dict(backup, strict=True)
+            params_by_name = dict(real_model.named_parameters())
+            with torch.no_grad():
+                for name, tensor in backup.items():
+                    params_by_name[name].data.copy_(tensor)
+            del backup
 
             to_save = model.module.state_dict() if is_ddp else model.state_dict()
             torch.save(to_save, best_raw_path)  

@@ -17,6 +17,12 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
+# 与 xtrimofold3 同类脚本对齐：显式把仓库根塞进 PYTHONPATH。
+# 训练脚本经 `python3 -m torch.distributed.run` 启动时，sys.path[0] 是**当前
+# 工作目录**而不是脚本目录——不设 PYTHONPATH 的话只有恰好在仓库根下执行才能
+# import models / data_affinity（k8s 靠 workingDir 保证，独立运行很容易踩坑）。
+export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
+
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

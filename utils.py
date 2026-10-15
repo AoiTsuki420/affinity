@@ -383,7 +383,9 @@ def resume_checkpoint_if_available(
         try:
             state = torch.load(ckpt_full, map_location=map_location)
             loaded = _safe_load_state(state)
-            start_epoch = int(state.get("epoch", 0)) if isinstance(state, dict) else 0
+            # 断点在每轮结束后保存（epoch=N 表示第 N 轮已完成），恢复时应从 N+1 开始；
+            # 原先直接用 N 会把最后一轮白跑一遍（2026-10-15 实测：每次续跑浪费一轮）。
+            start_epoch = (int(state.get("epoch", -1)) + 1) if isinstance(state, dict) else 0
             global_step = int(state.get("global_step", 0)) if isinstance(state, dict) else 0
             _report(ckpt_full, loaded, start_epoch, global_step)
         except Exception as e:
