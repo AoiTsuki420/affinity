@@ -916,17 +916,68 @@ def test_kfp_pipeline_is_an_argo_workflow_with_the_kfp_annotations():
 
 
 def test_kfp_pipeline_has_the_expected_templates_and_entrypoint():
+    """模板集合固定，且 entrypoint 指向 **DAG 模板**。
+
+    这里把"已知"和"没证实"分开写：Argo 语义下 resource 模板自己也能当 entrypoint
+    （那就是一个单节点 workflow），所以"指向 resource 模板"并不是一条硬性违规。选 DAG
+    的理由是**对齐已知可用的形状、降低风险**，具体有两条依据：
+      (a) 参照的、在本集群上确实跑通过的 xf3 流水线，entrypoint 是 DAG；
+      (b) KFP 编译器总是输出 DAG 作为 entrypoint，UI 的节点信息查询就是围绕 DAG 这一层
+          写的。
+    用户报的 `Unable to retrieve node info` 出自哪个页面、哪次上传并没有被确认过，
+    所以这**不是**已证实的根因——不要把它当成"找到一个 bug"来读。
+
+    顺带把 Argo 结构上的其它硬约束一起钉住：模板名唯一、DAG 任务的 `template` 存在、
+    DAG 为被调模板声明的每个 input 都传了值、顶层 arguments 覆盖 DAG 的 inputs。
+    （原先另有一条只测 entrypoint 的重复测试，已合并到这里。）
+    """
     document = _load_yaml(PIPELINE)
-    names = [template["name"] for template in document["spec"]["templates"]]
+    spec = document["spec"]
+    names = [template["name"] for template in spec["templates"]]
     assert names == [_PIPELINE_TEMPLATE, f"{_PIPELINE_TEMPLATE}-run"], names
-    # entrypoint 直接指向 resource 模板：一个只有单个任务的 pipeline，DAG 那层是
-    # 空的。参考文件两者都有（它的 entrypoint 是 DAG），两种都能被 KFP v1 接受；
-    # 这里少一层没有意义的间接。
-    assert document["spec"]["entrypoint"] == _PIPELINE_TEMPLATE
-    run = document["spec"]["templates"][1]
+
+    templates = {item["name"]: item for item in spec["templates"]}
+    entrypoint = spec.get("entrypoint")
+    assert entrypoint in templates, (
+        f"entrypoint {entrypoint!r} 不是任何模板名；现有模板: {sorted(templates)}"
+    )
+    assert entrypoint == f"{_PIPELINE_TEMPLATE}-run", (
+        f"entrypoint 必须是 DAG 模板 {_PIPELINE_TEMPLATE + '-run'!r}（与参照文件一致），"
+        f"实际是 {entrypoint!r}"
+    )
+    assert "dag" in templates[entrypoint], (
+        f"entrypoint {entrypoint!r} 不是 DAG 模板，它的键是 {sorted(templates[entrypoint])}"
+    )
+
+    resource_templates = [name for name, item in templates.items() if "resource" in item]
+    dag_templates = [name for name, item in templates.items() if "dag" in item]
+    assert resource_templates == [_PIPELINE_TEMPLATE], resource_templates
+    assert dag_templates == [f"{_PIPELINE_TEMPLATE}-run"], dag_templates
+
+    run = templates[dag_templates[0]]
+    for task in run["dag"]["tasks"]:
+        assert task["template"] in templates, (
+            f"DAG 任务 {task['name']!r} 指向不存在的模板 {task['template']!r}"
+        )
+        target = templates[task["template"]]
+        declared = {p["name"] for p in target.get("inputs", {}).get("parameters", [])}
+        supplied = {p["name"] for p in task.get("arguments", {}).get("parameters", [])}
+        assert declared == supplied, (
+            f"DAG 没给 {task['template']!r} 传全参数：缺 {sorted(declared - supplied)}，"
+            f"多 {sorted(supplied - declared)}"
+        )
+
     (task,) = run["dag"]["tasks"]
     assert task["template"] == _PIPELINE_TEMPLATE, "DAG 任务没有指向 resource 模板"
-    assert document["spec"]["serviceAccountName"] == "pipeline-runner"
+    dag_inputs = {p["name"] for p in run.get("inputs", {}).get("parameters", [])}
+    top_level = {p["name"] for p in spec.get("arguments", {}).get("parameters", [])}
+    assert dag_inputs <= top_level, (
+        f"顶层 arguments 没覆盖 DAG 的 inputs：缺 {sorted(dag_inputs - top_level)}"
+    )
+    assert dag_inputs == set(_PIPELINE_PARAMETERS), (
+        f"DAG 的 inputs {sorted(dag_inputs)} 与流水线参数 {sorted(_PIPELINE_PARAMETERS)} 不一致"
+    )
+    assert spec["serviceAccountName"] == "pipeline-runner"
 
 
 def test_kfp_pipeline_parameters_mirror_through_all_three_levels():
@@ -1302,3 +1353,6 @@ def test_all_k8s_artifacts_parse_and_are_committed_as_lf():
         assert raw.endswith(b"\n") and not raw.endswith(b"\n\n"), f"{path.name} 结尾换行不规范"
         assert b"\r" not in raw.replace(b"\r\n", b""), f"{path.name} 含孤立 CR（混用换行）"
     assert _load_yaml(PIPELINE)["kind"] == "Workflow"
+
+
+

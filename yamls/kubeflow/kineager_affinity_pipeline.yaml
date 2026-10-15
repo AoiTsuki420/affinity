@@ -36,7 +36,11 @@ metadata:
     pipelines.kubeflow.org/pipeline_spec: '{"description": "KinEAGER PDBbind-v2020 affinity training (elastic, Worker-only PyTorchJob).", "inputs": [{"name": "bash_command"}, {"name": "logpath"}, {"name": "memory"}, {"name": "cpu"}, {"name": "pod_gpus"}, {"name": "image"}, {"name": "pod_nums"}, {"name": "working_dir"}], "name": "kineager-affinity-train"}'}
   labels: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.14}
 spec:
-  entrypoint: kineager-affinity-train
+  # 指向 **DAG 模板**（下面的 `kineager-affinity-train-run`），与参照文件一致：那份在
+  # 本集群上确实跑通的 xf3 流水线，entrypoint 也是 DAG；KFP 编译器同样总是把 DAG 作为
+  # entrypoint，UI 的节点信息查询就是围绕这一层。指到 resource 模板在 Argo 语义下也能
+  # 跑（单节点 workflow），所以这里是**对齐已知可用的形状、降低风险**，不是已证实的根因。
+  entrypoint: kineager-affinity-train-run
   templates:
   - name: kineager-affinity-train
     resource:
