@@ -404,6 +404,10 @@ def test_val_epoch_affinity_branch_reports_sub_losses(monkeypatch):
     assert np.isfinite(float(loss))
     assert "affinity_val_total" in logged and "affinity_val_huber" in logged
     assert np.isfinite(logged["affinity_val_nll"])
+    # 排序诊断走的是同一个 sink，所以验证集也必须带 affinity_val_rank_pairs；
+    # 改动前 affinity_loss 只返回 6 个 key，这两条当时是 KeyError。
+    assert "affinity_val_rank_pairs" in logged
+    assert "affinity_val_rank_gap_mean" in logged
 
 
 @pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
