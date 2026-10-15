@@ -53,6 +53,24 @@ MASTER_PORT="${PET_MASTER_PORT:-${MASTER_PORT:-29500}}"
 MASTER_ADDR="${PET_MASTER_ADDR:-${MASTER_ADDR:-}}"
 export NNODES NODE_RANK NPROC_PER_NODE MASTER_PORT MASTER_ADDR
 
+# The elastic training-operator reports the node count as torchrun's own range
+# syntax "MIN:MAX" (observed as PET_NNODES=1:1 on the cluster, 2026-10-15).
+# This deployment runs a FIXED topology, so only a collapsed range (MIN == MAX)
+# is meaningful: use the number. An open range cannot be served by the static
+# rendezvous below - guessing a count would either hang the run or, far worse,
+# let every pod train standalone into the same runs_dir - so it must stop.
+if [[ "${NNODES}" == *:* ]]; then
+    nnodes_min="${NNODES%%:*}"
+    nnodes_max="${NNODES##*:}"
+    if [[ "${nnodes_min}" =~ ^[0-9]+$ && "${nnodes_max}" =~ ^[0-9]+$ && "${nnodes_min}" == "${nnodes_max}" ]]; then
+        echo "[kineager] NNODES=${NNODES} (elastic range) -> fixed ${nnodes_max}"
+        NNODES="${nnodes_max}"
+    else
+        echo "NNODES='${NNODES}' is an open elastic range; a fixed topology is required - set min_replicas == max_replicas == pod_nums" >&2
+        exit 1
+    fi
+fi
+
 # --- topology validation: all of it runs before the exec at the bottom -------
 for integer_var in NNODES NODE_RANK NPROC_PER_NODE MASTER_PORT; do
     if ! [[ "${!integer_var}" =~ ^[0-9]+$ ]]; then

@@ -675,6 +675,13 @@ notice — either every pod trains its own copy of the whole dataset into the sa
 `nnodes=1` in a pod's `[kineager]` line of a multi-pod run, this block is the
 first place to look.
 
+2026-10-15 的一次实跑里，弹性算子下发的 `PET_NNODES` 是**区间形式** `1:1`
+（torchrun 自己的 `MIN:MAX` 弹性语法）。launcher 现在会把 `MIN == MAX` 的区间
+收敛成固定值，并打印一行 `[kineager] NNODES=… (elastic range) -> fixed N`；
+开放区间（`MIN != MAX`）则直接报错拒绝——静态 rendezvous 撑不起弹性区间，乱猜
+一个数会让各 pod 单机训练、互相覆盖。本部署要求 `min_replicas == max_replicas
+== pod_nums`。
+
 ---
 
 ## 7. Verify multi-GPU actually engaged
