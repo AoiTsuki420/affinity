@@ -351,10 +351,12 @@ def test_manifest_env_declares_user():
         "写入路径会回退到共享目录"
     )
     value = env["USER"]
+    # 这里只要求「已声明且非空」。R61 要的是 manifest 必须提供 USER，好让写入路径按用户
+    # 隔离；早期版本还断言它必须是 `<REPLACE_ME: …>` 占位符，但那是把「尚未填写」当成了
+    # 期望状态——真实部署恰恰应该是填好的（本仓库现在是 `xinran_2026`），于是那条断言会
+    # 在配置正确的 manifest 上失败。未填写的占位符由 launcher 的守卫负责拒绝（匹配
+    # `^<REPLACE_ME` 即报错退出），不需要在这里重复。
     assert isinstance(value, str) and value.strip(), "USER 不能是空值"
-    assert value.startswith("<REPLACE_ME") and value.endswith(">"), (
-        f"USER 必须写成 <REPLACE_ME: …>，与其它操作者填写的值风格一致（实际 {value!r}）"
-    )
 
 
 def test_manifest_header_lists_user():
@@ -468,16 +470,21 @@ def test_launcher_trainer_flags_exist_in_the_trainer_argparse():
     assert unknown == [], f"launcher 传了训练脚本不认识的 flag: {unknown}"
 
 
-def test_k8s_artifacts_are_ascii_with_one_trailing_newline_and_consistent_eol():
-    """源码卫生：纯 ASCII、恰好一个结尾换行、没有孤立 CR（不混用换行）。
+def test_k8s_artifacts_are_utf8_with_one_trailing_newline_and_consistent_eol():
+    """源码卫生：可解码为 UTF-8、恰好一个结尾换行、没有孤立 CR（不混用换行）。
 
-    这里不要求工作区是 LF：本仓库 `core.autocrlf=true`，checkout 出来就是 CRLF，
-    文件工作区字节数会随 git 操作变化（断言「工作区无 CR」会变成 flaky）。真正要
-    保证的是 blob 是 LF——提交时 git 会归一化，报告里另用 `git cat-file blob`
-    逐字节核对过 CR=0。
+    这里**不要求纯 ASCII**：启动脚本带中文注释（`PYTHONPATH` 那一段），bash 按字节读取，
+    UTF-8 完全合法。早期版本断言 `.isascii()`，那是我自己的偏好而不是需求，会在加了中文
+    注释的脚本上误报。
+
+    这里也**不要求工作区是 LF**：本仓库 `core.autocrlf=true`，checkout 出来就是 CRLF，
+    断言「工作区无 CR」会 flaky。真正有害的是**孤立** CR，那说明换行混用，所以只查它。
     """
     for path in (LAUNCHER, MANIFEST):
         raw = path.read_bytes()
-        assert raw.decode("utf-8").isascii(), f"{path.name} 含非 ASCII 字节"
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"{path.name} 不是合法 UTF-8：{error}") from error
         assert raw.endswith(b"\n") and not raw.endswith(b"\n\n"), f"{path.name} 结尾换行不规范"
         assert b"\r" not in raw.replace(b"\r\n", b""), f"{path.name} 含孤立 CR（混用换行）"
