@@ -5,7 +5,8 @@
 # Same rendezvous contract as xtrimofold3's
 # bin/train/run_k8s_protenix_v2_multitask_PL_k8s.sh:
 #   * one GPU per pod (NPROC_PER_NODE=1),
-#   * the orchestrator injects NNODES / NODE_RANK / MASTER_ADDR,
+#   * the orchestrator injects the topology (PET_* from the training-operator,
+#     or NNODES / NODE_RANK / MASTER_ADDR; see the resolution block below),
 #   * this script validates the topology and execs torch.distributed.run.
 #
 # The topology comes from the environment; training hyperparameters (-epochs,
@@ -23,10 +24,34 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # import models / data_affinity（k8s 靠 workingDir 保证，独立运行很容易踩坑）。
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 
-NNODES="${NNODES:-1}"
-NODE_RANK="${NODE_RANK:-0}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-MASTER_PORT="${MASTER_PORT:-29500}"
+# --- topology resolution, launch-agnostic -----------------------------------
+# One resolution for all three ways this script is started, so a run cannot
+# silently degrade to a single rank depending on the *launcher*:
+#
+#   1. the training-operator's own variables. They come FIRST because the
+#      elastic, Worker-only KFP pipeline (yamls/kubeflow/kineager_affinity_pipeline.yaml)
+#      injects topology ONLY under this prefix (plus RANK/WORLD_SIZE): nothing in
+#      that pipeline sets the bare names, so with the old bare-name-only
+#      resolution every pod fell back to NNODES=1 / NODE_RANK=0. That is not an
+#      error the run can notice - DDP just wraps with world_size=1, every pod
+#      runs an independent replica writing the SAME runs_dir/train_data_dir, and
+#      the launcher's own `NODE_RANK < NNODES` check still passes.
+#   2. the bare, Kubernetes-style names: what
+#      yamls/kubeflow/kineager_affinity_k8s.yaml exports and what the operator
+#      leaves in place for the non-elastic (Master + Worker) topology.
+#   3. RANK / WORLD_SIZE: torchrun's own names - what a `torchrun` or
+#      `torch.distributed.run` parent passes down. Their values are 0-based, the
+#      same convention as NODE_RANK, so they map straight across.
+#   4. the historical defaults: a single local process.
+#
+# Every expansion carries a default, so all five names are always set and the
+# rest of the script stays safe under `set -u`.
+NNODES="${PET_NNODES:-${NNODES:-${WORLD_SIZE:-1}}}"
+NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-${RANK:-0}}}"
+NPROC_PER_NODE="${PET_NPROC_PER_NODE:-${NPROC_PER_NODE:-1}}"
+MASTER_PORT="${PET_MASTER_PORT:-${MASTER_PORT:-29500}}"
+MASTER_ADDR="${PET_MASTER_ADDR:-${MASTER_ADDR:-}}"
+export NNODES NODE_RANK NPROC_PER_NODE MASTER_PORT MASTER_ADDR
 
 # --- topology validation: all of it runs before the exec at the bottom -------
 for integer_var in NNODES NODE_RANK NPROC_PER_NODE MASTER_PORT; do
@@ -132,6 +157,28 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 echo "[kineager] task=${TASK} profile=${CATA_PROFILE} nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${master_addr}:${MASTER_PORT}"
 
 # --- launch ------------------------------------------------------------------
+# LOG_PATH: when it is set, ONLY rank 0 appends to it and the other ranks stay on
+# stdout/stderr (the same single-writer pattern as the xtrimofold3 reference).
+# The elastic pipeline's container args cannot express this by themselves - a
+# plain `bash ... >> ${logpath} 2>&1` wraps EVERY pod, so N pods interleave into
+# one file and the result is unreadable. Doing it here also covers the bare
+# manifest and a hand-run shell.
+#
+# The redirect is composed with the exec instead of opening the file separately,
+# so two properties survive:
+#   * rank 0's stdout/stderr are the log file BEFORE the exec, therefore torchrun
+#     and the trainer inherit the redirect (writing to fd 1/2 needs no LOG_PATH
+#     knowledge downstream). `exec 1>>file 2>&1` would leak the open descriptors
+#     into every child; this does not rely on that at all.
+#   * there is still exactly ONE exec and it is still the last thing the script
+#     does, so the trainer - not this wrapper - is the container's PID 1 and
+#     k8s SIGTERM / preemption reaches torchrun (see the long note below).
+# `{ ...; }` needs the semicolon before the closing brace; the `2>&1` applies to
+# the group, i.e. after the append redirect has already moved fd 1.
+#
+# Unset LOG_PATH => the `else` branch => behaviour is exactly what it was before
+# this block existed (both streams inherited from the container).
+#
 # exec: this wrapper is replaced, so k8s SIGTERM / preemption reaches torchrun
 # instead of being swallowed here. The PyTorchJob also calls this script through
 # `exec bash bin/train/kineager_k8s.sh`, which is what puts torchrun - not the
@@ -144,20 +191,42 @@ echo "[kineager] task=${TASK} profile=${CATA_PROFILE} nnodes=${NNODES} node_rank
 # to the (quoted) arguments otherwise - so a bare invocation still works.
 # -esm / -molt5 are the training script's legacy aliases for the two backbone
 # snapshot paths.
-exec python3 -m torch.distributed.run \
-    --nnodes="${NNODES}" \
-    --node_rank="${NODE_RANK}" \
-    --nproc_per_node="${NPROC_PER_NODE}" \
-    --master_addr="${master_addr}" \
-    --master_port="${MASTER_PORT}" \
-    "${ROOT}/main_train_predictor_multigpu.py" \
-        --task "${TASK}" \
-        -csv "${TRAIN_CSV}" \
-        -esm "${KINEAGER_ESMC_PATH}" \
-        -molt5 "${KINEAGER_MOLFORMER_PATH}" \
-        --lora_layer_policy "${LORA_LAYER_POLICY:-last_k}" \
-        --lora_last_k "${LORA_LAST_K:-30}" \
-        --grad_checkpoint_backbone "${GRAD_CHECKPOINT_BACKBONE:-off}" \
-        --iters_to_accumulate "${ITERS_TO_ACCUMULATE:-${KINEAGER_ITERS_TO_ACCUMULATE:-1}}" \
-        --num_workers "${NUM_WORKERS:-${KINEAGER_NUM_WORKERS:-8}}" \
-        ${1+"$@"}
+if [ -n "${LOG_PATH:-}" ] && [ "${NODE_RANK}" -eq 0 ]; then
+    {
+        exec python3 -m torch.distributed.run \
+            --nnodes="${NNODES}" \
+            --node_rank="${NODE_RANK}" \
+            --nproc_per_node="${NPROC_PER_NODE}" \
+            --master_addr="${master_addr}" \
+            --master_port="${MASTER_PORT}" \
+            "${ROOT}/main_train_predictor_multigpu.py" \
+                --task "${TASK}" \
+                -csv "${TRAIN_CSV}" \
+                -esm "${KINEAGER_ESMC_PATH}" \
+                -molt5 "${KINEAGER_MOLFORMER_PATH}" \
+                --lora_layer_policy "${LORA_LAYER_POLICY:-last_k}" \
+                --lora_last_k "${LORA_LAST_K:-30}" \
+                --grad_checkpoint_backbone "${GRAD_CHECKPOINT_BACKBONE:-off}" \
+                --iters_to_accumulate "${ITERS_TO_ACCUMULATE:-${KINEAGER_ITERS_TO_ACCUMULATE:-1}}" \
+                --num_workers "${NUM_WORKERS:-${KINEAGER_NUM_WORKERS:-8}}" \
+                ${1+"$@"}
+    } >> "${LOG_PATH}" 2>&1
+else
+    exec python3 -m torch.distributed.run \
+        --nnodes="${NNODES}" \
+        --node_rank="${NODE_RANK}" \
+        --nproc_per_node="${NPROC_PER_NODE}" \
+        --master_addr="${master_addr}" \
+        --master_port="${MASTER_PORT}" \
+        "${ROOT}/main_train_predictor_multigpu.py" \
+            --task "${TASK}" \
+            -csv "${TRAIN_CSV}" \
+            -esm "${KINEAGER_ESMC_PATH}" \
+            -molt5 "${KINEAGER_MOLFORMER_PATH}" \
+            --lora_layer_policy "${LORA_LAYER_POLICY:-last_k}" \
+            --lora_last_k "${LORA_LAST_K:-30}" \
+            --grad_checkpoint_backbone "${GRAD_CHECKPOINT_BACKBONE:-off}" \
+            --iters_to_accumulate "${ITERS_TO_ACCUMULATE:-${KINEAGER_ITERS_TO_ACCUMULATE:-1}}" \
+            --num_workers "${NUM_WORKERS:-${KINEAGER_NUM_WORKERS:-8}}" \
+            ${1+"$@"}
+fi

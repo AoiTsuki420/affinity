@@ -8,17 +8,21 @@
 #     6000s TTL, so a re-run MUST delete the finished PyTorchJob first -
 #     otherwise `kubectl apply` of the unchanged manifest reports "unchanged",
 #     exits 0, and launches nothing;
-#   * only rank 0 appends to LOG_PATH, so the master pod's log is the one worth
-#     following.
+#   * only rank 0 appends to LOG_PATH, so rank 0's pod is the one worth following.
+#     Which pod that is depends on the launcher: the bare manifest puts rank 0 in
+#     `<job>-master-0`, the elastic Worker-only pipeline has no master pod at all
+#     and rank 0 is `<job>-...-worker-0`. The pod is therefore DISCOVERED from the
+#     training-operator's labels (master-0 preferred when it exists) instead of
+#     being hardcoded.
 #
 # Usage:
 #   bash bin/train/launch_kineager_affinity_k8s.sh [options]
 #
 # Options:
 #   --no-delete          do not delete an existing PyTorchJob first
-#   --no-follow          do not stream the master pod log
+#   --no-follow          do not stream the rank-0 pod log
 #   --dry-run            print the kubectl commands without running them
-#   --wait-timeout N     seconds to wait for the master pod (default 1800)
+#   --wait-timeout N     seconds to wait for the rank-0 pod (default 1800)
 #   -h | --help          show this help
 #
 # Environment overrides:
@@ -90,31 +94,104 @@ run kubectl apply -f "$MANIFEST"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     if [ "$FOLLOW" -eq 1 ]; then
-        echo "+ (dry-run) kubectl get pod ${JOB}-master-0 ...   # 轮询直到 Running"
-        echo "+ (dry-run) kubectl logs -f ${JOB}-master-0 -c pytorch -n $NAMESPACE"
+        echo "+ (dry-run) kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB   # 轮询直到出现 *-master-0 / *-worker-0 且 Running"
+        echo "+ (dry-run) kubectl logs -f <rank-0 pod> -c pytorch -n $NAMESPACE"
     fi
     exit 0
 fi
 
 if [ "$FOLLOW" -eq 0 ]; then
     echo "[launch] submitted; not following (--no-follow)."
-    echo "[launch] pod: ${JOB}-master-0  |  logs: kubectl logs -f ${JOB}-master-0 -c pytorch -n $NAMESPACE"
+    echo "[launch] rank-0 pod: kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB"
+    echo "[launch] logs:       kubectl logs -f <that pod> -c pytorch -n $NAMESPACE"
     exit 0
 fi
 
-# --- 3) wait for the master pod, then stream its log -------------------------
-MASTER_POD="${JOB}-master-0"
-echo "[launch] waiting for pod ${MASTER_POD} (timeout ${WAIT_TIMEOUT}s; first run may pull the image)..."
+# --- 3) wait for the rank-0 pod, then stream its log -------------------------
+# The pod name is DISCOVERED, not hardcoded. The bare manifest
+# (yamls/kubeflow/kineager_affinity_k8s.yaml) has a Master replica, so rank 0
+# runs in `${JOB}-master-0`; the elastic, Worker-only pipeline
+# (yamls/kubeflow/kineager_affinity_pipeline.yaml) has no Master at all and rank 0
+# is whichever worker holds NODE_RANK=0 - in practice `${JOB}-...-worker-0`. (The
+# elastic job's pods also carry a generated suffix, so even the worker's name is
+# not predictable.) Ask the cluster instead of assuming either shape.
+#
+# The user-supplied JOB may be a prefix (kineager-affinity) or the exact
+# metadata.name of the bare manifest, so match on the training-operator's own
+# label and filter client-side: kubectl label selectors have no prefix match.
+pod_names() {
+    kubectl get pods -n "$NAMESPACE" \
+        -l "training.kubeflow.org/job-name=$JOB" \
+        --no-headers -o custom-columns=':metadata.name' 2>/dev/null || true
+}
+
+# Two passes, deliberately: `kubectl get pods` sorts by name, and an elastic job's
+# generated name can sort *before* a master pod's, so a single loop that takes the
+# first match can pick worker-0 while a master exists. A master pod wins outright;
+# worker-0 is only the fallback for the Worker-only pipeline.
+pick_rank0() {
+    chosen=""
+    for candidate in $(pod_names); do
+        case "$candidate" in
+            *-master-0) chosen="$candidate" ;;
+        esac
+        [ -n "$chosen" ] && break
+    done
+    if [ -z "$chosen" ]; then
+        for candidate in $(pod_names); do
+            case "$candidate" in
+                *-worker-0) chosen="$candidate" ;;
+            esac
+            [ -n "$chosen" ] && break
+        done
+    fi
+    printf '%s' "$chosen"
+}
+
+echo "[launch] waiting for the rank-0 pod of '$JOB' (timeout ${WAIT_TIMEOUT}s; first run may pull the image)..."
 phase=""
+MASTER_POD=""
+last_seen=""
 deadline=$((SECONDS + WAIT_TIMEOUT))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    phase=$(kubectl get pod "$MASTER_POD" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    MASTER_POD=$(pick_rank0)
+    if [ -n "$MASTER_POD" ]; then
+        phase=$(kubectl get pod "$MASTER_POD" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    else
+        phase=""
+    fi
     case "$phase" in
         Running|Succeeded|Failed)
             break ;;
     esac
+    # One line per pod-set change (not one per 10 s poll), so a slow start is
+    # still visible: which pods exist and which phase rank 0 is in.
+    if [ "$MASTER_POD" != "$last_seen" ]; then
+        if [ -n "$MASTER_POD" ]; then
+            echo "[launch] rank-0 candidate ${MASTER_POD} is in phase '${phase:-unknown}'"
+        else
+            echo "[launch] no *-master-0 / *-worker-0 pod yet"
+        fi
+        last_seen="$MASTER_POD"
+    fi
     sleep 10
 done
+
+if [ -z "${MASTER_POD:-}" ]; then
+    echo "[launch] no rank-0 pod found for job '$JOB' in namespace '$NAMESPACE' after ${WAIT_TIMEOUT}s." >&2
+    echo "         Looked for a pod labelled training.kubeflow.org/job-name=$JOB with a name ending in -master-0 or -worker-0." >&2
+    echo "         Pods actually found for that job (may be none, or all still Pending/ContainerCreating):" >&2
+    listed=$(pod_names)
+    if [ -n "$listed" ]; then
+        printf '%s\n' "$listed" | sed 's/^/           /' >&2
+    else
+        echo "           (none)" >&2
+    fi
+    echo "         Inspect:" >&2
+    echo "           kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB -o wide" >&2
+    echo "           kubectl get pytorchjob -n $NAMESPACE" >&2
+    exit 1
+fi
 
 case "$phase" in
     Running)
@@ -126,7 +203,7 @@ case "$phase" in
         run kubectl logs "$MASTER_POD" -c pytorch -n "$NAMESPACE" --tail=200
         ;;
     *)
-        echo "[launch] timed out after ${WAIT_TIMEOUT}s waiting for ${MASTER_POD}." >&2
+        echo "[launch] timed out after ${WAIT_TIMEOUT}s waiting for ${MASTER_POD} to leave phase '${phase}'." >&2
         echo "         Inspect: kubectl describe pod $MASTER_POD -n $NAMESPACE" >&2
         exit 1
         ;;
