@@ -1,0 +1,12 @@
+# Shell scripts and YAML are consumed by bash and by kubectl/PyYAML; both
+# reject or mis-parse CRLF. The repo sets core.autocrlf=true, which checks
+# files out as CRLF by default, so pin these to LF explicitly. Without this
+# a CRLF shell script parses locally-looking-fine but dies on the cluster
+# with `syntax error near unexpected token $'do\r'`.
+*.sh   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+
+# This file is read by git on every platform and must itself stay LF in the
+# working tree too (core.autocrlf=true would otherwise rewrite it on checkout).
+.gitattributes text eol=lf

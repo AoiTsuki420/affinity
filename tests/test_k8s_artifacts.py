@@ -58,22 +58,65 @@ TRAINER = REPO_ROOT / "main_train_predictor_multigpu.py"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 
 # `bash -n` 需要一个**真能跑**的 bash：本机 PATH 上的 `bash` 常常是
-# `WindowsApps\bash.EXE`（WSL 转发器，报 Wsl/E_ACCESSDENIED），Git for Windows 的
-# bash.exe 又被文件沙箱拦在「创建 signal pipe」那一步（Win32 error 5）。所以不猜
-# 路径：拿 `bash -n` 试一个玩具脚本，能返回 0 的才算数，否则下面的语法断言直接
-# skip —— 报一个它其实看不见的缺陷比 skip 更糟。
+# `WindowsApps\bash.EXE`（WSL 转发器），Git for Windows 的 bash.exe 在受限沙箱里又被
+# 拦在「创建 signal pipe」那一步（Win32 error 5）。所以不猜路径，而是拿一个玩具脚本
+# **以文件形式**试 `bash -n`，能返回 0 的才算数。
+#
+# 试的方式很关键：脚本必须写成文件再用 `bash -n <file>`，不能走 stdin。
+# `bash -n` + stdin 在 WindowsApps 的 WSL 转发器上会报
+# 「unexpected end of file from `if` command」——那是那个转发器的管道处理，不是脚本的
+# 问题（同一段文本以文件形式交给同一个 bash 返回 0）。测试必须与解释器的调用方式无关，
+# 所以下面所有 bash 调用统一走「写文件 + bash -n <file>」，容器里的 `bash -lc` 也是从
+# 文件读脚本的。
+def _run_bash_syntax_check(script):
+    """把 `script` 写成 LF 文件、跑 `bash -n <file>`，返回 CompletedProcess。
+
+    文件写在仓库根目录（本机 pytest 的 tmp_path 不可用），文件名带 pid 以免并发运行
+    互踩；无论成败都在 finally 里删掉。
+
+    路径以**相对文件名**传给 bash，且把 cwd 显式设成仓库根：Windows 形状的绝对路径
+    （`D:\\...`）对 Git bash 没问题，但对 WSL 转发器是另一套命名空间，而相对路径两种
+    解释器都按同一个 cwd 解析。
+    """
+    probe = REPO_ROOT / f".bash_syntax_probe_{os.getpid()}.sh"
+    try:
+        # newline="\n" 是显式要求：CRLF 会让 bash 报 `$'do\r'` 之类的语法错，那是文件
+        # 换行的问题、不是被检查脚本的问题（`.gitattributes` 钉住 eol=lf 也是为此）。
+        probe.write_text(script, encoding="utf-8", newline="\n")
+        raw = probe.read_bytes()
+        assert b"\r" not in raw, f"探测文件必须只有 LF，实际含 CR: {probe.name}"
+        assert not raw.startswith(b"\xef\xbb\xbf"), "探测文件不能有 BOM"
+        return subprocess.run([BASH, "-n", probe.name], capture_output=True, text=True,
+                              cwd=str(REPO_ROOT))
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _bash_word_count(argument):
+    """`set -- <argument>; echo $#` 的词数（同样走文件，不走 stdin）。"""
+    probe = f"set -- {argument}\nprintf '%s\\n' \"$#\"\n"
+    result = _run_bash_syntax_check(probe)
+    assert result.returncode == 0, f"词数探测脚本执行失败: {result.stderr}"
+    return result.stdout.strip()
+
+
 def _find_usable_bash():
     candidates = [shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe",
                   r"C:\Program Files\Git\usr\bin\bash.exe"]
     for candidate in candidates:
         if not candidate:
             continue
+        probe = REPO_ROOT / f".bash_usable_probe_{os.getpid()}.sh"
         try:
-            probe = subprocess.run([candidate, "-n"], input="true\n",
-                                   capture_output=True, text=True, timeout=30)
+            probe.write_text("true\n", encoding="utf-8", newline="\n")
+            result = subprocess.run([candidate, "-n", probe.name],
+                                    capture_output=True, text=True, timeout=30,
+                                    cwd=str(REPO_ROOT))
         except (OSError, subprocess.SubprocessError):
             continue
-        if probe.returncode == 0:
+        finally:
+            probe.unlink(missing_ok=True)
+        if result.returncode == 0:
             return candidate
     return None
 
@@ -1070,11 +1113,15 @@ def test_kfp_pipeline_rank_zero_log_gate_substitutes_into_parseable_bash():
     """容器 args 渲染出来必须是**能过 `bash -n`** 的脚本，且门控形状正确。
 
     这是「引号有没有活过 YAML 与 Argo 的 `{{...}}` 替换」的直接证据：`logpath` 和
-    `bash_command` 都换成真实值，再把 args 交给 bash 的词法分析器。少了/多了引号、
-    替换把 `>>` 吃掉、`$@` 被展开——都会在这里变成语法错误。
+    `bash_command` 都换成真实值，把渲染结果写成 LF 文件，再交给 bash 的语法分析器。
+    少了/多了引号、替换把 `>>` 吃掉、`$@` 被展开——都会在这里变成语法错误。
 
-    形状断言（不依赖 bash）先跑，所以本机没有 bash 时这一条仍然能抓到「重定向没引号」
-    「门控被写成 true」这类改动；只有语法那一半会 skip。
+    脚本走**文件**而不是 stdin：`bash -n` + stdin 在 WindowsApps 的 WSL 转发器上会误报
+    「unexpected end of file from `if` command」（同一段文本以文件形式交给同一个 bash
+    返回 0），测试不能依赖解释器的管道处理。容器里的 `bash -lc` 也是从文件读脚本。
+
+    形状断言（不依赖 bash）先跑，所以沙箱里也能抓到「重定向没引号」「门控被写成 true」
+    这类改动；只有语法那一半在没有 bash 时才 skip。
     """
     argv = _rank0_argv(2)
     assert 'if [ "${NODE_RANK:-0}" -eq 0 ]; then' in argv, (
@@ -1091,23 +1138,23 @@ def test_kfp_pipeline_rank_zero_log_gate_substitutes_into_parseable_bash():
     assert "{{" not in argv and "}}" not in argv, "替换之后不能留下 Argo 模板语法"
 
     if not BASH:
-        pytest.skip("没有可用的 bash，跳过 `bash -n` 那一半（本机 sandbox 下 Git bash 起不来）")
+        pytest.skip("PATH 和 Git for Windows 里都没有可用的 bash，跳过 `bash -n` 那一半")
 
-    result = subprocess.run([BASH, "-n"], input=argv, capture_output=True, text=True)
-    assert result.returncode == 0, f"容器 args 不是合法 bash: {result.stderr}"
-    assert subprocess.run([BASH, "-n"], input=_rank0_argv(3),
-                          capture_output=True, text=True).returncode == 0
+    result = _run_bash_syntax_check(argv)
+    assert result.returncode == 0, f"容器 args 不是合法 bash（{BASH}）: {result.stderr}"
+
+    # 换个 pod_nums，渲染出来的脚本同样必须合法
+    other = _run_bash_syntax_check(_rank0_argv(3))
+    assert other.returncode == 0, f"pod_nums=3 的容器 args 不是合法 bash: {other.stderr}"
 
 
 def test_kfp_pipeline_logpath_substitution_cannot_expand_into_extra_words():
     """`logpath` 被塞进双引号里：去掉引号就会被 word-splitting 拆成两个词。
 
     这条用「把引号拿掉就得到不同的词数」证明引号真的在起作用，而不是碰巧路径里没有
-    空格。它同时是给操作者的护栏：带空格/引号的路径会在这里被抓住。
+    空格。它同时是给操作者的护栏：带空格/引号的路径会在这里被抓住。词数探测同样走
+    文件（见 `_run_bash_syntax_check`）。
     """
-    if not BASH:
-        pytest.skip("没有可用的 bash，无法做词法检查（本机 sandbox 下 Git bash 起不来）")
-
     argv = _rank0_argv(2)
     log_line = next(line for line in argv.splitlines() if "rank0.log" in line)
     match = re.search(r"bash .*? >> (.*) 2>&1$", log_line)
@@ -1117,14 +1164,11 @@ def test_kfp_pipeline_logpath_substitution_cannot_expand_into_extra_words():
         f"logpath 没有被引号包住，`>>` 之后就是裸路径: {log_line!r}"
     )
 
-    def word_count(argument):
-        probe = subprocess.run([BASH, "-c", f'set -- {argument}; printf "%s\\n" "$#"'],
-                               capture_output=True, text=True)
-        assert probe.returncode == 0, probe.stderr
-        return probe.stdout.strip()
+    if not BASH:
+        pytest.skip("PATH 和 Git for Windows 里都没有可用的 bash，跳过词数探测")
 
-    assert word_count(quoted) == "1", f"重定向目标被拆开了: {quoted}"
-    assert word_count(quoted[1:-1]) == "2", (
+    assert _bash_word_count(quoted) == "1", f"重定向目标被拆开了: {quoted}"
+    assert _bash_word_count(quoted[1:-1]) == "2", (
         "引号必须真的起作用：去掉引号后这个路径应该被拆成 2 个词，否则这条断言什么都没证明"
     )
 
