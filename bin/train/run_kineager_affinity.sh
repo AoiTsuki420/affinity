@@ -53,8 +53,12 @@ export SWANLAB_API_KEY="${SWANLAB_API_KEY:-LjZwDjUAxKIzS86yP9mhG}"
 # two local ranks on 2026-10-15).
 python "${ROOT}/bin/train/prewarm_remote_code.py"
 
+# -epochs / -es_patience are deliberately huge: this deployment trains until the
+# run is stopped from the Kubeflow UI (every epoch still saves the full
+# checkpoint). Export EPOCHS / ES_PATIENCE to get a bounded run back.
 exec bash "${ROOT}/bin/train/kineager_k8s.sh" \
-    -epochs "${EPOCHS:-30}" \
+    -epochs "${EPOCHS:-100000}" \
+    -es_patience "${ES_PATIENCE:-100000}" \
     -batch_size "${BATCH_SIZE:-4}" \
     --split_mode group_pair \
     --split_seed 42 \

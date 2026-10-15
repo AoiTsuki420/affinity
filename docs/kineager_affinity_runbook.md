@@ -141,15 +141,16 @@ warmup（已知）。第一轮完成前中断则退回 `predictor_best_ema.pt`�
 ### 0.7 弹性流水线路线（kineager-affinity-train，KFP UI）
 
 机制、参数含义、`logpath` 与 `LOG_PATH` 的区别见 §6.2；这里给**本部署当前提交的
-具体填法**（12 卡 = 3 pod × 4 GPU；续跑本地单卡已完成的前两轮。换卡数只改本表
-参数，脚本不用动——`NPROC_PER_NODE` 由 wrapper 按容器内可见 GPU 数自动设定）：
+具体填法**（2026-10-15 实跑：1 pod × 8 卡；续跑本地单卡已完成的前两轮。换卡数
+只改本表参数，脚本不用动——`NPROC_PER_NODE` 由 wrapper 按容器内可见 GPU 数自动
+设定；例如用满 12 卡 = `pod_gpus=4` / `pod_nums=3` / `min=max=3`）：
 
 | 参数 | 本部署取值 |
 |---|---|
-| `pod_nums` | `3`（= NNODES；世界大小 = `pod_gpus` × `pod_nums` = 12）|
-| `pod_gpus` | `4`（每个 pod 的 GPU 数）|
-| `min_replicas` / `max_replicas` | `3` / `3`（固定 = `pod_nums`，不要弹性）|
-| `cpu` / `memory` | `40` / `320Gi`（按每卡比例；节点宽松时也可沿用 `80/640Gi`）|
+| `pod_nums` | `1`（= NNODES；世界大小 = `pod_gpus` × `pod_nums`）|
+| `pod_gpus` | `8`（每个 pod 的 GPU 数）|
+| `min_replicas` / `max_replicas` | `1` / `1`（固定 = `pod_nums`，不要弹性）|
+| `cpu` / `memory` | `80` / `640Gi` |
 | `image` | `harbor.biomap-int.com/xinran_2026/kineager:affinity-v1` |
 | `working_dir` | `/pfs_beijing/xinran_2026/project/affinity`（专用流水线可用 `/workspace/kineager`）|
 | `bash_command` | 见下方代码块 |
@@ -169,11 +170,17 @@ bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.s
   （避免 HF 远程代码模块缓存竞争），`pod_gpus=1` 时它也基本零成本。
 - USER / TRAIN_CSV / 骨干路径 / CATA_* 写路径 / swanlab key 在流水线 yaml 的
   `manifest: |` env 块里；改这些值要**重新上传 yaml（新版本）**。
-- 启动后核对每个 pod 日志首行：`[kineager] ... nnodes=3 node_rank=0/1/2 nproc_per_node=4`；
-  若出现 `nnodes=1`、或 `nproc_per_node` 不等于 `pod_gpus`、或两个 pod 的
-  `node_rank` 相同，立刻停掉（否则各 pod 单机训练、互相覆盖产物）。
+- 启动后核对每个 pod 日志首行：
+  `[kineager] ... nnodes=<pod_nums> node_rank=... nproc_per_node=<pod_gpus>`
+  （当前 1×8 实跑：`nnodes=1 node_rank=0 nproc_per_node=8`）；与表单不符、或
+  多 pod 时出现相同 `node_rank`，立刻停掉（否则各 pod 单机训练、互相覆盖产物）。
 - **同一 `run_name` 只能有一个任务在写**。本部署的本地单卡 run 已停止，断点在
   epoch 2（best val 0.6705），提交后应从 `[RESUME] start_epoch=3` 继续。
+- **默认“训到手动停”**：wrapper 的 `-epochs` / `-es_patience` 默认都是 `100000`
+  ——早停实际关闭（日志里 `[EarlyStop] no_improve=x/100000` 属正常输出），想停
+  就在 KFP UI 里终止，之后重提从最近一个完成的 epoch 续跑（LR 会重新 warmup，
+  已知行为）。副产品：余弦 LR 按 10 万轮衰减（≈恒定在峰值附近）、resmask
+  droprate 的渐进也基本不涨；想要有界训练就 `EPOCHS=30 ES_PATIENCE=5` 覆盖。
 - 想先小规模验证路线：按 §6.2 的建议先 `pod_gpus=1` / `pod_nums=2` 跑一轮
   （记得换一个 `--run_name`，别和本部署的断点混写）。
 - 本路线**不需要重建镜像**：wrapper、launcher 与训练代码全部从 `/pfs` 共享盘读取
