@@ -15,13 +15,178 @@ appendix `docs/superpowers/plans/2026-10-13-kineager-pdbbind-affinity-rulings.md
 and the README section `README.md` → "PDBbind v2020 Protein-Ligand Affinity
 Training".
 
-Scope note: the §9 checklist (and the §2 probe checks) can only be done on the
-cluster — this branch was developed and tested on CPU only, with no GPU, no CUDA,
-no `esm` package, no network and no backbone weights. The shell surfaces
-(`bin/train/kineager_k8s.sh`, `bin/train/launch_kineager_affinity_k8s.sh`, the
-manifest's embedded `args[0]` block and the pipeline's embedded container
-command) have been parse-checked with `bash -n` (exit 0 each) and the two YAML
-deliverables with PyYAML; nothing has been executed against a cluster.
+状态（2026-10-15）：该分支已在集群（2×A800）上端到端跑通——探针、数据集构建、LoRA
+训练（含 EMA 验证）、每轮断点与续跑均已实测。**第 0 节是本部署的具体镜像与命令**
+（弹性流水线 KFP 路线的机制说明见 §6.2）；第 1~9 节保留为原始通用操作指南与验收清单。
+
+---
+
+## 0. 部署速查（本集群）
+
+`xinran_2026` 在 biomap 集群上的具体、已验证配置；第 1~9 节保留为通用操作指南。
+
+### 0.1 训练镜像
+
+```
+harbor.biomap-int.com/xinran_2026/kineager:affinity-v1
+digest sha256:73c485d81e021eac1faa267f2e1e27a13a165180179893c1a015dc945518674e   （构建于 2026-10-15）
+```
+
+基于本仓库的 `Dockerfile`、以 `xinran_2026/esmc20260915:v1` 为底构建：CUDA 12.6、
+torch 2.11+cu126、esm 3.4.1、transformers 4.57.6、peft、rdkit、swanlab 0.10.2、
+pytest；仓库代码烤在 `/workspace/kineager`。
+
+**什么时候需要重建（本部署约定）**：走 `/pfs` 路线的运行（§0.4 单机、§0.7 泛用
+流水线，`bash_command` 都是 `/pfs` 绝对路径）读取的是**共享盘上的仓库代码**——改
+脚本/训练代码/超参都**不需要重建镜像**；只有两种情形需要：① 新增 Python 依赖；
+② 改用镜像内的仓库副本运行（例如专用流水线的 `working_dir=/workspace/kineager`，
+此时要么重建，要么把它的 `working_dir` 同样指到 `/pfs` 路径）。重建命令：
+
+```bash
+cd /pfs_beijing/xinran_2026/project/affinity
+docker build --network host -t harbor.biomap-int.com/xinran_2026/kineager:affinity-v1 .
+docker push harbor.biomap-int.com/xinran_2026/kineager:affinity-v1
+```
+
+### 0.2 数据集
+
+`/pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv` —— 16,446 个复合物
+（15,536 主训练集 + 881 新增，剔除了一条混入的 CASF 泄漏样本 `3qgy`），列为
+`pdb_id,Sequence,Smiles,pKaffinity,affinity_type`。CASF-285 核心集已排除（外部测试集）。
+重建方法（在 `xinran-xtrimofold3-a800` 容器内执行；bio pickle 反序列化需要 protenix
+在 `sys.path` 上）：
+
+```bash
+/opt/miniconda3/envs/xtrimoengine/bin/python \
+  /pfs_beijing/xinran_2026/general_protein_dir/affinity_plm_runs/scripts/build_kineager_affinity_csv.py \
+  --split "/pfs_beijing/xinran_2026/general_protein_dir/affinity_plm_runs/splits/pdbbindv2020_train_covered_minus_val_add881.csv,/pfs_beijing/xinran_2026/general_protein_dir/affinity_plm_runs/splits/pdbbindv2020_val_covered.csv" \
+  --exclude-csv /pfs_beijing/xinran_2026/general_protein_dir/affinity_plm_runs/splits/casf2016_285_ids.csv \
+  --workers 32 \
+  --out /pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv
+```
+
+### 0.3 裸 PyTorchJob 路线（kubectl）
+
+```bash
+cd /pfs_beijing/xinran_2026/project/affinity
+bash bin/train/launch_kineager_affinity_k8s.sh              # 删旧 job -> apply -> 跟 rank-0 日志
+bash bin/train/launch_kineager_affinity_k8s.sh --dry-run    # 只打印将执行的 kubectl 命令
+```
+
+包装脚本会自动发现 rank-0 pod（裸 manifest 是 `*-master-0`；弹性流水线没有 master
+pod，是 `*-worker-0`），不需要手动指定。等价原生命令：
+
+```bash
+kubectl delete pytorchjob kineager-affinity 2>/dev/null     # 固定名字：不删旧的直接 apply 不会启动任何东西
+kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml
+kubectl get pytorchjob kineager-affinity -o wide
+kubectl logs -f kineager-affinity-master-0 -c pytorch
+```
+
+### 0.4 单机启动（一台机器，示例为双卡）
+
+```bash
+LOG_NAME="affinity_$(date +%Y%m%d_%H%M%S).log"
+NEW=/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs
+docker run -d --name kineager-affinity-local \
+  --gpus '"device=7,5"' --shm-size 16g \
+  -v /pfs_beijing/xinran_2026/project/affinity:/workspace/kineager \
+  -v /pfs_beijing/xinran_2026/models:/pfs_beijing/xinran_2026/models:ro \
+  -v /pfs_beijing/xinran_2026/kineager_data:/pfs_beijing/xinran_2026/kineager_data \
+  -v $NEW:$NEW \
+  -v /pfs_beijing/xinran_2026/project/affinity/run_logs:/run_logs \
+  -e LOG_NAME="$LOG_NAME" -e USER=xinran_2026 \
+  -e CATA_RUNS_DIR=$NEW -e CATA_WEIGHTS_DIR=$NEW -e CATA_TRAIN_DATA_DIR=$NEW \
+  -e TRAIN_CSV=/pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv \
+  -e KINEAGER_ESMC_PATH=/pfs_beijing/xinran_2026/models/ESMC-6B2026.9.15 \
+  -e KINEAGER_MOLFORMER_PATH=/pfs_beijing/xinran_2026/models/molformer/models--ibm-research--MoLFormer-XL-both-10pct/snapshots/7b12d946c181a37f6012b9dc3b002275de070314 \
+  -e NPROC_PER_NODE=2 -e NNODES=1 -e NODE_RANK=0 -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT=29517 \
+  -e NUM_WORKERS=4 -e OMP_NUM_THREADS=8 \
+  -e SWANLAB_API_KEY=<与流水线 yaml 里同一个 key> \
+  -w /workspace/kineager \
+  harbor.biomap-int.com/xinran_2026/kineager:affinity-v1 \
+  bash -lc 'python bin/train/prewarm_remote_code.py > /run_logs/${LOG_NAME} 2>&1 && bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 4 --split_mode group_pair --split_seed 42 --val_ratio 0.05 --test_ratio 0.01 --run_name affinity_local_v1 2>&1 | tee -a /run_logs/${LOG_NAME}'
+```
+
+说明：单卡用 `--gpus '"device=7"'` 和 `-e NPROC_PER_NODE=1`；`prewarm_remote_code.py`
+只在"同一容器内多 rank"时需要。选卡前先 `nvidia-smi`——rank 会和卡上其他任务分享算力。
+
+### 0.5 监控 / 停止 / 续跑
+
+```bash
+tail -f run_logs/<LOG_NAME>.log              # 单机后台运行的完整日志 tee 在这里
+docker logs -f kineager-affinity-local       # 或者用 docker 看
+docker stop kineager-affinity-local          # 停止（断点不受影响）
+kubectl delete pytorchjob kineager-affinity  # k8s 停止
+```
+
+续跑语义：每轮结束写 `predictor_checkpoint.pt`（模型 + 优化器 + scaler + EMA，约 27GB）。
+用**同样的命令**重跑（`--run_name` 与 `--split_seed` 不变）会打印
+`[RESUME] ... start_epoch=N+1` 并从下一轮继续；LR 调度器状态无法序列化，续跑后会重新
+warmup（已知）。第一轮完成前中断则退回 `predictor_best_ema.pt`（仅权重、优化器全新）。
+
+### 0.6 产物
+
+- run 目录 `/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/<run_name>/seed<seed>/`：
+  `predictor_checkpoint.pt`、`predictor_best_ema.pt`、`predictor_best_raw.pt`、
+  `train/val/test_set.csv`、`split_meta.json`、`metrics.json`
+- 每轮 `preds_epoch*.npy` / `labels_epoch*.npy` 在 `.../kineager_runs/` 下
+- 日志在 `project/affinity/run_logs/`
+- swanlab：项目 `enzyme-kinetics-cv`（key 在流水线/manifest 的环境变量里）
+
+当前训练配置：每卡 `-batch_size 4`、不做梯度累积（累积 + DDP 会触发
+`expect_autograd_hooks_` 断言与 epoch 边界卡死，诊断记录见
+`docs/grad_accumulation_ddp_diagnosis.md`）、`--val_ratio 0.05 --test_ratio 0.01`
+——PDBbind 的 test 切片只是占位，真正测试集是 CASF-285。
+
+### 0.7 弹性流水线路线（kineager-affinity-train，KFP UI）
+
+机制、参数含义、`logpath` 与 `LOG_PATH` 的区别见 §6.2；这里给**本部署当前提交的
+具体填法**（2026-10-15 实跑：1 pod × 8 卡；续跑本地单卡已完成的前两轮。换卡数
+只改本表参数，脚本不用动——`NPROC_PER_NODE` 由 wrapper 按容器内可见 GPU 数自动
+设定；例如用满 12 卡 = `pod_gpus=4` / `pod_nums=3` / `min=max=3`）：
+
+| 参数 | 本部署取值 |
+|---|---|
+| `pod_nums` | `1`（= NNODES；世界大小 = `pod_gpus` × `pod_nums`）|
+| `pod_gpus` | `8`（每个 pod 的 GPU 数）|
+| `min_replicas` / `max_replicas` | `1` / `1`（固定 = `pod_nums`，不要弹性）|
+| `cpu` / `memory` | `80` / `640Gi` |
+| `image` | `harbor.biomap-int.com/xinran_2026/kineager:affinity-v1` |
+| `working_dir` | `/pfs_beijing/xinran_2026/project/affinity`（专用流水线可用 `/workspace/kineager`）|
+| `bash_command` | 见下方代码块 |
+| `logpath` | `/pfs_beijing/xinran_2026/project/affinity/run_logs/affinity_k8s.log` |
+
+```bash
+bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.sh
+```
+
+这条一行脚本把本部署的 env 块、超参与 prewarm 全部封装在内（各项均可用环境变量
+覆盖，见脚本头部注释）；**泛用的 `xtfold3-train` 流水线同样用它**——把它填进
+`bash_command` 即可，拓扑解析由 launcher 兼容 `PET_*` / 裸名 / `RANK`。
+
+要点：
+
+- `pod_gpus > 1` 时每个 pod 有多 rank；`run_kineager_affinity.sh` 已包含 prewarm
+  （避免 HF 远程代码模块缓存竞争），`pod_gpus=1` 时它也基本零成本。
+- USER / TRAIN_CSV / 骨干路径 / CATA_* 写路径 / swanlab key 在流水线 yaml 的
+  `manifest: |` env 块里；改这些值要**重新上传 yaml（新版本）**。
+- 启动后核对每个 pod 日志首行：
+  `[kineager] ... nnodes=<pod_nums> node_rank=... nproc_per_node=<pod_gpus>`
+  （当前 1×8 实跑：`nnodes=1 node_rank=0 nproc_per_node=8`）；与表单不符、或
+  多 pod 时出现相同 `node_rank`，立刻停掉（否则各 pod 单机训练、互相覆盖产物）。
+- **同一 `run_name` 只能有一个任务在写**。本部署的本地单卡 run 已停止，断点在
+  epoch 2（best val 0.6705），提交后应从 `[RESUME] start_epoch=3` 继续。
+- **默认“训到手动停”**：wrapper 的 `-epochs` / `-es_patience` 默认都是 `100000`
+  ——早停实际关闭（日志里 `[EarlyStop] no_improve=x/100000` 属正常输出），想停
+  就在 KFP UI 里终止，之后重提从最近一个完成的 epoch 续跑（LR 会重新 warmup，
+  已知行为）。副产品：余弦 LR 按 10 万轮衰减（≈恒定在峰值附近）、resmask
+  droprate 的渐进也基本不涨；想要有界训练就 `EPOCHS=30 ES_PATIENCE=5` 覆盖。
+- 想先小规模验证路线：按 §6.2 的建议先 `pod_gpus=1` / `pod_nums=2` 跑一轮
+  （记得换一个 `--run_name`，别和本部署的断点混写）。
+- 本路线**不需要重建镜像**：wrapper、launcher 与训练代码全部从 `/pfs` 共享盘读取
+  （镜像只提供 Python 环境）；只有新增 pip 依赖、或改用镜像内仓库副本（在
+  `/workspace/kineager` 运行）时才需要重建。
 
 ---
 
@@ -517,6 +682,13 @@ notice — either every pod trains its own copy of the whole dataset into the sa
 `runs_dir`, or torchrun waits forever for ranks that never join. If you ever see
 `nnodes=1` in a pod's `[kineager]` line of a multi-pod run, this block is the
 first place to look.
+
+2026-10-15 的一次实跑里，弹性算子下发的 `PET_NNODES` 是**区间形式** `1:1`
+（torchrun 自己的 `MIN:MAX` 弹性语法）。launcher 现在会把 `MIN == MAX` 的区间
+收敛成固定值，并打印一行 `[kineager] NNODES=… (elastic range) -> fixed N`；
+开放区间（`MIN != MAX`）则直接报错拒绝——静态 rendezvous 撑不起弹性区间，乱猜
+一个数会让各 pod 单机训练、互相覆盖。本部署要求 `min_replicas == max_replicas
+== pod_nums`。
 
 ---
 

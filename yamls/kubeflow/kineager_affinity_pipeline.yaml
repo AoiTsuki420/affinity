@@ -159,7 +159,7 @@ spec:
                         - name: TASK
                           value: "affinity"
                         - name: EPOCHS
-                          value: "30"
+                          value: "100000"
                         - name: BATCH_SIZE
                           value: "4"
                         - name: ITERS_TO_ACCUMULATE
