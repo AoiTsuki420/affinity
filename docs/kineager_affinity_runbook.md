@@ -29,7 +29,7 @@ Training".
 
 ```
 harbor.biomap-int.com/xinran_2026/kineager:affinity-v1
-digest sha256:73c485d81e021eac1faa267f2e1e27a13a165180179893c1a015dc945518674e   （构建于 2026-10-15）
+digest sha256:ae8b50a2da4446a9cd5a49c35756e73397b4c8abee9672377d3bcdd0fa641aec   （重建于 2026-10-15，含 launcher 的 PET_* 拓扑解析与 LOG_PATH 单写者逻辑、prewarm 脚本）
 ```
 
 基于本仓库的 `Dockerfile`、以 `xinran_2026/esmc20260915:v1` 为底构建：CUDA 12.6、
@@ -149,14 +149,17 @@ warmup（已知）。第一轮完成前中断则退回 `predictor_best_ema.pt`�
 | `logpath` | `/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/kineager_affinity/rank0.log` |
 
 ```bash
-python bin/train/prewarm_remote_code.py && bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 4 --split_mode group_pair --split_seed 42 --val_ratio 0.05 --test_ratio 0.01 --run_name affinity_local_v1
+bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.sh
 ```
+
+这条一行脚本把本部署的 env 块、超参与 prewarm 全部封装在内（各项均可用环境变量
+覆盖，见脚本头部注释）；**泛用的 `xtfold3-train` 流水线同样用它**——把它填进
+`bash_command` 即可，拓扑解析由 launcher 兼容 `PET_*` / 裸名 / `RANK`。
 
 要点：
 
-- `pod_gpus > 1` 时每个 pod 有多 rank，命令里必须先跑
-  `python bin/train/prewarm_remote_code.py`（避免 HF 远程代码模块缓存竞争）；
-  `pod_gpus=1` 时可省。
+- `pod_gpus > 1` 时每个 pod 有多 rank；`run_kineager_affinity.sh` 已包含 prewarm
+  （避免 HF 远程代码模块缓存竞争），`pod_gpus=1` 时它也基本零成本。
 - USER / TRAIN_CSV / 骨干路径 / CATA_* 写路径 / swanlab key 在流水线 yaml 的
   `manifest: |` env 块里；改这些值要**重新上传 yaml（新版本）**。
 - 启动后核对每个 pod 日志首行：`[kineager] ... nnodes=2 node_rank=0/1`；
