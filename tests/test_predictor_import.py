@@ -196,6 +196,44 @@ def test_arg_parser_rejects_unknown_task():
         )
 
 
+def test_arg_parser_exposes_the_protaff_ranking_flags():
+    """ProtAff 的四个排序旋钮必须能从命令行传进来，且默认不改变今天的行为。
+
+    默认值本身就是契约：rank_weight 的默认 0.0 让 rank 项精确为 0，所以
+    min_gap / gap_weight / clamp 的默认值不影响任何现有命令；rank_pairs 的默认
+    必须与库默认（256）一致，否则 --affinity_rank_pairs 一被线程化，所有老命令
+    的抽样上限都会被静默改掉。
+    """
+    from main_train_predictor_multigpu import build_arg_parser
+
+    parser = build_arg_parser()
+    defaults = parser.parse_args(["-csv", "x.csv", "-esm", "a", "-molt5", "b"])
+    assert defaults.affinity_rank_weight == 0.0
+    assert defaults.affinity_rank_pairs == 256
+    assert defaults.affinity_rank_min_gap == 0.0
+    assert defaults.affinity_rank_gap_weight is False
+    assert defaults.affinity_rank_gap_clamp_lo == 0.1
+    assert defaults.affinity_rank_gap_clamp_hi == 5.0
+
+    explicit = parser.parse_args([
+        "-csv", "x.csv", "-esm", "a", "-molt5", "b",
+        "--affinity_rank_weight", "0.5",
+        "--affinity_rank_margin", "0.1",
+        "--affinity_rank_pairs", "8",
+        "--affinity_rank_min_gap", "1.0",
+        "--affinity_rank_gap_weight",
+        "--affinity_rank_gap_clamp_lo", "0.2",
+        "--affinity_rank_gap_clamp_hi", "3.0",
+    ])
+    assert explicit.affinity_rank_weight == 0.5
+    assert explicit.affinity_rank_margin == 0.1
+    assert explicit.affinity_rank_pairs == 8
+    assert explicit.affinity_rank_min_gap == 1.0
+    assert explicit.affinity_rank_gap_weight is True
+    assert explicit.affinity_rank_gap_clamp_lo == 0.2
+    assert explicit.affinity_rank_gap_clamp_hi == 3.0
+
+
 def test_compute_affinity_step_loss_is_finite():
     import torch
 
@@ -218,6 +256,62 @@ def test_compute_affinity_step_loss_is_finite():
     assert "total" in logs
     loss.backward()
     assert mu.grad is not None
+
+
+def test_compute_affinity_step_loss_threads_rank_pairs_and_the_gap_parameters():
+    """rank_pairs 必须真的从 args 走到 affinity_loss —— 旧代码把它丢在默认值上。
+
+    4 个标签两两相差 >= 1.0（标准化后是 [0,2,4,6]），天花板 n(n-1) = 12：
+      * affinity_rank_pairs=2 → 只有 2 对进入 rank 项，日志 rank_pairs == 2.0；
+      * args 里没有这个属性（getattr 回落到库默认 256）→ 12 对。
+    只把 rank_pairs 接到 CLI 而没接进 compute_affinity_step_loss 时，第二种情况
+    与第一种会给出同一个数，这条就红。
+    第三条断言要求 min_gap 也真的生效：标签全部落在 0.3 以内 → rank 项恰好 0。
+    """
+    from main_train_predictor_multigpu import compute_affinity_step_loss
+
+    class _RankArgs:
+        affinity_loss_type = "huber"
+        affinity_nll_weight = 0.0
+        affinity_rank_weight = 1.0
+        affinity_rank_margin = 0.0
+        affinity_rank_pairs = 2
+        affinity_rank_min_gap = 1.0
+        affinity_rank_gap_weight = True
+        affinity_rank_gap_clamp_lo = 0.1
+        affinity_rank_gap_clamp_hi = 5.0
+        affinity_var_reg_weight = 0.0
+        affinity_var_reg_mode = "abs"
+
+    class _LegacyArgs:
+        """新旋钮一个都没有：库默认必须让老命令的行为不变。"""
+
+        affinity_loss_type = "huber"
+        affinity_nll_weight = 0.05
+        affinity_rank_weight = 1.0
+        affinity_rank_margin = 0.0
+        affinity_var_reg_weight = 0.0
+        affinity_var_reg_mode = "abs"
+
+    mu = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    log_var = torch.zeros(4)
+    labels = torch.tensor([0.0, 2.0, 4.0, 6.0])
+
+    _, logs = compute_affinity_step_loss((mu, log_var), labels, _RankArgs(),
+                                        torch.device("cpu"))
+    assert float(logs["rank_pairs"]) == 2.0
+    assert float(logs["rank_gap_mean"]) >= 1.0
+
+    _, legacy_logs = compute_affinity_step_loss((mu, log_var), labels, _LegacyArgs(),
+                                                torch.device("cpu"))
+    assert float(legacy_logs["rank_pairs"]) == 12.0
+    assert float(legacy_logs["rank_gap_mean"]) > 0.0
+
+    close_labels = torch.tensor([0.0, 0.1, 0.2, 0.3])
+    _, close_logs = compute_affinity_step_loss((mu, log_var), close_labels, _RankArgs(),
+                                               torch.device("cpu"))
+    assert float(close_logs["rank"]) == 0.0
+    assert float(close_logs["rank_pairs"]) == 0.0
 
 
 def test_compute_affinity_metrics_scores_and_skips_non_finite_rows():
@@ -346,6 +440,62 @@ def test_train_epoch_affinity_routes_sub_losses_to_swanlab(monkeypatch):
 
     assert "affinity_total" in logged and "affinity_huber" in logged
     assert np.isfinite(logged["affinity_nll"])
+
+
+@pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
+def test_train_epoch_affinity_routes_rank_pair_diagnostics_to_swanlab(monkeypatch):
+    """rank_pairs / rank_gap_mean 必须一路走到 swanlab —— 这是本实验唯一的诊断。
+
+    _accumulate_affinity_loss_logs 逐 key 累加，所以这里验证的是整条链路：
+    affinity_loss → loss_logs → sink → affinity_<key>。样本 pK=[1,2,3,4] 经
+    AffinityScaler 标准化成 [-1.3416, -0.4472, 0.4472, 1.3416]：|Δ|>=1.0 的有序对
+    只有 6 个（相邻对的 0.894 被 δ_min 剔除），一个 batch（4 样本）就是 6 对，
+    所以 affinity_rank_pairs 必须精确等于 6.0。δ_min 没接上时会变成 12.0，
+    n_valid 相关的天花板/抽样出错时会是别的值。
+    """
+    import pathlib
+    import shutil
+
+    from data_affinity import AffinityDataset
+    from main_train_predictor_multigpu import train_epoch
+    from torch.utils.data import DataLoader
+
+    import main_train_predictor_multigpu as training
+
+    scaler, frame, _ = _affinity_batch()
+    loader = DataLoader(AffinityDataset(frame, label_col="pKaffinity", scaler=scaler),
+                        batch_size=4, shuffle=False)
+    logged = {}
+    monkeypatch.setattr(training.swanlab, "log", lambda payload: logged.update(payload))
+
+    class _RankingArgs(_AffinityArgs):
+        affinity_rank_weight = 1.0
+        affinity_rank_margin = 0.5
+        affinity_rank_pairs = 256
+        affinity_rank_min_gap = 1.0
+        affinity_rank_gap_weight = True
+        affinity_rank_gap_clamp_lo = 0.1
+        affinity_rank_gap_clamp_hi = 5.0
+
+    class _NoOpEMA:
+        def update(self, module):
+            return None
+
+    scratch = pathlib.Path("_scratch_rank_pair_logs")
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setitem(training.RUNTIME_PATHS, "train_data_dir", scratch)
+    try:
+        model = _VaryingAffinity()
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        train_epoch(model, loader, optimizer, None, _NoOpScaler(), _NoOpEMA(),
+                    0, _RankingArgs(), None, None, 0)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    assert logged["affinity_rank_pairs"] == pytest.approx(6.0)
+    assert logged["affinity_rank_gap_mean"] >= 1.0
+    # margin=0.5 且模型把顺序预测对了 → 每对都是 relu(0.5 - 间隔) > 0。
+    assert logged["affinity_rank"] > 0.0
 
 
 def test_compute_affinity_metrics_ignores_non_finite_sigma():

@@ -1085,12 +1085,21 @@ def compute_affinity_step_loss(model_out, labels, args, device):
         log_var = log_var.squeeze(-1)
 
     y = labels.reshape(-1).to(device=device, dtype=torch.float32)
+    # ProtAff 的排序项旋钮全部走 getattr(...)：args 里没有这些属性时（旧脚本、
+    # 单测里的假 args）回落到库默认值，行为与改动前一致。
     return affinity_loss(
         mu, log_var, y,
         loss_type=str(getattr(args, "affinity_loss_type", "huber")),
         nll_weight=float(getattr(args, "affinity_nll_weight", 0.05)),
         rank_weight=float(getattr(args, "affinity_rank_weight", 0.0)),
         rank_margin=float(getattr(args, "affinity_rank_margin", 0.0)),
+        rank_pairs=int(getattr(args, "affinity_rank_pairs", 256)),
+        rank_min_gap=float(getattr(args, "affinity_rank_min_gap", 0.0)),
+        rank_gap_weight=bool(getattr(args, "affinity_rank_gap_weight", False)),
+        rank_gap_clamp=(
+            float(getattr(args, "affinity_rank_gap_clamp_lo", 0.1)),
+            float(getattr(args, "affinity_rank_gap_clamp_hi", 5.0)),
+        ),
         var_reg_weight=float(getattr(args, "affinity_var_reg_weight", 0.0)),
         var_reg_mode=str(getattr(args, "affinity_var_reg_mode", "abs")),
     )
@@ -2771,6 +2780,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--affinity_nll_weight", type=float, default=0.05)
     p.add_argument("--affinity_rank_weight", type=float, default=0.0)
     p.add_argument("--affinity_rank_margin", type=float, default=0.0)
+    # ProtAff（bioRxiv 2026, doi 10.64898/2026.06.13.732058）的 margin-ranking 旋钮。
+    # 默认值刻意"什么都不做"：rank_weight=0 时 rank 项精确为 0，所以老命令逐位不变。
+    # 注意标签是**标准化后**的（AffinityScaler 用训练集 pKaffinity 的均值/std），
+    # δ_min 的单位是"训练集标准差"：要复现论文的 10 倍 K_D 差，传 1.0 / scaler.scale_
+    # （见 run_dir/scaler_affinity.json），而不是直接传 1.0。
+    p.add_argument("--affinity_rank_pairs", type=int, default=256,
+                   help="每个 microbatch 最多抽多少个有序 pair；硬上限是 "
+                        "n_valid*(n_valid-1)（batch_size=4 → 12），所以 batch 太小时"
+                        "排序项几乎没有信号，实际生效的对数看日志 affinity_rank_pairs")
+    p.add_argument("--affinity_rank_min_gap", type=float, default=0.0,
+                   help="ProtAff 的 δ_min：只保留 |Δy| >= δ_min 的 pair（标准化标签"
+                        "单位）。0.0=不过滤（旧行为）；论文取 1.0")
+    p.add_argument("--affinity_rank_gap_weight", action="store_true", default=False,
+                   help="ProtAff 的 gap 加权变体：每对按 clamp(|Δy|, lo, hi) 加权")
+    p.add_argument("--affinity_rank_gap_clamp_lo", type=float, default=0.1,
+                   help="gap 权重下界（ProtAff 取 0.1）")
+    p.add_argument("--affinity_rank_gap_clamp_hi", type=float, default=5.0,
+                   help="gap 权重上界（ProtAff 取 5.0；标准化标签下几乎不触发）")
     p.add_argument("--affinity_var_reg_weight", type=float, default=0.0)
     p.add_argument("--affinity_var_reg_mode", type=str, default="abs",
                    choices=["abs", "ratio"])
