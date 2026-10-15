@@ -1074,6 +1074,64 @@ def compute_multihead_loss(model_out, labels, criterion):
     return loss, loss_detail
 
 
+class AffinityLabelScaleUnavailable(RuntimeError):
+    """δ_min 以 log10(K) 声明，但缺少 AffinityScaler.scale_，无法换算成标签的 z 单位。
+
+    见 resolve_affinity_rank_min_gap：拿不到 scale_ 时**不能猜**——按字面 1.0 用会
+    静默放宽（只有 scale=1 时 1 个标准差才等于 10 倍 K_D），按典型值 1.7 猜会静默
+    收紧 5 倍。两种都会让排序项长期贴近 0，把一次 4-GPU 实验误读成"排序没用"。
+    """
+
+
+_MISSING_LABEL_SCALE_REMEDY = (
+    "Δ_min 需要一个 AffinityScaler.scale_ 才能从 log10(K) 换成标准化标签的单位："
+    "请确认 args.affinity_label_scale 已经被赋值（main() 的 --task affinity 分支里，"
+    "拟合完 scaler 后立刻 args.affinity_label_scale = float(kscaler.scale_)），"
+    "或者用 --affinity_rank_min_gap_units z 直接把 Δ_min 声明成标签单位。"
+)
+
+
+def resolve_affinity_rank_min_gap(args) -> float:
+    """把 CLI 的 δ_min 换算成**标签所在单位**（这里是 AffinityScaler 的 z 单位）。
+
+    R74：``--affinity_rank_min_gap`` 以 log10(K) 计（ProtAff 的口径：1.0 = 10 倍
+    K_D 差），而 affinity_loss 收到的是标准化标签。缺了这一步换算，"10 倍"会变成
+    "≈1.7 个标准差（约 50 倍）"：过滤过严 → 有效 pair 很少 → rank 项接近 0 → 一次
+    4-GPU 实验被报成"排序没有帮助"。所以这里必须拿到 scale_；拿不到就抛
+    AffinityLabelScaleUnavailable，绝不退化成按字面值使用。
+
+    ``--affinity_rank_min_gap_units z`` 是逃生口：δ_min 直接按标签单位给，跳过换算
+    （也不需要 scale_）。δ_min=0（不过滤）在任何单位下都是 0，同样不需要 scale_，
+    因此老命令与"只开 ranking 不设间隔"的用法完全不受影响。
+    """
+    gap = float(getattr(args, "affinity_rank_min_gap", 0.0))
+    units = str(getattr(args, "affinity_rank_min_gap_units", "log10"))
+    if units not in ("log10", "z"):
+        raise ValueError(
+            f"未知的 affinity_rank_min_gap_units: {units!r}（支持 log10 / z）"
+        )
+    if gap <= 0.0 or units == "z":
+        return gap
+    scale = getattr(args, "affinity_label_scale", None)
+    if scale is None:
+        raise AffinityLabelScaleUnavailable(
+            f"affinity_rank_min_gap={gap} 是 log10(K) 单位，但 args 上没有 "
+            f"affinity_label_scale。" + _MISSING_LABEL_SCALE_REMEDY
+        )
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError) as exc:
+        raise AffinityLabelScaleUnavailable(
+            f"affinity_label_scale={scale!r} 不是数字。" + _MISSING_LABEL_SCALE_REMEDY
+        ) from exc
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise AffinityLabelScaleUnavailable(
+            f"affinity_label_scale={scale!r} 不是正的有限值（除以它会得到 NaN/Inf，"
+            f"过滤会静默失效）。" + _MISSING_LABEL_SCALE_REMEDY
+        )
+    return gap / scale
+
+
 def compute_affinity_step_loss(model_out, labels, args, device):
     """affinity 通路的单任务损失。model_out = (mu, log_var)，labels = (B,)。"""
     from models.affinity_loss import affinity_loss
@@ -1087,6 +1145,8 @@ def compute_affinity_step_loss(model_out, labels, args, device):
     y = labels.reshape(-1).to(device=device, dtype=torch.float32)
     # ProtAff 的排序项旋钮全部走 getattr(...)：args 里没有这些属性时（旧脚本、
     # 单测里的假 args）回落到库默认值，行为与改动前一致。
+    # δ_min：CLI 以 log10(K) 计，调用点换算成标签的 z 单位；缺 scale_ 会抛
+    # AffinityLabelScaleUnavailable（见 resolve_affinity_rank_min_gap）。
     return affinity_loss(
         mu, log_var, y,
         loss_type=str(getattr(args, "affinity_loss_type", "huber")),
@@ -1094,7 +1154,7 @@ def compute_affinity_step_loss(model_out, labels, args, device):
         rank_weight=float(getattr(args, "affinity_rank_weight", 0.0)),
         rank_margin=float(getattr(args, "affinity_rank_margin", 0.0)),
         rank_pairs=int(getattr(args, "affinity_rank_pairs", 256)),
-        rank_min_gap=float(getattr(args, "affinity_rank_min_gap", 0.0)),
+        rank_min_gap=resolve_affinity_rank_min_gap(args),
         rank_gap_weight=bool(getattr(args, "affinity_rank_gap_weight", False)),
         rank_gap_clamp=(
             float(getattr(args, "affinity_rank_gap_clamp_lo", 0.1)),
@@ -2790,14 +2850,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "n_valid*(n_valid-1)（batch_size=4 → 12），所以 batch 太小时"
                         "排序项几乎没有信号，实际生效的对数看日志 affinity_rank_pairs")
     p.add_argument("--affinity_rank_min_gap", type=float, default=0.0,
-                   help="ProtAff 的 δ_min：只保留 |Δy| >= δ_min 的 pair（标准化标签"
-                        "单位）。0.0=不过滤（旧行为）；论文取 1.0")
+                   help="ProtAff 的 δ_min，单位 **log10(K)**：1.0 = 10 倍 K_D 差"
+                        "（论文取值）。0.0=不过滤（旧行为）。内部用 AffinityScaler."
+                        "scale_ 换算成标准化标签的单位；拿不到 scale_ 会直接报错，"
+                        "绝不按字面值静默使用")
+    p.add_argument("--affinity_rank_min_gap_units", type=str, default="log10",
+                   choices=["log10", "z"],
+                   help="δ_min 的单位：log10=log10(K)，ProtAff 的口径（默认）；"
+                        "z=直接按标准化标签的单位给（逃生口，跳过 scaler 换算，"
+                        "也不需要 scale_）")
     p.add_argument("--affinity_rank_gap_weight", action="store_true", default=False,
                    help="ProtAff 的 gap 加权变体：每对按 clamp(|Δy|, lo, hi) 加权")
     p.add_argument("--affinity_rank_gap_clamp_lo", type=float, default=0.1,
-                   help="gap 权重下界（ProtAff 取 0.1）")
+                   help="gap 权重下界（ProtAff 取 0.1；作用在标准化标签的 |Δy| 上）")
     p.add_argument("--affinity_rank_gap_clamp_hi", type=float, default=5.0,
-                   help="gap 权重上界（ProtAff 取 5.0；标准化标签下几乎不触发）")
+                   help="gap 权重上界（ProtAff 取 5.0；作用在标准化标签的 |Δy| 上，"
+                        "≈8 个 log 单位，实际几乎不触发）")
     p.add_argument("--affinity_var_reg_weight", type=float, default=0.0)
     p.add_argument("--affinity_var_reg_mode", type=str, default="abs",
                    choices=["abs", "ratio"])
@@ -2973,8 +3041,14 @@ def main():
     if args.task == "affinity":
         kscaler = AffinityScaler()
         kscaler.fit(train_df[args.affinity_label_col].to_numpy())
+        # R74：δ_min 以 log10(K) 传入，compute_affinity_step_loss 必须用这个 scale_
+        # 把它换成标签的 z 单位。标度就挂在 args 上（同一个 args 一路传到 train_step /
+        # val_epoch），由 resolve_affinity_rank_min_gap 读取；缺了它那边会报错而不是猜。
+        args.affinity_label_scale = float(kscaler.scale_)
         if is_main_process():
             kscaler.save(os.path.join(run_dir, "scaler_affinity.json"))
+            print(f"[AFFINITY] label scale (pKaffinity std) = {kscaler.scale_:.6f}; "
+                  f"--affinity_rank_min_gap is read in log10(K) and divided by it")
 
         def _make_affinity_dataset(frame):
             return AffinityDataset(

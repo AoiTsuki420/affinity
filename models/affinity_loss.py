@@ -10,9 +10,12 @@ doi 10.64898/2026.06.13.732058）的 margin-ranking 配方：**最小间隔** δ
 可选变体（权重 clamp 到 [0.1, 5.0]）。论文用 δ_min=1.0（10 倍 K_D 差）、
 margin=0.1、gap 加权。
 
-注意：进入本函数的 y 是 **标准化后** 的标签（data_affinity.AffinityScaler 用训练集
-的 pKaffinity 均值/标准差做 z-score），所以 δ_min 的单位是"训练集标准差"，不是
-log10(K)。要复现论文的"10 倍 K_D"，应传 1.0 / scaler.scale_。
+注意：本函数的 ``rank_min_gap`` 与 ``y`` **同单位**。本仓库里 y 是 AffinityScaler
+标准化后的 z 值，而 CLI 的 ``--affinity_rank_min_gap`` 以 **log10(K)** 计（ProtAff 的
+口径，1.0 = 10 倍 K_D 差）。换算在调用点完成：
+``main_train_predictor_multigpu.resolve_affinity_rank_min_gap()`` 除以 scaler.scale_；
+拿不到 scale_ 时**报错，不按字面值猜**——猜错会让过滤过严、rank 项长期贴近 0，把一次
+4-GPU 实验误读成"排序没用"。实际生效的 δ_min 会以 ``rank_min_gap_z`` 写进日志。
 """
 from __future__ import annotations
 
@@ -199,20 +202,25 @@ def affinity_loss(
     """返回 (总损失, 分项日志)。所有分项均为标量张量，便于直接写日志。
 
     rank 项（默认关闭）：
-      * ``rank_min_gap``（ProtAff 的 δ_min，论文取 1.0）：只保留
-        ``|Δy| >= rank_min_gap`` 的 pair；``0.0`` 表示不过滤（只排除零间隔对），
-        与旧行为一致。
+      * ``rank_min_gap``（ProtAff 的 δ_min）：只保留 ``|Δy| >= rank_min_gap`` 的
+        pair；``0.0`` 表示不过滤（只排除零间隔对），与旧行为一致。**单位与 ``y``
+        相同**（本仓库是标准化标签的 z 单位）；CLI 的 log10(K) → z 换算在调用点做，
+        见模块 docstring。
       * ``rank_gap_weight``：为真时每个 pair 按 ``clamp(|Δy|, lo, hi)`` 加权，
         归一化用 Σw（加权平均，不是加权求和），所以量级不随 pair 数漂移。
-      * ``rank_gap_clamp``：加权变体的 clamp 上下界（ProtAff 取 (0.1, 5.0)）。
+      * ``rank_gap_clamp``：加权变体的 clamp 上下界（ProtAff 取 (0.1, 5.0)，
+        作用在与 ``y`` 同单位的 |Δy| 上）。
     无论哪条路径，``rank_weight=0.0`` 都让 rank 项精确为 0。
 
-    另返回两个诊断项（与 rank 项同生命周期，未启用时为 0）：
+    另返回三个诊断项（与 rank 项同生命周期）：
       * ``rank_pairs``：真正进入 rank 项的 pair 数。上限是 microbatch 内的
         ``n_valid*(n_valid-1)``，所以它把"batch 太小 → 排序项没信号"这件事直接
         摆到 swanlab 上。
       * ``rank_gap_mean``：这些 pair 的 |Δy| 均值，用来看间隔过滤是否真的在选
         有意义的分隔，而不是被近邻对淹没。
+      * ``rank_min_gap_z``：**实际生效**的 δ_min（与 ``y`` 同单位）。ranking 开着时
+        即使一对都没留下也照实记录（那正是需要看清 δ 的时候）；ranking 关掉时没有
+        过滤器，记 0.0。运维靠它确认 CLI 的 log10 值被换算成了什么。
     """
     if loss_type not in ("huber", "barron"):
         raise ValueError(f"未知 loss_type: {loss_type!r}（支持 huber / barron）")
@@ -220,6 +228,9 @@ def affinity_loss(
         raise ValueError(f"未知 var_reg_mode: {var_reg_mode!r}（支持 abs / ratio）")
     min_gap, gap_clamp = _validate_rank_gap_params(rank_min_gap, rank_gap_clamp)
     rank_weight = float(rank_weight)
+    # 生效中的 δ_min（与 y 同单位）；ranking 关掉 ⇒ 没有过滤器 ⇒ 0.0。
+    min_gap_z = torch.as_tensor(
+        min_gap if rank_weight > 0.0 else 0.0, device=mu.device, dtype=torch.float32)
 
     mu = torch.nan_to_num(mu.float(), nan=0.0, posinf=1e4, neginf=-1e4)
     log_var = torch.nan_to_num(
@@ -241,6 +252,7 @@ def affinity_loss(
         )
         logs.update({"huber": zero, "barron": zero, "rank": zero,
                      "rank_pairs": zero, "rank_gap_mean": zero,
+                     "rank_min_gap_z": min_gap_z,
                      "var_reg": zero, "nll": zero, "total": zero})
         return zero, logs
 
@@ -299,6 +311,7 @@ def affinity_loss(
     logs["rank"] = rank.detach()
     logs["rank_pairs"] = rank_pairs_log
     logs["rank_gap_mean"] = rank_gap_mean_log
+    logs["rank_min_gap_z"] = min_gap_z
 
     var_reg = torch.zeros((), device=device, dtype=mu.dtype)
     if var_reg_weight > 0.0 and n_valid >= 2:

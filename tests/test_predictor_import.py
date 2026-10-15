@@ -214,6 +214,9 @@ def test_arg_parser_exposes_the_protaff_ranking_flags():
     assert defaults.affinity_rank_gap_weight is False
     assert defaults.affinity_rank_gap_clamp_lo == 0.1
     assert defaults.affinity_rank_gap_clamp_hi == 5.0
+    # R74：δ_min 的**默认**单位必须是 log10(K)——ProtAff 的口径，也是人从论文里读到
+    # 的那个 1.0；z 只是逃生口。
+    assert defaults.affinity_rank_min_gap_units == "log10"
 
     explicit = parser.parse_args([
         "-csv", "x.csv", "-esm", "a", "-molt5", "b",
@@ -232,6 +235,18 @@ def test_arg_parser_exposes_the_protaff_ranking_flags():
     assert explicit.affinity_rank_gap_weight is True
     assert explicit.affinity_rank_gap_clamp_lo == 0.2
     assert explicit.affinity_rank_gap_clamp_hi == 3.0
+
+    z_units = parser.parse_args([
+        "-csv", "x.csv", "-esm", "a", "-molt5", "b",
+        "--affinity_rank_min_gap", "0.5",
+        "--affinity_rank_min_gap_units", "z",
+    ])
+    assert z_units.affinity_rank_min_gap_units == "z"
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "-csv", "x.csv", "-esm", "a", "-molt5", "b",
+            "--affinity_rank_min_gap_units", "banana",
+        ])
 
 
 def test_compute_affinity_step_loss_is_finite():
@@ -267,6 +282,9 @@ def test_compute_affinity_step_loss_threads_rank_pairs_and_the_gap_parameters():
     只把 rank_pairs 接到 CLI 而没接进 compute_affinity_step_loss 时，第二种情况
     与第一种会给出同一个数，这条就红。
     第三条断言要求 min_gap 也真的生效：标签全部落在 0.3 以内 → rank 项恰好 0。
+
+    这里刻意用 units="z"：本测试问的是"参数有没有被线程化"，δ_min 的单位换算由
+    下面三条 R74 测试单独负责。
     """
     from main_train_predictor_multigpu import compute_affinity_step_loss
 
@@ -277,6 +295,7 @@ def test_compute_affinity_step_loss_threads_rank_pairs_and_the_gap_parameters():
         affinity_rank_margin = 0.0
         affinity_rank_pairs = 2
         affinity_rank_min_gap = 1.0
+        affinity_rank_min_gap_units = "z"
         affinity_rank_gap_weight = True
         affinity_rank_gap_clamp_lo = 0.1
         affinity_rank_gap_clamp_hi = 5.0
@@ -312,6 +331,142 @@ def test_compute_affinity_step_loss_threads_rank_pairs_and_the_gap_parameters():
                                                torch.device("cpu"))
     assert float(close_logs["rank"]) == 0.0
     assert float(close_logs["rank_pairs"]) == 0.0
+
+
+def test_affinity_rank_min_gap_log10_is_converted_with_the_scaler_scale():
+    """R74：`--affinity_rank_min_gap` 以 log10(K) 计，调用点必须除以 scaler.scale_。
+
+    同一个 δ_min=1.0（= 10 倍 K_D）在三个 scale 下必须给出三种不同的过滤：
+      * scale=2.0 → δ_z = 0.5，标签 [0, 0.6, 3.0] 的三对全合格 → 6 个有序对
+      * scale=0.4 → δ_z = 2.5，只剩 |Δy|=3 那对 → 2 个有序对
+      * 完全不换算（δ_z=1.0）会得到 4 个有序对
+    三个结果互不相等，所以"除没除"和"除以谁"都跑不掉；rank_min_gap_z 再从数值上
+    把换算结果单独钉一遍（0.5 / 2.5）。
+    """
+    from main_train_predictor_multigpu import (compute_affinity_step_loss,
+                                              resolve_affinity_rank_min_gap)
+
+    class _Args:
+        affinity_loss_type = "huber"
+        affinity_nll_weight = 0.0
+        affinity_rank_weight = 1.0
+        affinity_rank_margin = 0.0
+        affinity_rank_pairs = 256
+        affinity_rank_min_gap = 1.0          # log10(K)：10 倍 K_D 差
+        affinity_rank_gap_weight = False
+        affinity_var_reg_weight = 0.0
+        affinity_var_reg_mode = "abs"
+
+    class _Scale2(_Args):
+        affinity_label_scale = 2.0
+
+    class _Scale04(_Args):
+        affinity_label_scale = 0.4
+
+    class _NoConversion(_Args):
+        affinity_label_scale = 1.0
+
+    assert resolve_affinity_rank_min_gap(_Scale2()) == pytest.approx(0.5)
+    assert resolve_affinity_rank_min_gap(_Scale04()) == pytest.approx(2.5)
+
+    mu = torch.tensor([0.0, 0.0, 0.0])
+    log_var = torch.zeros(3)
+    labels = torch.tensor([0.0, 0.6, 3.0])
+
+    _, logs_scale2 = compute_affinity_step_loss((mu, log_var), labels, _Scale2(),
+                                                torch.device("cpu"))
+    _, logs_scale04 = compute_affinity_step_loss((mu, log_var), labels, _Scale04(),
+                                                 torch.device("cpu"))
+    _, logs_literal = compute_affinity_step_loss((mu, log_var), labels, _NoConversion(),
+                                                 torch.device("cpu"))
+
+    assert float(logs_scale2["rank_pairs"]) == 6.0
+    assert float(logs_scale04["rank_pairs"]) == 2.0
+    assert float(logs_literal["rank_pairs"]) == 4.0
+    assert float(logs_scale2["rank_min_gap_z"]) == pytest.approx(0.5)
+    assert float(logs_scale04["rank_min_gap_z"]) == pytest.approx(2.5)
+
+
+def test_affinity_rank_min_gap_z_units_escape_hatch_skips_the_conversion():
+    """逃生口：units="z" 直接按标签单位用 δ_min，不需要也不读 scaler.scale_。
+
+    没有 scale_ 属性也必须能跑——"精确控制 z 单位"就是这个用途；标签 [0,1,4] 上
+    δ_z=1.0 恰好落在边界，按"低于 δ 才排除"保留 → 6 个有序对（写成严格 > 会得到 4）。
+    """
+    from main_train_predictor_multigpu import (compute_affinity_step_loss,
+                                              resolve_affinity_rank_min_gap)
+
+    class _ZArgs:
+        affinity_loss_type = "huber"
+        affinity_nll_weight = 0.0
+        affinity_rank_weight = 1.0
+        affinity_rank_margin = 0.0
+        affinity_rank_pairs = 256
+        affinity_rank_min_gap = 1.0
+        affinity_rank_min_gap_units = "z"
+        affinity_var_reg_weight = 0.0
+        affinity_var_reg_mode = "abs"
+        # affinity_label_scale 故意不存在
+
+    assert resolve_affinity_rank_min_gap(_ZArgs()) == pytest.approx(1.0)
+
+    mu = torch.tensor([0.0, 0.0, 0.0])
+    log_var = torch.zeros(3)
+    labels = torch.tensor([0.0, 1.0, 4.0])
+    _, logs = compute_affinity_step_loss((mu, log_var), labels, _ZArgs(),
+                                         torch.device("cpu"))
+    assert float(logs["rank_pairs"]) == 6.0
+    assert float(logs["rank_min_gap_z"]) == pytest.approx(1.0)
+
+
+def test_affinity_rank_min_gap_in_log10_without_the_scaler_raises_a_named_error():
+    """R74 的核心：缺 scale_ 时**宁可报错也不猜**，并在消息里给出补救方式。
+
+    猜字面值 1.0 会静默放宽（1 个标准差 ≈ 10 倍 K_D 只在 scale=1 时成立），猜 1.7
+    会静默收紧 5 倍。两种都会把 4-GPU 结果误读成"排序没用"，所以必须是具名错误。
+    """
+    from main_train_predictor_multigpu import (AffinityLabelScaleUnavailable,
+                                              compute_affinity_step_loss,
+                                              resolve_affinity_rank_min_gap)
+
+    class _NoScale:
+        affinity_rank_min_gap = 1.0          # log10：10 倍 K_D
+        # affinity_label_scale / affinity_rank_min_gap_units 都不存在 → 默认 log10
+
+    with pytest.raises(AffinityLabelScaleUnavailable) as excinfo:
+        resolve_affinity_rank_min_gap(_NoScale())
+    message = str(excinfo.value)
+    # 消息必须说清"缺什么"和"怎么补"，否则运维只能猜。
+    assert "affinity_label_scale" in message
+    assert "affinity_rank_min_gap_units" in message
+
+    mu = torch.tensor([0.0, 0.6, 3.0])
+    log_var = torch.zeros(3)
+    with pytest.raises(AffinityLabelScaleUnavailable):
+        compute_affinity_step_loss((mu, log_var), mu, _NoScale(), torch.device("cpu"))
+
+    # 非正 / 非有限的 scale 一样不能用（除以 0 或 NaN 会静默毁掉过滤）。
+    class _ZeroScale(_NoScale):
+        affinity_label_scale = 0.0
+
+    class _NaNScale(_NoScale):
+        affinity_label_scale = float("nan")
+
+    with pytest.raises(AffinityLabelScaleUnavailable):
+        resolve_affinity_rank_min_gap(_ZeroScale())
+    with pytest.raises(AffinityLabelScaleUnavailable):
+        resolve_affinity_rank_min_gap(_NaNScale())
+
+    # δ_min=0（不过滤）与 units="z" 都不需要 scale：老命令与逃生口不受影响。
+    class _NoGap:
+        affinity_rank_min_gap = 0.0
+
+    assert resolve_affinity_rank_min_gap(_NoGap()) == 0.0
+
+    class _LegacyNoAttrs:
+        pass
+
+    assert resolve_affinity_rank_min_gap(_LegacyNoAttrs()) == 0.0
 
 
 def test_compute_affinity_metrics_scores_and_skips_non_finite_rows():
@@ -380,7 +535,8 @@ def test_train_step_affinity_reports_sub_losses_to_the_sink():
                       args=_AffinityArgs(), loss_log_sink=sink)
 
     assert np.isfinite(float(loss))
-    for key in ("huber", "barron", "nll", "rank", "var_reg", "total"):
+    for key in ("huber", "barron", "nll", "rank", "var_reg", "total",
+                "rank_pairs", "rank_gap_mean", "rank_min_gap_z"):
         assert key in sink, f"affinity 分项 {key} 没有进入日志 sink"
         assert np.isfinite(sink[key])
 
@@ -448,14 +604,15 @@ def test_train_epoch_affinity_routes_sub_losses_to_swanlab(monkeypatch):
 
 @pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
 def test_train_epoch_affinity_routes_rank_pair_diagnostics_to_swanlab(monkeypatch):
-    """rank_pairs / rank_gap_mean 必须一路走到 swanlab —— 这是本实验唯一的诊断。
+    """rank_pairs / rank_gap_mean / rank_min_gap_z 必须一路走到 swanlab。
 
     _accumulate_affinity_loss_logs 逐 key 累加，所以这里验证的是整条链路：
     affinity_loss → loss_logs → sink → affinity_<key>。样本 pK=[1,2,3,4] 经
-    AffinityScaler 标准化成 [-1.3416, -0.4472, 0.4472, 1.3416]：|Δ|>=1.0 的有序对
-    只有 6 个（相邻对的 0.894 被 δ_min 剔除），一个 batch（4 样本）就是 6 对，
-    所以 affinity_rank_pairs 必须精确等于 6.0。δ_min 没接上时会变成 12.0，
-    n_valid 相关的天花板/抽样出错时会是别的值。
+    AffinityScaler 标准化成 [-1.3416, -0.4472, 0.4472, 1.3416]，相邻对的 |Δy| 是
+    0.8944、跳一个的是 1.7889、跳两个的是 2.6833。--affinity_rank_min_gap 1.5 是
+    **log10** 单位，除以真实的 scaler.scale_（≈1.118）得 δ_z ≈ 1.3416：相邻对被剔除、
+    另两档保留 → 恰好 6 个有序对。若 δ_min 被当成 z 单位直接使用（1.5），只剩跳两个
+    的 2 对；若完全不生效，则是 12 对。affinity_rank_min_gap_z 同时验证换算结果本身。
     """
     import pathlib
     import shutil
@@ -476,7 +633,9 @@ def test_train_epoch_affinity_routes_rank_pair_diagnostics_to_swanlab(monkeypatc
         affinity_rank_weight = 1.0
         affinity_rank_margin = 0.5
         affinity_rank_pairs = 256
-        affinity_rank_min_gap = 1.0
+        affinity_rank_min_gap = 1.5          # log10(K)：≈32 倍 K_D 差
+        affinity_rank_min_gap_units = "log10"
+        affinity_label_scale = float(scaler.scale_)
         affinity_rank_gap_weight = True
         affinity_rank_gap_clamp_lo = 0.1
         affinity_rank_gap_clamp_hi = 5.0
@@ -498,6 +657,11 @@ def test_train_epoch_affinity_routes_rank_pair_diagnostics_to_swanlab(monkeypatc
 
     assert logged["affinity_rank_pairs"] == pytest.approx(6.0)
     assert logged["affinity_rank_gap_mean"] >= 1.0
+    # R74：留在日志里的 δ_min 必须是**换算后**的 z 值（1.5 log10 ÷ scale），
+    # 而不是 CLI 上的 1.5 —— 运维据此判断过滤器到底有多严。
+    assert logged["affinity_rank_min_gap_z"] == pytest.approx(1.5 / float(scaler.scale_),
+                                                              rel=1e-5)
+    assert logged["affinity_rank_min_gap_z"] != pytest.approx(1.5, rel=1e-2)
     # margin=0.5 且模型把顺序预测对了 → 每对都是 relu(0.5 - 间隔) > 0。
     assert logged["affinity_rank"] > 0.0
 

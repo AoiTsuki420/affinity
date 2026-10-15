@@ -585,6 +585,39 @@ def test_invalid_rank_gap_parameters_are_refused():
         affinity_loss(mu, log_var, y, rank_weight=1.0, rank_min_gap=-1.0)
 
 
+def test_rank_min_gap_in_force_is_logged_in_label_units():
+    """生效的 δ_min 必须出现在日志里，而且是**损失实际使用的标签单位**（z 单位）。
+
+    只看 affinity_rank_pairs 分不清"是 δ 太大"还是"这个 batch 全是近邻对"；
+    rank_min_gap_z 把"当前按哪个间隔在过滤"直接摆出来。三条语义：
+    - rank 开着且一对都没留下时**照实记 δ**（那正是最需要看到 δ 的时候，记 0 会掩盖
+      真正的原因）；
+    - rank 关掉时没有过滤器 → 0.0；
+    - 早退路径（没有有效标签）也必须带这个键，否则 sink 的 key 集合会漂。
+    """
+    mu, log_var, y = _pair_inputs([0.0, 0.4, 0.9, 0.2], [1.0, -1.0, 1.0, -1.0])
+
+    _, logs_degenerate = affinity_loss(mu, log_var, y, rank_weight=1.0,
+                                       rank_min_gap=1.0, rank_pairs=256)
+    assert float(logs_degenerate["rank_pairs"]) == 0.0
+    assert torch.is_tensor(logs_degenerate["rank_min_gap_z"])
+    assert logs_degenerate["rank_min_gap_z"].ndim == 0
+    assert logs_degenerate["rank_min_gap_z"].dtype == torch.float32
+    assert abs(float(logs_degenerate["rank_min_gap_z"]) - 1.0) < 1e-6
+
+    _, logs_off = affinity_loss(mu, log_var, y, rank_weight=0.0, rank_min_gap=1.0)
+    assert float(logs_off["rank_min_gap_z"]) == 0.0
+    assert float(logs_off["rank_pairs"]) == 0.0
+
+    _, logs_default = affinity_loss(mu, log_var, y)
+    assert float(logs_default["rank_min_gap_z"]) == 0.0
+
+    nan_labels = torch.full((4,), float("nan"), dtype=torch.float32)
+    _, logs_none = affinity_loss(mu, log_var, nan_labels, rank_weight=1.0,
+                                 rank_min_gap=0.588)
+    assert abs(float(logs_none["rank_min_gap_z"]) - 0.588) < 1e-6
+
+
 def test_protaff_preset_constants_are_the_paper_values_and_usable_as_arguments():
     """论文取值只写一处：δ_min=1.0、gap clamp=(0.1, 5.0)。
 
