@@ -54,9 +54,11 @@ spec:
   pytorchReplicaSpecs:
     Master:
       replicas: 1
-      # OnFailure as in the reference; use Never if you would rather fail fast
-      # than let a rank restart into a rendezvous the other ranks already left.
-      restartPolicy: OnFailure
+      # Never: for multi-pod runs a restarted pod would re-join a rendezvous the
+      # surviving ranks have already left (or duplicate a rank). We fail the
+      # whole job and re-apply instead - every epoch writes a full checkpoint,
+      # so the rerun resumes where it stopped.
+      restartPolicy: Never
       template: &pytorch-template
         metadata:
           annotations:
@@ -141,6 +143,16 @@ spec:
                 # preds_epoch*/labels_epoch*.npy overwrite each other.
                 - name: USER
                   value: "xinran_2026"
+                # ---- write-path relocation -----------------------------------
+                # kineager_runs moved under general_protein_dir; without these
+                # overrides path_config would fall back to the default
+                # /pfs_beijing/${USER}/kineager_runs.
+                - name: CATA_RUNS_DIR
+                  value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
+                - name: CATA_WEIGHTS_DIR
+                  value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
+                - name: CATA_TRAIN_DATA_DIR
+                  value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
                 # ---- inputs required by bin/train/kineager_k8s.sh --------------
                 - name: TRAIN_CSV
                   value: "/pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv"
@@ -149,7 +161,7 @@ spec:
                 - name: KINEAGER_MOLFORMER_PATH
                   value: "/pfs_beijing/xinran_2026/models/molformer/models--ibm-research--MoLFormer-XL-both-10pct/snapshots/7b12d946c181a37f6012b9dc3b002275de070314"
                 - name: LOG_PATH
-                  value: "/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log"
+                  value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/kineager_affinity/rank0.log"
                 # Only consulted when the operator does not inject PET_NNODES.
                 - name: NNODES
                   value: "2"
@@ -171,7 +183,7 @@ spec:
                 - name: EPOCHS
                   value: "30"
                 - name: BATCH_SIZE
-                  value: "8"
+                  value: "4"
                 - name: ITERS_TO_ACCUMULATE
                   value: "1"
                 - name: NUM_WORKERS
@@ -230,5 +242,6 @@ spec:
                 sizeLimit: "64Gi"
     Worker:
       replicas: 1
-      restartPolicy: OnFailure
+      # Never, same reasoning as the Master above.
+      restartPolicy: Never
       template: *pytorch-template

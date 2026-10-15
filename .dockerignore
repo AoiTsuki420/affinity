@@ -3,6 +3,8 @@
 *.pyc
 .pytest_cache
 runs/
+run_logs/
+swanlog/
 outputs/
 wandb/
 *.pt

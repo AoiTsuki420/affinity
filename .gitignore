@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 wandb/
 runs/
+run_logs/
+swanlog/
 result/
 results/
 checkpoints/
