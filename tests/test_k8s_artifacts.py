@@ -68,8 +68,12 @@ REQUIREMENTS = REPO_ROOT / "requirements.txt"
 # 问题（同一段文本以文件形式交给同一个 bash 返回 0）。测试必须与解释器的调用方式无关，
 # 所以下面所有 bash 调用统一走「写文件 + bash -n <file>」，容器里的 `bash -lc` 也是从
 # 文件读脚本的。
-def _run_bash_syntax_check(script):
+def _run_bash_syntax_check(script, *, syntax_only=True):
     """把 `script` 写成 LF 文件、跑 `bash -n <file>`，返回 CompletedProcess。
+
+    `syntax_only=False` 时**真正执行**脚本（去掉 `-n`）——`bash -n` 只做词法/语法
+    分析，从不运行正文，所以拿它去取脚本的输出永远得到空 stdout。词数探测需要执行，
+    语法检查需要不执行，两者共用这里的落盘与清理逻辑，靠这个开关区分。
 
     文件写在仓库根目录（本机 pytest 的 tmp_path 不可用），文件名带 pid 以免并发运行
     互踩；无论成败都在 finally 里删掉。
@@ -78,7 +82,7 @@ def _run_bash_syntax_check(script):
     （`D:\\...`）对 Git bash 没问题，但对 WSL 转发器是另一套命名空间，而相对路径两种
     解释器都按同一个 cwd 解析。
     """
-    probe = REPO_ROOT / f".bash_syntax_probe_{os.getpid()}.sh"
+    probe = REPO_ROOT / f".bash_probe_{os.getpid()}.sh"
     try:
         # newline="\n" 是显式要求：CRLF 会让 bash 报 `$'do\r'` 之类的语法错，那是文件
         # 换行的问题、不是被检查脚本的问题（`.gitattributes` 钉住 eol=lf 也是为此）。
@@ -86,16 +90,20 @@ def _run_bash_syntax_check(script):
         raw = probe.read_bytes()
         assert b"\r" not in raw, f"探测文件必须只有 LF，实际含 CR: {probe.name}"
         assert not raw.startswith(b"\xef\xbb\xbf"), "探测文件不能有 BOM"
-        return subprocess.run([BASH, "-n", probe.name], capture_output=True, text=True,
-                              cwd=str(REPO_ROOT))
+        argv = [BASH, "-n", probe.name] if syntax_only else [BASH, probe.name]
+        return subprocess.run(argv, capture_output=True, text=True, cwd=str(REPO_ROOT))
     finally:
         probe.unlink(missing_ok=True)
 
 
 def _bash_word_count(argument):
-    """`set -- <argument>; echo $#` 的词数（同样走文件，不走 stdin）。"""
+    """`set -- <argument>; echo $#` 的词数（同样走文件，不走 stdin）。
+
+    必须**执行**（`syntax_only=False`）：这条断言的意义是「去掉引号就会被 word-splitting
+    拆成多个词」，只有真跑一遍才观测得到。
+    """
     probe = f"set -- {argument}\nprintf '%s\\n' \"$#\"\n"
-    result = _run_bash_syntax_check(probe)
+    result = _run_bash_syntax_check(probe, syntax_only=False)
     assert result.returncode == 0, f"词数探测脚本执行失败: {result.stderr}"
     return result.stdout.strip()
 
