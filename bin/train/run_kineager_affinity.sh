@@ -15,8 +15,12 @@
 # `[kineager] ... nnodes=... node_rank=...` line to confirm the world size
 # (nnodes must equal pod_nums; each pod must report a different node_rank).
 #
-# The world size is NPROC_PER_NODE x pod_nums: NPROC_PER_NODE must match the
-# pipeline's pod_gpus (8 here; set NPROC_PER_NODE=1 for a pod_gpus=1 run).
+# The world size is NPROC_PER_NODE x pod_nums. NPROC_PER_NODE is auto-detected
+# by default from the GPUs visible inside this container - K8s mounts exactly
+# the pod_gpus GPUs it allocated, so it always matches the form's pod_gpus
+# (8, 4, 6, ...); no script edit is needed when the GPU count changes. Export
+# NPROC_PER_NODE to pin it explicitly - on the shared local node always run
+# with `NPROC_PER_NODE=1 bash ...` because the whole node's GPUs are visible.
 #
 # Every value below can be overridden by exporting it before this script runs.
 set -euo pipefail
@@ -24,7 +28,16 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 RUNS_DIR=/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs
 
-export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+# One process per GPU: default to the GPU count visible in this container
+# (== pod_gpus in the submission form); an explicit NPROC_PER_NODE wins.
+if [ -z "${NPROC_PER_NODE:-}" ]; then
+    NPROC_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || true)
+    if [ "${NPROC_PER_NODE}" -lt 1 ]; then
+        echo "cannot detect a GPU count via nvidia-smi; set NPROC_PER_NODE explicitly (= pod_gpus)" >&2
+        exit 1
+    fi
+fi
+export NPROC_PER_NODE
 export USER="${USER:-xinran_2026}"
 export CATA_RUNS_DIR="${CATA_RUNS_DIR:-$RUNS_DIR}"
 export CATA_WEIGHTS_DIR="${CATA_WEIGHTS_DIR:-$RUNS_DIR}"

@@ -140,18 +140,20 @@ warmup（已知）。第一轮完成前中断则退回 `predictor_best_ema.pt`�
 
 ### 0.7 弹性流水线路线（kineager-affinity-train，KFP UI）
 
-机制、参数含义、`logpath` 与 `LOG_PATH` 的区别见 §6.2；这里只给**本部署第一次提交的
-具体填法**（16 卡 = 2 pod × 8 GPU；续跑本地单卡已完成的前两轮）：
+机制、参数含义、`logpath` 与 `LOG_PATH` 的区别见 §6.2；这里给**本部署当前提交的
+具体填法**（12 卡 = 3 pod × 4 GPU；续跑本地单卡已完成的前两轮。换卡数只改本表
+参数，脚本不用动——`NPROC_PER_NODE` 由 wrapper 按容器内可见 GPU 数自动设定）：
 
 | 参数 | 本部署取值 |
 |---|---|
-| `pod_nums` | `2`（= NNODES；世界大小 = `pod_gpus` × `pod_nums`）|
-| `pod_gpus` | `8`（流水线据此注入 `PET_NPROC_PER_NODE=8`，世界大小 = 16）|
-| `cpu` / `memory` | `80` / `640Gi` |
+| `pod_nums` | `3`（= NNODES；世界大小 = `pod_gpus` × `pod_nums` = 12）|
+| `pod_gpus` | `4`（每个 pod 的 GPU 数）|
+| `min_replicas` / `max_replicas` | `3` / `3`（固定 = `pod_nums`，不要弹性）|
+| `cpu` / `memory` | `40` / `320Gi`（按每卡比例；节点宽松时也可沿用 `80/640Gi`）|
 | `image` | `harbor.biomap-int.com/xinran_2026/kineager:affinity-v1` |
-| `working_dir` | `/workspace/kineager` |
+| `working_dir` | `/pfs_beijing/xinran_2026/project/affinity`（专用流水线可用 `/workspace/kineager`）|
 | `bash_command` | 见下方代码块 |
-| `logpath` | `/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/kineager_affinity/rank0.log` |
+| `logpath` | `/pfs_beijing/xinran_2026/project/affinity/run_logs/affinity_k8s.log` |
 
 ```bash
 bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.sh
@@ -167,8 +169,9 @@ bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.s
   （避免 HF 远程代码模块缓存竞争），`pod_gpus=1` 时它也基本零成本。
 - USER / TRAIN_CSV / 骨干路径 / CATA_* 写路径 / swanlab key 在流水线 yaml 的
   `manifest: |` env 块里；改这些值要**重新上传 yaml（新版本）**。
-- 启动后核对每个 pod 日志首行：`[kineager] ... nnodes=2 node_rank=0/1`；
-  若出现 `nnodes=1` 立刻停掉（否则各 pod 单机训练、互相覆盖产物）。
+- 启动后核对每个 pod 日志首行：`[kineager] ... nnodes=3 node_rank=0/1/2 nproc_per_node=4`；
+  若出现 `nnodes=1`、或 `nproc_per_node` 不等于 `pod_gpus`、或两个 pod 的
+  `node_rank` 相同，立刻停掉（否则各 pod 单机训练、互相覆盖产物）。
 - **同一 `run_name` 只能有一个任务在写**。本部署的本地单卡 run 已停止，断点在
   epoch 2（best val 0.6705），提交后应从 `[RESUME] start_epoch=3` 继续。
 - 想先小规模验证路线：按 §6.2 的建议先 `pod_gpus=1` / `pod_nums=2` 跑一轮
