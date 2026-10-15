@@ -29,13 +29,18 @@ Training".
 
 ```
 harbor.biomap-int.com/xinran_2026/kineager:affinity-v1
-digest sha256:ae8b50a2da4446a9cd5a49c35756e73397b4c8abee9672377d3bcdd0fa641aec   （重建于 2026-10-15，含 launcher 的 PET_* 拓扑解析与 LOG_PATH 单写者逻辑、prewarm 脚本）
+digest sha256:73c485d81e021eac1faa267f2e1e27a13a165180179893c1a015dc945518674e   （构建于 2026-10-15）
 ```
 
 基于本仓库的 `Dockerfile`、以 `xinran_2026/esmc20260915:v1` 为底构建：CUDA 12.6、
 torch 2.11+cu126、esm 3.4.1、transformers 4.57.6、peft、rdkit、swanlab 0.10.2、
-pytest；仓库代码烤在 `/workspace/kineager`（弹性流水线的 `working_dir` 用它）。
-**改动 `bin/train/` 或训练代码后必须重建镜像**（流水线容器里的 launcher 来自镜像副本）：
+pytest；仓库代码烤在 `/workspace/kineager`。
+
+**什么时候需要重建（本部署约定）**：走 `/pfs` 路线的运行（§0.4 单机、§0.7 泛用
+流水线，`bash_command` 都是 `/pfs` 绝对路径）读取的是**共享盘上的仓库代码**——改
+脚本/训练代码/超参都**不需要重建镜像**；只有两种情形需要：① 新增 Python 依赖；
+② 改用镜像内的仓库副本运行（例如专用流水线的 `working_dir=/workspace/kineager`，
+此时要么重建，要么把它的 `working_dir` 同样指到 `/pfs` 路径）。重建命令：
 
 ```bash
 cd /pfs_beijing/xinran_2026/project/affinity
@@ -168,6 +173,9 @@ bash /pfs_beijing/xinran_2026/project/affinity/bin/train/run_kineager_affinity.s
   epoch 2（best val 0.6705），提交后应从 `[RESUME] start_epoch=3` 继续。
 - 想先小规模验证路线：按 §6.2 的建议先 `pod_gpus=1` / `pod_nums=2` 跑一轮
   （记得换一个 `--run_name`，别和本部署的断点混写）。
+- 本路线**不需要重建镜像**：wrapper、launcher 与训练代码全部从 `/pfs` 共享盘读取
+  （镜像只提供 Python 环境）；只有新增 pip 依赖、或改用镜像内仓库副本（在
+  `/workspace/kineager` 运行）时才需要重建。
 
 ---
 
