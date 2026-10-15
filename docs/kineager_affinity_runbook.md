@@ -135,7 +135,8 @@ warmup（已知）。第一轮完成前中断则退回 `predictor_best_ema.pt`�
 - swanlab：项目 `enzyme-kinetics-cv`（key 在流水线/manifest 的环境变量里）
 
 当前训练配置：每卡 `-batch_size 4`、不做梯度累积（累积 + DDP 会触发
-`expect_autograd_hooks_` 断言与 epoch 边界卡死）、`--val_ratio 0.05 --test_ratio 0.01`
+`expect_autograd_hooks_` 断言与 epoch 边界卡死，诊断记录见
+`docs/grad_accumulation_ddp_diagnosis.md`）、`--val_ratio 0.05 --test_ratio 0.01`
 ——PDBbind 的 test 切片只是占位，真正测试集是 CASF-285。
 
 ### 0.7 弹性流水线路线（kineager-affinity-train，KFP UI）
