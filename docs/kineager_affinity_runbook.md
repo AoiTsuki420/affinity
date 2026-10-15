@@ -3,7 +3,10 @@
 Operator runbook for the `--task affinity` path added by the
 `feat/pdbbind-affinity` branch: single-task regression over `-log10(Kd/Ki/IC50)`
 with **ESMC-6B + MoLFormer** backbones under last-30-layer LoRA, one GPU per pod,
-launched on Kubeflow through `yamls/kubeflow/kineager_affinity_k8s.yaml`.
+launched on Kubeflow either as a bare PyTorchJob
+(`yamls/kubeflow/kineager_affinity_k8s.yaml`, §6.1) or through Kubeflow
+Pipelines with the elastic, Worker-only pipeline
+(`yamls/kubeflow/kineager_affinity_pipeline.yaml`, §6.2).
 
 Companion documents: the design spec
 `docs/superpowers/specs/2026-10-13-kineager-pdbbind-affinity-design.md`, the plan
@@ -14,9 +17,11 @@ Training".
 
 Scope note: the §9 checklist (and the §2 probe checks) can only be done on the
 cluster — this branch was developed and tested on CPU only, with no GPU, no CUDA,
-no `esm` package, no network and no backbone weights. The two shell surfaces
-(`bin/train/kineager_k8s.sh` and the manifest's embedded `args[0]` block) have
-been parse-checked with `bash -n` (exit 0 each); nothing has been executed.
+no `esm` package, no network and no backbone weights. The shell surfaces
+(`bin/train/kineager_k8s.sh`, `bin/train/launch_kineager_affinity_k8s.sh`, the
+manifest's embedded `args[0]` block and the pipeline's embedded container
+command) have been parse-checked with `bash -n` (exit 0 each) and the two YAML
+deliverables with PyYAML; nothing has been executed against a cluster.
 
 ---
 
@@ -297,6 +302,24 @@ differently — a mismatch shows up as a pod stuck `Pending`.
 
 ## 6. Launch
 
+There are **two** launchers for the same training run, and the launcher script
+(`bin/train/kineager_k8s.sh`) is deliberately identical for both: it resolves the
+topology from `PET_*` first, then the bare names, then `RANK`/`WORLD_SIZE`, then
+its own defaults (§6.4), so a pod cannot end up on the wrong world size just
+because a different orchestrator started it.
+
+| | bare PyTorchJob (§6.1) | Kubeflow Pipelines (§6.2) |
+|---|---|---|
+| Manifest | `yamls/kubeflow/kineager_affinity_k8s.yaml` | `yamls/kubeflow/kineager_affinity_pipeline.yaml` |
+| Topology | Master + Worker, `Worker.replicas + 1` = `NNODES` | elastic, Worker-only, `pod_nums` = `NNODES` |
+| Rank 0 | `kineager-affinity-master-0` | `kineager-affinity-<run>-worker-0` |
+| How to start | `kubectl apply -f …`, or the wrapper | upload once in the UI, then **Create run** |
+| Values live in | the manifest's `env:` block (edit the file) | the run's parameter form (no file edit) |
+| Job object after the run | survives (TTL 6000 s) | deleted ~30 s after it finishes |
+| Prefer it when | you are iterating on the container image / env / mounts, you want `kubectl describe`, or Argo/KFP is not usable | you want to re-launch with different parameters, keep a history of runs, or hand the run to someone else |
+
+### 6.1 The bare PyTorchJob (`kubectl apply`)
+
 ```bash
 kubectl apply -f yamls/kubeflow/kineager_affinity_k8s.yaml
 kubectl get pytorchjob kineager-affinity -o wide
@@ -309,7 +332,7 @@ topology and then `exec`s `torch.distributed.run` with
 `--nproc_per_node=1` (one GPU per pod), so the workers' own logs carry their
 rank and the master's log is the one that is also appended to `LOG_PATH`.
 
-### The re-run footgun
+#### The re-run footgun
 
 `metadata.name` is fixed at `kineager-affinity`, `cleanPodPolicy: None` keeps the
 pods after the job finishes, and `ttlSecondsAfterFinished: 6000` deletes the job
@@ -327,11 +350,120 @@ with edited values) modifies the same job object. Never start two at once — gi
 one of them its own namespace, or edit `metadata.name` and the two
 `kubectl … kineager-affinity` commands above together.
 
-### Standalone launcher (no Kubeflow)
+### 6.2 The Kubeflow Pipelines route (elastic, Worker-only)
 
-Useful for a 2-GPU smoke on one host. `USER` is required here too, and the
-launcher defaults `CATA_PROFILE` to `k8s`. Export the values first, so that
-`$USER` in `TRAIN_CSV` expands to the username you just set:
+`yamls/kubeflow/kineager_affinity_pipeline.yaml` is a KFP v1 pipeline whose single
+`resource: create` template submits a PyTorchJob. It is a **copy in the shape of
+the pipeline already running on this cluster** (`xtfold3-train`, from
+`xtrimofold3-affinity-plm`), deliberately: that file is proof of the schema the
+cluster's KFP accepts.
+
+**Upload it once.** Kubeflow Pipelines UI → **Pipelines** → **Upload pipeline** →
+**Upload a file** → pick `yamls/kubeflow/kineager_affinity_pipeline.yaml`. The
+pipeline is named `kineager-affinity-train`; the annotations
+(`pipelines.kubeflow.org/pipeline_spec` et al.) are what the UI reads to build the
+parameter form. Uploading again with the same name creates a **new version** of
+the pipeline — that is the normal way to pick up a change to the file.
+
+**Then** **Create run** and fill in the eight parameters:
+
+| Parameter | Recommended first value | Why |
+|---|---|---|
+| `pod_nums` | `2` | the number of worker pods **and** the world size: `minReplicas == maxReplicas == pod_nums == NNODES`. One GPU per pod, so 2 pods = 2 GPUs. Raise it only after a 2-pod run is green |
+| `pod_gpus` | `1` | one GPU per pod; the launcher sets `NPROC_PER_NODE` to 1 (`PET_NPROC_PER_NODE` is injected from this), and `nproc_per_node × pod_nums` is the world size |
+| `cpu` | `16` | matches the bare manifest's per-pod request |
+| `memory` | `200Gi` | matches the bare manifest |
+| `image` | `harbor.biomap-int.com/xinran_2026/kineager:affinity-v1` | the same image the bare manifest uses |
+| `working_dir` | `/workspace/kineager` | repo root inside that image (the container runs `bash bin/train/kineager_k8s.sh` relative to it) |
+| `bash_command` | `bash bin/train/kineager_k8s.sh -epochs 30 -batch_size 4 --split_mode group_pair --split_seed 42` | the launcher takes the training hyperparameters through `"$@"`; **do not** put a shell redirect (`>> log 2>&1`) here — the pipeline's container command already appends to `logpath` on rank 0 only |
+| `logpath` | `/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/kineager_affinity/rank0.log` | rank 0's append target, on storage **every pod can write**. Must be non-empty and free of spaces/quotes: it is substituted into a double-quoted shell string, and an empty value stops the container with a named error |
+
+`pod_nums` is the only parameter that changes the topology. Keep
+`minReplicas == maxReplicas == pod_nums`: if the elastic bounds are allowed to
+differ, the operator can run fewer replicas than the `NNODES` the launcher
+validates, and torchrun then waits forever for a rank that never exists. That is
+a hang, not an error message — which is why the pipeline exposes one number
+instead of two.
+
+#### How `logpath` and `LOG_PATH` interact
+
+There are two different "log files", and they are not the same thing:
+
+* **`logpath` (a pipeline parameter, required).** The container command is:
+
+  ```bash
+  if [ "${NODE_RANK:-0}" -eq 0 ]; then
+    <bash_command> >> "<logpath>" 2>&1
+  else
+    <bash_command>
+  fi
+  ```
+
+  So **only rank 0** appends to that file; the other ranks stay on their own pod
+  stdout. This is what stops N pods from interleaving into one unreadable file.
+  The gate lives in the pipeline's container command (not in the launcher) because
+  it has to wrap the whole command; the launcher implements the same gate for
+  `LOG_PATH` (§6.4), so the two agree.
+* **`LOG_PATH` (an env var in the embedded job's `env:` block, empty by default).**
+  After the gate above, the container runs `bash bin/train/kineager_k8s.sh …`,
+  and that script independently checks `LOG_PATH`: **if it is set, rank 0 appends
+  there too and the other ranks do not.** Two consequences:
+
+  * with the shipped default (`LOG_PATH: ""`), rank 0's output lands in `logpath`
+    and each rank's output is *also* in its own `kubectl logs`;
+  * if you set `LOG_PATH` as well, rank 0's stream goes to **both** files. Set it
+    only if some other tooling expects that exact path; otherwise leave it empty
+    so there is exactly one rank-0 file.
+
+  The path itself is the one thing `logpath` cannot express: `LOG_PATH` is for
+  tooling that reads a fixed location, `logpath` is the per-run parameter.
+
+To edit `LOG_PATH`, `USER`, `TRAIN_CSV`, the backbone paths, the hyperparameter
+env vars, or the swanlab key, edit the `env:` block inside this file's
+`manifest: |` and re-upload (new pipeline version). A run's parameter form cannot
+reach them.
+
+#### Finding the pods and the logs
+
+There is **no master pod** in this topology. Do not look for
+`kineager-affinity-master-0`; the elastic job's pods are named
+`kineager-affinity-<something>-worker-<N>`, and the `<something>` is generated:
+
+```bash
+# which pods exist (label set by the training-operator - works for both topologies)
+kubectl get pods -l training.kubeflow.org/job-name=kineager-affinity -o wide
+
+# rank 0's stdout (the pod whose name ends in -worker-0, or in -master-0 for §6.1)
+kubectl logs -f kineager-affinity-<run>-worker-0 -c pytorch
+
+# rank 1 and up (useful to check that each pod reports a different node_rank)
+kubectl logs kineager-affinity-<run>-worker-1 -c pytorch | head -5
+
+# the rank-0 log file, independent of which pod got rank 0
+tail -f /pfs_beijing/xinran_2026/general_protein_dir/kineager_runs/kineager_affinity/rank0.log
+```
+
+`bin/train/launch_kineager_affinity_k8s.sh` does this discovery for you when it
+follows the log (`-l training.kubeflow.org/job-name=…`, preferring a `master` pod
+when one exists and falling back to `worker-0`), so it works for both topologies;
+it only applies the bare manifest, so use it for §6.1.
+
+Two operational consequences of the embedded `runPolicy`, kept as-is from the
+cluster's pipeline for fidelity:
+
+* `cleanPodPolicy: Running` — the pods are deleted as soon as the job leaves
+  `Running`, so **a pod log is gone once the job finishes**. Copy what you need
+  while it runs, or rely on `logpath` / `LOG_PATH`.
+* `ttlSecondsAfterFinished: 30` — the **PyTorchJob object** is deleted ~30 s after
+  the job finishes, so `kubectl describe pytorchjob` / `kubectl get pytorchjob -o
+  yaml` post-mortems are impossible. Raise the TTL in the embedded manifest if you
+  want them. Only rank 0's log file survives a successful run.
+
+### 6.3 What both routes share
+
+`USER` is required in both, and the launcher defaults `CATA_PROFILE` to `k8s`.
+Export the values first, so that `$USER` in `TRAIN_CSV` expands to the username
+you just set:
 
 ```bash
 export CATA_PROFILE=k8s
@@ -345,10 +477,11 @@ NNODES=2 NODE_RANK=0 MASTER_ADDR=<master-ip> MASTER_PORT=29517 \
     --task affinity
 ```
 
-Use `MASTER_PORT=29517` rather than `29300`, which was recorded as occupied on
-the reference cluster. `29500` is the launcher's own default; in the Kubeflow
-route the training-operator derives the rendezvous port from the container port
-named `pytorchjob-port`, and the manifest's comment says to keep the two in sync.
+(That standalone form is useful for a 2-GPU smoke on one host.) Use
+`MASTER_PORT=29517` rather than `29300`, which was recorded as occupied on the
+reference cluster. `29500` is the launcher's own default; in the Kubeflow route
+the training-operator derives the rendezvous port from the container port named
+`pytorchjob-port`, and the manifest's comment says to keep the two in sync.
 
 Two option notes for the training side:
 
@@ -363,6 +496,27 @@ Two option notes for the training side:
   affinity path's `(mu, log_sigma2)` output; the trainer now raises a named error
   up front instead of failing mid-scan. Scan the LR on a kinetics run, or add a
   dedicated range test for the affinity criterion if you need one.
+
+### 6.4 Which topology variable wins
+
+`bin/train/kineager_k8s.sh` resolves all five topology inputs before validating
+anything, in this order — first match wins:
+
+| Variable | Resolution order |
+|---|---|
+| `NNODES` | `PET_NNODES` → `NNODES` → `WORLD_SIZE` → `1` |
+| `NODE_RANK` | `PET_NODE_RANK` → `NODE_RANK` → `RANK` → `0` |
+| `NPROC_PER_NODE` | `PET_NPROC_PER_NODE` → `NPROC_PER_NODE` → `1` |
+| `MASTER_PORT` | `PET_MASTER_PORT` → `MASTER_PORT` → `29500` |
+| `MASTER_ADDR` | `PET_MASTER_ADDR` → `MASTER_ADDR` → (empty; required only when `NNODES > 1`) |
+
+The `PET_` names come first because the elastic Worker-only pipeline injects
+**only** those (plus `RANK`/`WORLD_SIZE`): with the bare names alone, every pod
+would resolve `NNODES=1, NODE_RANK=0`, and that is not an error the run can
+notice — either every pod trains its own copy of the whole dataset into the same
+`runs_dir`, or torchrun waits forever for ranks that never join. If you ever see
+`nnodes=1` in a pod's `[kineager]` line of a multi-pod run, this block is the
+first place to look.
 
 ---
 

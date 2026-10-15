@@ -1,0 +1,245 @@
+# KinEAGER PDBbind-v2020 affinity training - Kubeflow Pipelines v1 (compiled
+# style), elastic Worker-only PyTorchJob.
+#
+# Upload this file in the Kubeflow Pipelines UI: Pipelines -> Upload pipeline ->
+# Upload a file -> pick this YAML. It is an argoproj.io/v1alpha1 Workflow with
+# the `pipelines.kubeflow.org/*` annotations the KFP v1 UI reads, laid out
+# exactly like the working pipeline from this cluster
+# (xtrimofold3-affinity-plm/yamls/kubeflow/xf3_pl_multitask_k8s.yaml): one
+# `resource: create` template with the PyTorchJob embedded as a string and every
+# variable flowing in through {{inputs.parameters.*}}.
+#
+# Operator notes (fuller version: docs/kineager_affinity_runbook.md section 4):
+#
+#   * elastic, Worker-only. There is no Master replica, so no pod is named
+#     `...-master-0` and the topology arrives as PET_NNODES / PET_NODE_RANK
+#     (plus RANK / WORLD_SIZE). bin/train/kineager_k8s.sh resolves exactly that
+#     order, which is what makes this pipeline and the bare PyTorchJob
+#     (yamls/kubeflow/kineager_affinity_k8s.yaml) interchangeable.
+#   * minReplicas == maxReplicas == pod_nums. See the comment on the manifest
+#     below: a replica count that drifts away from the NNODES the launcher
+#     validates is a silent hang, not an error.
+#   * only rank 0 appends to the `logpath` parameter; every pod writes to its own
+#     stdout either way. Set LOG_PATH (env, below) as well if you want rank 0's
+#     stream in a file on shared storage - it is the only artifact that outlives
+#     `ttlSecondsAfterFinished: 30`.
+#   * imagePullPolicy: Always, the securityContext (privileged: false +
+#     IPC_LOCK), the resource limits, the 40Gi memory /dev/shm emptyDir, the
+#     `gpu.device: a100` nodeSelector and the three `role` tolerations (mpu,
+#     m1b, NBTopic) are carried over verbatim from the pipeline that is already
+#     running on this cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: kineager-affinity-train-
+  annotations: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.14, pipelines.kubeflow.org/pipeline_compilation_time: '2026-10-13T00:00:00',
+    pipelines.kubeflow.org/pipeline_spec: '{"description": "KinEAGER PDBbind-v2020 affinity training (elastic, Worker-only PyTorchJob).", "inputs": [{"name": "bash_command"}, {"name": "logpath"}, {"name": "memory"}, {"name": "cpu"}, {"name": "pod_gpus"}, {"name": "image"}, {"name": "pod_nums"}, {"name": "working_dir"}], "name": "kineager-affinity-train"}'}
+  labels: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.14}
+spec:
+  entrypoint: kineager-affinity-train
+  templates:
+  - name: kineager-affinity-train
+    resource:
+      action: create
+      # Worker-only topology: there is no Master replicaStatuses entry to wait on.
+      # successCondition is therefore satisfied by the single Worker replica
+      # finishing; failureCondition fires on the first failed worker.
+      successCondition: status.replicaStatuses.Worker.succeeded == 1
+      failureCondition: status.replicaStatuses.Worker.failed > 0
+      setOwnerReference: true
+      manifest: |
+        apiVersion: kubeflow.org/v1
+        kind: PyTorchJob
+        metadata:
+          generateName: kineager-affinity-
+        spec:
+          # Elastic, Worker-only. There is NO Master replica, so nothing in this job is
+          # called `...-master-0`: pod names are `kineager-affinity-<run>-worker-0..N-1`
+          # and the rendezvous variables arrive under the PET_ prefix (plus RANK /
+          # WORLD_SIZE), never as bare NNODES / NODE_RANK.
+          elasticPolicy:
+            rdzvBackend: c10d
+            # minReplicas == maxReplicas == pod_nums on purpose: elasticity that scales
+            # the running replica count below what the launcher validates is the
+            # silent-hang case - the ranks that torchrun waits for never exist. A
+            # topology change must be a deliberate edit of pod_nums (and it must match
+            # pod_gpus = 1 per pod in bin/train/kineager_k8s.sh).
+            minReplicas: {{inputs.parameters.pod_nums}}
+            maxReplicas: {{inputs.parameters.pod_nums}}
+            maxRestarts: 5
+          pytorchReplicaSpecs:
+            Worker:
+              replicas: {{inputs.parameters.pod_nums}}
+              template:
+                metadata:
+                  annotations:
+                    sidecar.istio.io/inject: 'false'
+                  labels:
+                    file-mount: 'true'
+                spec:
+                  hostNetwork: false
+                  containers:
+                    - name: pytorch
+                      command: [/bin/bash, -lc]
+                      args:
+                        # Rank-0-only log append. The obvious form -
+                        #   bash cmd >> path 2>&1
+                        # - is applied to EVERY pod, so N pods interleave into one file
+                        # and the log becomes unreadable. The guard below keeps the
+                        # reference's single-writer property without any shell-quoting
+                        # hazard around the path, because `{{...}}` substitution happens
+                        # inside a double-quoted shell string, where an
+                        # operator-supplied logpath cannot break out of the quoting the
+                        # way it could in a bare `>> {{...}}`.
+                        - |
+                          : "${logpath:?set the logpath parameter to a file on storage every pod can write}"
+                          if [ "${NODE_RANK:-0}" -eq 0 ]; then
+                            {{inputs.parameters.bash_command}} >> "{{inputs.parameters.logpath}}" 2>&1
+                          else
+                            {{inputs.parameters.bash_command}}
+                          fi
+                      image: '{{inputs.parameters.image}}'
+                      imagePullPolicy: Always
+                      securityContext:
+                        privileged: false
+                        capabilities:
+                          add: ["IPC_LOCK"]
+                      resources:
+                        limits:
+                          cpu: {{inputs.parameters.cpu}}
+                          memory: {{inputs.parameters.memory}}
+                          nvidia.com/gpu: {{inputs.parameters.pod_gpus}}
+                      env:
+                        # ---- path profile ----------------------------------------------
+                        - name: CATA_PROFILE
+                          value: "k8s"
+                        # ---- write-path scoping: USER is required ----------------------
+                        # path_config.py expands ${USER} in the k8s profile's runs_dir,
+                        # weights_dir and train_data_dir, and bin/train/kineager_k8s.sh
+                        # refuses to start when it is unset (the fallback is the SHARED
+                        # /pfs_beijing/kineager/kineager_runs).
+                        - name: USER
+                          value: "xinran_2026"
+                        # ---- write-path relocation -----------------------------------
+                        # kineager_runs moved under general_protein_dir; without these
+                        # overrides path_config would fall back to the default
+                        # /pfs_beijing/${USER}/kineager_runs.
+                        - name: CATA_RUNS_DIR
+                          value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
+                        - name: CATA_WEIGHTS_DIR
+                          value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
+                        - name: CATA_TRAIN_DATA_DIR
+                          value: "/pfs_beijing/xinran_2026/general_protein_dir/kineager_runs"
+                        # ---- inputs required by bin/train/kineager_k8s.sh --------------
+                        - name: TRAIN_CSV
+                          value: "/pfs_beijing/xinran_2026/kineager_data/pdbbindv2020_affinity.csv"
+                        - name: KINEAGER_ESMC_PATH
+                          value: "/pfs_beijing/xinran_2026/models/ESMC-6B2026.9.15"
+                        - name: KINEAGER_MOLFORMER_PATH
+                          value: "/pfs_beijing/xinran_2026/models/molformer/models--ibm-research--MoLFormer-XL-both-10pct/snapshots/7b12d946c181a37f6012b9dc3b002275de070314"
+                        # ---- rank-0 log file -------------------------------------------
+                        # Leave this EMPTY in the KFP UI to get each pod's own stdout
+                        # instead (which is also what makes rank > 0 visible); set it to
+                        # opt into the single-writer file. The manifest's container command
+                        # names this variable in its own failure message.
+                        - name: LOG_PATH
+                          value: ""
+                        # Only consulted when the operator does not inject PET_NNODES.
+                        # Keep it equal to pod_nums.
+                        - name: NNODES
+                          value: "{{inputs.parameters.pod_nums}}"
+                        # ---- swanlab logging -------------------------------------------
+                        - name: SWANLAB_API_KEY
+                          value: "LjZwDjUAxKIzS86yP9mhG"
+                        # ---- task and hyperparameters, passed through "$@" ------------
+                        - name: TASK
+                          value: "affinity"
+                        - name: EPOCHS
+                          value: "30"
+                        - name: BATCH_SIZE
+                          value: "4"
+                        - name: ITERS_TO_ACCUMULATE
+                          value: "1"
+                        - name: NUM_WORKERS
+                          value: "8"
+                        - name: GRAD_CHECKPOINT_BACKBONE
+                          value: "off"
+                      workingDir: '{{inputs.parameters.working_dir}}'
+                      volumeMounts:
+                        - mountPath: /dev/shm
+                          name: xumeng
+                  nodeSelector:
+                    gpu.device: a100
+                  tolerations:
+                    - {effect: NoSchedule, key: role, operator: Equal, value: mpu}
+                    - {effect: NoSchedule, key: role, operator: Equal, value: m1b}
+                    - {effect: NoSchedule, key: role, operator: Equal, value: NBTopic}
+                  volumes:
+                    - name: xumeng
+                      emptyDir: {medium: Memory, sizeLimit: 40Gi}
+          runPolicy:
+            cleanPodPolicy: Running
+            # Kept for fidelity with the pipeline this was copied from. The operational
+            # cost is real: the PyTorchJob OBJECT is gone 30 s after it finishes, so
+            # there is no `kubectl describe pytorchjob` post-mortem and no
+            # `kubectl get pytorchjob ... -o yaml` history - raise the TTL if you want
+            # either. What survives is rank 0's log file (LOG_PATH / the logpath
+            # parameter) plus whatever the KFP UI captured from the pods' stdout.
+            ttlSecondsAfterFinished: 30
+    inputs:
+      parameters:
+      - {name: bash_command}
+      - {name: logpath}
+      - {name: memory}
+      - {name: cpu}
+      - {name: pod_gpus}
+      - {name: image}
+      - {name: pod_nums}
+      - {name: working_dir}
+    outputs:
+      parameters:
+      - name: kineager-affinity-train-manifest
+        valueFrom: {jsonPath: '{}'}
+      - name: kineager-affinity-train-name
+        valueFrom: {jsonPath: '{.metadata.name}'}
+    metadata:
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.14
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  - name: kineager-affinity-train-run
+    inputs:
+      parameters:
+      - {name: bash_command}
+      - {name: logpath}
+      - {name: memory}
+      - {name: cpu}
+      - {name: pod_gpus}
+      - {name: image}
+      - {name: pod_nums}
+      - {name: working_dir}
+    dag:
+      tasks:
+      - name: kineager-affinity-train
+        template: kineager-affinity-train
+        arguments:
+          parameters:
+          - {name: bash_command, value: '{{inputs.parameters.bash_command}}'}
+          - {name: logpath, value: '{{inputs.parameters.logpath}}'}
+          - {name: memory, value: '{{inputs.parameters.memory}}'}
+          - {name: cpu, value: '{{inputs.parameters.cpu}}'}
+          - {name: pod_gpus, value: '{{inputs.parameters.pod_gpus}}'}
+          - {name: image, value: '{{inputs.parameters.image}}'}
+          - {name: pod_nums, value: '{{inputs.parameters.pod_nums}}'}
+          - {name: working_dir, value: '{{inputs.parameters.working_dir}}'}
+  arguments:
+    parameters:
+    - {name: bash_command}
+    - {name: logpath}
+    - {name: memory}
+    - {name: cpu}
+    - {name: pod_gpus}
+    - {name: image}
+    - {name: pod_nums}
+    - {name: working_dir}
+  serviceAccountName: pipeline-runner

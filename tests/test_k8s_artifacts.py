@@ -39,6 +39,7 @@ R62：本模块对 `yaml` 保持硬 import，**不要**改成 `importorskip`。R
 import ast
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,9 +51,34 @@ from path_config import resolve_runtime_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "bin" / "train" / "kineager_k8s.sh"
+LAUNCH_WRAPPER = REPO_ROOT / "bin" / "train" / "launch_kineager_affinity_k8s.sh"
 MANIFEST = REPO_ROOT / "yamls" / "kubeflow" / "kineager_affinity_k8s.yaml"
+PIPELINE = REPO_ROOT / "yamls" / "kubeflow" / "kineager_affinity_pipeline.yaml"
 TRAINER = REPO_ROOT / "main_train_predictor_multigpu.py"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
+
+# `bash -n` 需要一个**真能跑**的 bash：本机 PATH 上的 `bash` 常常是
+# `WindowsApps\bash.EXE`（WSL 转发器，报 Wsl/E_ACCESSDENIED），Git for Windows 的
+# bash.exe 又被文件沙箱拦在「创建 signal pipe」那一步（Win32 error 5）。所以不猜
+# 路径：拿 `bash -n` 试一个玩具脚本，能返回 0 的才算数，否则下面的语法断言直接
+# skip —— 报一个它其实看不见的缺陷比 skip 更糟。
+def _find_usable_bash():
+    candidates = [shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe",
+                  r"C:\Program Files\Git\usr\bin\bash.exe"]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            probe = subprocess.run([candidate, "-n"], input="true\n",
+                                   capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
+BASH = _find_usable_bash()
 
 # torchrun 自己的参数（不是训练脚本的 argparse 参数）
 _TORCHRUN_FLAGS = {"-m", "--nnodes", "--node_rank", "--nproc_per_node",
@@ -62,6 +88,16 @@ _TORCHRUN_FLAGS = {"-m", "--nnodes", "--node_rank", "--nproc_per_node",
 _HYPERPARAMETER_FLAGS = ("-epochs", "-batch_size", "--lr", "--split_mode", "--split_seed",
                          "--val_ratio", "--test_ratio", "--eval_only", "--weights",
                          "--use_struct_branch", "--final_contact_npz")
+
+# 训练算子的 label：它标在 PyTorchJob 自己创建的 pod 上，也是「这个 job 有哪些
+# pod」唯一稳定的查询方式（pod 名在 elastic 拓扑下不可预测）。
+_JOB_LABEL = "training.kubeflow.org/job-name"
+
+# 上传到 KFP UI 的 compiled pipeline 必须长成的形状
+_PIPELINE_TEMPLATE = "kineager-affinity-train"
+_PIPELINE_NAME = "kineager-affinity-train"
+_PIPELINE_PARAMETERS = ["bash_command", "logpath", "memory", "cpu", "pod_gpus",
+                        "image", "pod_nums", "working_dir"]
 
 
 def _launcher_text():
@@ -87,12 +123,180 @@ def _manifest():
     return yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
 
 
+def _load_yaml(path):
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _substitute_argo_parameters(text, values):
+    """把 `{{inputs.parameters.NAME}}` 换成给定值（Argo 在集群上做的事）。
+
+    KFP 编译产物的 manifest 里 `{{...}}` 是**未加引号**地嵌在 YAML 里的
+    （`minReplicas: {{inputs.parameters.pod_nums}}`），直接 safe_load 会把它读成嵌套
+    mapping 而报 "found unhashable key"。参考文件
+    （xtrimofold3-affinity-plm/yamls/kubeflow/xf3_pl_multitask_k8s.yaml）在同样的
+    输入下报同样的错，所以那是模板语法的性质、不是缺陷——本函数先做替换，再把
+    替换结果当真正的 YAML 解析。values 里的字典项会被 dump 成 JSON 字面量
+    （容器 args 的 `{...}` 花括号因此不会把解析器搞乱），其余按原文插入。
+    """
+    import json as _json
+
+    def replace(match):
+        name = match.group(1)
+        assert name in values, f"测试没有为参数 {name} 准备替换值"
+        value = values[name]
+        if isinstance(value, str):
+            return value
+        return _json.dumps(value)
+
+    return re.sub(r"\{\{inputs\.parameters\.([A-Za-z0-9_]+)\}\}", replace, text)
+
+
+def _embedded_manifest(path=PIPELINE):
+    """KFP pipeline 里那段 `manifest: |` 字符串。"""
+    document = _load_yaml(path)
+    templates = [item for item in document["spec"]["templates"] if "resource" in item]
+    assert len(templates) == 1, f"{path.name} 必须恰好一个 resource 模板"
+    manifest = templates[0]["resource"]["manifest"]
+    assert isinstance(manifest, str) and manifest.strip(), "resource 模板的 manifest 是空的"
+    return manifest
+
+
+def _rank0_argv(pod_nums):
+    """按 pod_nums 渲染出 rank 0 pod 上真正执行的容器 argv。"""
+    values = {
+        "bash_command": "bash bin/train/kineager_k8s.sh -epochs 30",
+        "logpath": "/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "harbor.biomap-int.com/xinran_2026/kineager:affinity-v1",
+        "pod_nums": pod_nums,
+        "working_dir": "/workspace/kineager",
+    }
+    job = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), values))
+    container = job["spec"]["pytorchReplicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]
+    assert container["command"][:2] == ["/bin/bash", "-lc"]
+    return container["args"][0]
+
+
 def _replicas():
     return _manifest()["spec"]["pytorchReplicaSpecs"]
 
 
 def _container():
     return _replicas()["Master"]["template"]["spec"]["containers"][0]
+
+
+def _pipeline_container():
+    """pipeline 嵌的 PyTorchJob 里那个容器（参数已替换，可以当普通 YAML 读）。"""
+    manifest = _substitute_argo_parameters(_embedded_manifest(), {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "2",
+        "working_dir": "/workspace/kineager",
+    })
+    job = yaml.safe_load(manifest)
+    return job["spec"]["pytorchReplicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]
+
+
+def _launcher_exec_lines():
+    """launcher 里每条 `exec python3 …` 命令的**起始行号**（允许缩进）。
+
+    续行不算新的 exec，所以只在「上一行不以反斜杠结尾」的位置取。早期版本要求
+    `exec` 出现在第 0 列、并且只有一条。rank-0 的日志重定向必须在 exec **之前**
+    生效，而把重定向包在 exec 外面（`{ … } >> "$LOG_PATH" 2>&1`）就会让那条 exec
+    缩进一格；再加上「每条命令只有一次 exec」的约束，只能写成两个分支、每条分支各
+    一条 exec 命令行。于是这里断言的是：都在行首（允许缩进）、且没有其它形式的
+    exec（`_launcher_exec_occurrences`）——强度没有放松，只是把「一条」换成了
+    「每个分支一条、彼此逐 token 相同」。
+    """
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    exec_lines = []
+    for index, line in enumerate(lines):
+        if not re.match(r"\s*exec\s+python3\b", line):
+            continue
+        previous = lines[index - 1].rstrip() if index else ""
+        if not previous.endswith("\\"):
+            exec_lines.append(index)
+    assert exec_lines, "launcher 的 exec python3 不见了"
+    return exec_lines
+
+
+def _launcher_exec_line():
+    """第一条 exec 的行号（校验必须都在它之前）。"""
+    return _launcher_exec_lines()[0]
+
+
+def _launcher_exec_occurrences():
+    """整个脚本里出现 `exec ` 这个命令 token 的行。
+
+    这是「没有第二条 exec」的真正证明：既有断言只看 `^exec python3`，而
+    `exec 1>>"$LOG_PATH" 2>&1` 这样的写法能骗过它。这里连 `;`/`&&`/`$( ` 之后的
+    exec 一起抓，再与 `_launcher_exec_lines()` 的数量对齐。
+    """
+    return [line.strip() for line in _strip_shell_comments(_launcher_text()).splitlines()
+            if re.search(r"(?:^|[;&|({]|\$\()\s*exec\s", line)]
+
+
+def _launcher_exec_commands():
+    """各条 exec 分支的「逻辑命令行」：把续行拼起来、去掉每行缩进。
+
+    它们必须逐 token 相同（见
+    `test_launcher_passes_each_rendezvous_flag_exactly_once`）：rank 门控只允许改
+    变输出去向，不允许改变 torchrun 收到的参数。谁改了一条分支的 `--nnodes=`
+    表达式，这里立刻变成两条不同的命令行。
+    """
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    commands = []
+    for start in _launcher_exec_lines():
+        chunk = []
+        for line in lines[start:]:
+            chunk.append(line.strip())
+            if not line.rstrip().endswith("\\"):
+                break
+        commands.append(" ".join(chunk))
+    return commands
+
+
+def _launcher_section(heading):
+    """`# --- <heading> …` 那一节的 block（去掉注释行）。
+
+    只认真正的分节头（`# --- ` 之后紧跟分节名），不认正文注释里提到的
+    `# --- topology validation: … ---`：两者都以 `# --- ` 开头，靠 heading 的完整
+    名字区分（调用方传的是分节名本身，例如 "topology resolution"）。
+    """
+    lines = _launcher_text().splitlines()
+    marker = f"# --- {heading}"
+    starts = [i for i, line in enumerate(lines) if line.startswith(marker)]
+    assert len(starts) == 1, f"launcher 里 `{heading}` 那一节必须恰好一处，找到 {len(starts)} 处"
+    end = len(lines)
+    for index in range(starts[0] + 1, len(lines)):
+        if lines[index].startswith("# --- "):
+            end = index
+            break
+    block = "\n".join(lines[starts[0]:end])
+    return "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _topology_assignment(variable):
+    """拓扑解析块里 `VAR="${A:-${B:-…}}"` 的 fallback 链。
+
+    链 = 赋值里每个 `${...}` 展开的名字；最后一个展开的默认值（字面量）追加在末尾，
+    所以 `world_size` 这种「裸默认值」也进得了链。返回 (链, 原始赋值)。
+    """
+    block = _launcher_section("topology resolution")
+    match = re.search(rf'^{variable}="(.*)"[ \t]*$', block, re.M)
+    assert match, f"拓扑解析块里没有 {variable}= 赋值"
+    expression = match.group(1)
+    chain = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-|\})", expression)
+    tail = re.search(r":-([0-9]+)\}\}\}?$", expression)
+    if tail:
+        chain.append(tail.group(1))
+    return chain, expression
 
 
 def _trainer_argparse_flags():
@@ -282,9 +486,7 @@ def test_launcher_exports_the_validated_user():
     assert exits and max(exits) < export_index, "export 必须跟在所有拒绝分支之后"
     assert export_index < end, "export 必须在守卫块内（k8s profile 才需要它）"
 
-    exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
-    assert exec_lines, "launcher 的 exec 不见了"
-    assert export_index < exec_lines[0], "export 必须先于 exec，否则训练进程看不到它"
+    assert export_index < _launcher_exec_line(), "export 必须先于 exec，否则训练进程看不到它"
 
 
 def test_an_unexported_value_never_reaches_a_child_process():
@@ -326,10 +528,7 @@ def test_path_config_accepts_username_when_user_is_unset(monkeypatch):
 
 def test_launcher_user_guard_precedes_the_exec():
     start, _, _ = _launcher_user_guard()
-    lines = _strip_shell_comments(_launcher_text()).splitlines()
-    exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
-    assert exec_lines, "launcher 的 exec 不见了"
-    assert start < exec_lines[0], "USER 守卫必须与其它校验一起先于 exec"
+    assert start < _launcher_exec_line(), "USER 守卫必须与其它校验一起先于 exec"
 
 
 def test_launcher_user_guard_precedes_the_required_input_checks():
@@ -437,23 +636,66 @@ def test_manifest_container_runs_the_launcher():
 # launcher：结构契约（上一轮临时 checker 的固化版本）
 # ---------------------------------------------------------------------------
 
-def test_launcher_has_exactly_one_exec_and_it_is_last():
-    lines = _launcher_text().splitlines()
-    exec_lines = [i for i, line in enumerate(lines) if line.startswith("exec ")]
-    assert len(exec_lines) == 1, "launcher 必须只有一条 exec"
+def test_launcher_has_exactly_one_exec_per_branch_and_they_are_last():
+    """每条分支一条 exec，且它们是脚本的最后一件事。
+
+    「行首 token」的判定允许缩进（见 `_launcher_exec_lines`）：rank-0 的日志重定向
+    必须包住那条 exec，所以它在 `{ …; } >> "${LOG_PATH}" 2>&1` 里。同时断言 `exec`
+    这个命令 token 在全脚本里只出现在这些行上——否则 `exec 1>>file` 那种写法既能
+    骗过行首检查，又能给每行偷偷加一次 exec。
+    """
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    exec_lines = _launcher_exec_lines()
+    assert len(exec_lines) == 2, (
+        f"期望两条 exec（rank 0 的带重定向 / 其它 rank 的不带），找到 {len(exec_lines)} 条"
+    )
+    occurrences = _launcher_exec_occurrences()
+    assert len(occurrences) == len(exec_lines), (
+        f"`exec` 命令 token 必须只出现在这些分支行上，实际: {occurrences}"
+    )
+
     guards = [i for i, line in enumerate(lines) if line.strip().startswith("exit 1")]
     assert guards, "launcher 的拓扑/输入校验不见了"
-    assert max(guards) < exec_lines[0], "所有校验都必须先于 exec"
+    assert max(guards) < min(exec_lines), "所有校验都必须先于 exec"
+
+    # 最后一条 exec 之后只允许收尾的 `fi`；任何代码在那里都已经不可达，而这正是
+    # 要挡的（例如把某个校验挪到 exec 后面）。两条 exec 之间不需要单独检查：它们必须
+    # 逐 token 相同（`test_launcher_passes_each_rendezvous_flag_exactly_once`），
+    # 中间插不进任何语句。
+    trailer = [line for line in lines[exec_lines[-1] + 1:] if line.strip()]
+    assert trailer and trailer[-1].strip() == "fi", "exec 之后必须以收尾的 fi 结束"
+    for line in trailer:
+        assert line.rstrip().endswith("\\") or re.match(r'^\s*(fi|else|}|\$)', line), (
+            f"exec 之后还有代码在跑（不可达）: {line!r}"
+        )
+    assert lines[-1].strip() == "fi", "脚本必须以收尾的 fi 结束"
 
 
 def test_launcher_passes_each_rendezvous_flag_exactly_once():
-    text = _launcher_text()
+    """每个 rendezvous flag 只能出现**一次命令**。
+
+    这条曾经数的是「字符串出现次数 == 1」，在有 rank-0 日志重定向之后不可能成立：
+    重定向必须包住 exec，而 exec 只有一条，所以两个分支各自带一份完整的 exec 参数
+    列表。真正的契约是「每个 flag 只传给 torchrun 一次」——所以按**去重后的命令行**
+    计数：同一个 flag 在两条不同的命令行上各出现一次（两个分支各一份）是允许的，
+    在同一条命令行上出现两次、或出现两条内容相同的命令行，都是缺陷。
+    """
+    code = _strip_shell_comments(_launcher_text())
     for flag in ("--nnodes=", "--node_rank=", "--nproc_per_node=",
                  "--master_addr=", "--master_port="):
-        assert text.count(flag) == 1, f"{flag} 出现 {text.count(flag)} 次"
-    code = _strip_shell_comments(text)          # 注释里解释过 "$@"，不能算进次数
-    assert code.count('${1+"$@"}') == 1, "调用方参数必须恰好透传一次"
-    assert code.count(' -m torch.distributed.run') == 1
+        lines = sorted({line.strip() for line in code.splitlines() if flag in line})
+        assert len(lines) == 1, (
+            f"{flag} 必须恰好出现在一条（去重后的）命令行上，找到 {len(lines)} 条: {lines}"
+        )
+    passthrough = sorted({line.strip() for line in code.splitlines() if '${1+"$@"}' in line})
+    assert len(passthrough) == 1, (
+        f"调用方参数必须恰好透传一次（去重后的命令行只有一条），找到 {len(passthrough)} 条"
+    )
+    commands = _launcher_exec_commands()
+    assert len(set(commands)) == 1, (
+        "两条 exec 分支（rank 0 带重定向 / 其它 rank 不带）必须逐 token 相同："
+        f"rank 门控只允许改变输出去向，不允许改变 torchrun 收到的参数: {commands}"
+    )
 
 
 def test_launcher_hardcodes_no_training_hyperparameters():
@@ -488,3 +730,501 @@ def test_k8s_artifacts_are_utf8_with_one_trailing_newline_and_consistent_eol():
             raise AssertionError(f"{path.name} 不是合法 UTF-8：{error}") from error
         assert raw.endswith(b"\n") and not raw.endswith(b"\n\n"), f"{path.name} 结尾换行不规范"
         assert b"\r" not in raw.replace(b"\r\n", b""), f"{path.name} 含孤立 CR（混用换行）"
+
+
+# ---------------------------------------------------------------------------
+# KFP：elastic Worker-only 拓扑下 launcher 的启动无关性（R71）
+# ---------------------------------------------------------------------------
+#
+# 集群上那个 xtfold3-train pipeline 是 elastic + Worker-only：算子里程碑变量全部
+# 走 `PET_` 前缀（外加 `RANK`/`WORLD_SIZE`），**没有**任何东西设置裸名
+# `NNODES`/`NODE_RANK`。于是只认裸名的 launcher 在每个 pod 里都解析出
+# `NNODES=1, NODE_RANK=0`：要么每个 pod 都以为自己是 rank 0（各自单进程训练，写同
+# 一个 runs_dir），要么 torchrun 永远等一个不会加入的 rank。两种都是**静默**的
+# ——没有报错，只有错误的结果或永久挂起。下面把解析顺序钉在源码上。
+
+_TOPOLOGY_CHAINS = {
+    "NNODES": ["PET_NNODES", "NNODES", "WORLD_SIZE", "1"],
+    "NODE_RANK": ["PET_NODE_RANK", "NODE_RANK", "RANK", "0"],
+    "NPROC_PER_NODE": ["PET_NPROC_PER_NODE", "NPROC_PER_NODE", "1"],
+    "MASTER_PORT": ["PET_MASTER_PORT", "MASTER_PORT", "29500"],
+    "MASTER_ADDR": ["PET_MASTER_ADDR", "MASTER_ADDR"],
+}
+
+
+def test_launcher_resolves_topology_from_pet_then_bare_then_torchrun_then_default():
+    """每个拓扑变量的 fallback 链，顺序即优先级。"""
+    for variable, expected in _TOPOLOGY_CHAINS.items():
+        chain, raw = _topology_assignment(variable)
+        assert chain == expected, (
+            f"{variable} 的解析链是 {chain}，期望 {expected}（原始赋值: {variable}={raw}）"
+        )
+
+
+def test_launcher_topology_resolution_block_exported():
+    """解析结果必须 export：torchrun 和训练进程读的是环境。"""
+    block = _launcher_section("topology resolution")
+    match = re.search(r"^export ([A-Z_ ]+)$", block, re.M)
+    assert match, "拓扑解析块没有 export"
+    exported = set(match.group(1).split())
+    assert exported == set(_TOPOLOGY_CHAINS), (
+        f"拓扑解析块导出的变量是 {sorted(exported)}，期望 {sorted(_TOPOLOGY_CHAINS)}"
+    )
+
+
+def test_launcher_topology_resolution_precedes_every_check_and_the_exec():
+    """解析必须在所有校验与 exec 之前：校验用的是解析后的值。"""
+    lines = _strip_shell_comments(_launcher_text()).splitlines()
+    resolved = [i for i, line in enumerate(lines)
+                if re.match(r"^(NNODES|NODE_RANK)=", line)
+                and "${PET_" in line]
+    assert len(resolved) == 2, f"期望两条拓扑赋值，找到 {len(resolved)} 条"
+
+    checks = [i for i, line in enumerate(lines) if line.strip().startswith("exit 1")]
+    assert checks, "launcher 的校验不见了"
+    assert max(resolved) < min(checks), "拓扑解析必须早于所有校验"
+    assert max(resolved) < _launcher_exec_line(), "拓扑解析必须在 exec 之前"
+
+
+def test_launcher_appends_to_log_path_only_on_rank_zero():
+    """LOG_PATH 只由 rank 0 追加写，其它 rank 保持 stdout/stderr。
+
+    pipeline 的容器 args 在每个 pod 上都跑，没法自己做这件事（那正是 N 个 pod 交错
+    写一个文件的原因），所以门控落在 launcher 里。两个分支各一条 exec，是单 exec
+    约束下唯一能让重定向包住 exec 的写法。
+    """
+    code = _strip_shell_comments(_launcher_text())
+    condition = re.search(r"if \[ -n \"\$\{LOG_PATH:-\}\" \] && \[ \"\$\{NODE_RANK\}\" -eq 0 \]; then",
+                          code)
+    assert condition, "没有 `LOG_PATH` 非空且 `NODE_RANK` 为 0 的门控条件"
+    condition_line = code[:condition.start()].count("\n")
+    assert condition_line < _launcher_exec_line(), "门控必须在 exec 之前成立"
+    assert code.count('} >> "${LOG_PATH}" 2>&1') == 1, (
+        "rank 0 那支必须恰好一条分组重定向：`} >> \"${LOG_PATH}\" 2>&1`"
+    )
+    commands = _launcher_exec_commands()
+    assert len(commands) == 2, f"期望 rank 0 / 其它 rank 两条 exec 分支，找到 {len(commands)}"
+    assert len(set(commands)) == 1, "两条分支的 exec 必须逐 token 相同"
+
+
+def test_launcher_unset_log_path_falls_back_to_the_plain_exec():
+    """LOG_PATH 未设时行为必须与改动前完全一致：裸 exec，不重定向。
+
+    这条挡的是把 `LOG_PATH` 换成「总有默认值」的写法，那会把每个 rank 的 stdout
+    悄悄搬到一个文件里（`kubectl logs` 随即变空）。
+    """
+    code = _strip_shell_comments(_launcher_text())
+    assert "${LOG_PATH:?" not in code, "LOG_PATH 不能是必填项：未设时必须维持旧行为"
+    assert re.search(r'if \[ -n "\$\{LOG_PATH:-\}" \]', code), (
+        "门控必须用 ${LOG_PATH:-} 判空，未设即走 else（裸 exec）"
+    )
+    assert "LOG_PATH=" not in code, "launcher 不许给 LOG_PATH 兜底默认值"
+
+
+# ---------------------------------------------------------------------------
+# KFP：编译产物本身
+# ---------------------------------------------------------------------------
+
+def test_kfp_pipeline_is_an_argo_workflow_with_the_kfp_annotations():
+    """KFP v1 UI 的上传契约：Workflow + pipelines.kubeflow.org/* 注解。"""
+    document = _load_yaml(PIPELINE)
+    assert document["apiVersion"] == "argoproj.io/v1alpha1"
+    assert document["kind"] == "Workflow"
+    assert document["metadata"]["generateName"] == "kineager-affinity-train-"
+    annotations = document["metadata"]["annotations"]
+    for key in ("pipelines.kubeflow.org/kfp_sdk_version",
+                "pipelines.kubeflow.org/pipeline_compilation_time",
+                "pipelines.kubeflow.org/pipeline_spec"):
+        assert key in annotations, f"缺少 KFP 注解 {key}"
+    assert "pipelines.kubeflow.org/kfp_sdk_version" in document["metadata"]["labels"]
+
+    # pipeline_spec 注解必须是**真 JSON**：KFP UI 用它渲染参数表单。
+    import json
+
+    spec = json.loads(annotations["pipelines.kubeflow.org/pipeline_spec"])
+    assert spec["name"] == _PIPELINE_NAME
+    assert [item["name"] for item in spec["inputs"]] == _PIPELINE_PARAMETERS
+
+
+def test_kfp_pipeline_has_the_expected_templates_and_entrypoint():
+    document = _load_yaml(PIPELINE)
+    names = [template["name"] for template in document["spec"]["templates"]]
+    assert names == [_PIPELINE_TEMPLATE, f"{_PIPELINE_TEMPLATE}-run"], names
+    # entrypoint 直接指向 resource 模板：一个只有单个任务的 pipeline，DAG 那层是
+    # 空的。参考文件两者都有（它的 entrypoint 是 DAG），两种都能被 KFP v1 接受；
+    # 这里少一层没有意义的间接。
+    assert document["spec"]["entrypoint"] == _PIPELINE_TEMPLATE
+    run = document["spec"]["templates"][1]
+    (task,) = run["dag"]["tasks"]
+    assert task["template"] == _PIPELINE_TEMPLATE, "DAG 任务没有指向 resource 模板"
+    assert document["spec"]["serviceAccountName"] == "pipeline-runner"
+
+
+def test_kfp_pipeline_parameters_mirror_through_all_three_levels():
+    """resource 模板的 inputs ← DAG 任务的 arguments ← 顶层 arguments。
+
+    任一层少一个名字，Argo 会在**运行时**报 `failed to resolve ... parameter`，
+    或在 UI 里根本不显示该输入框——两者都不是本地能看到的失败。
+    """
+    document = _load_yaml(PIPELINE)
+    resource, run = document["spec"]["templates"][0], document["spec"]["templates"][1]
+    declared = [item["name"] for item in resource["inputs"]["parameters"]]
+    assert declared == _PIPELINE_PARAMETERS, declared
+
+    (task,) = run["dag"]["tasks"]
+    supplied = [item["name"] for item in task["arguments"]["parameters"]]
+    assert sorted(supplied) == sorted(declared), (
+        f"DAG 任务提供的参数 {supplied} 与 resource 模板声明的 {declared} 不一致"
+    )
+    values = {item["name"]: item["value"] for item in task["arguments"]["parameters"]}
+    for name in declared:
+        assert values[name] == f"{{{{inputs.parameters.{name}}}}}", (
+            f"{name} 没有从 DAG 的 inputs 透传（value={values[name]!r}）"
+        )
+
+    top = [item["name"] for item in document["spec"]["arguments"]["parameters"]]
+    assert sorted(top) == sorted(declared), (
+        f"顶层 arguments {top} 与 resource 模板声明的 {declared} 不一致"
+    )
+
+
+def test_kfp_pipeline_embedded_pytorchjob_parses_after_substitution():
+    """嵌在 `manifest: |` 里的 PyTorchJob 必须能当 YAML 解析。
+
+    顶层 safe_load 只证明 Workflow 那层没问题；引号/缩进/参数替换的错误全在嵌的那段
+    里。`{{...}}` 按 Argo 的做法替换成具体值之后再解析，正好覆盖「替换之后 YAML 还是
+    合法的」这件事。
+
+    注意：**未替换**的 manifest 连参考文件都解析不了（`minReplicas:
+    {{inputs.parameters.pod_nums}}` 被读成嵌套 mapping，报 "found unhashable key"），
+    所以断言的是替换后的可解析性，而不是原文可解析性。
+    """
+    job = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "2",
+        "working_dir": "/workspace/kineager",
+    }))
+    assert job["apiVersion"] == "kubeflow.org/v1"
+    assert job["kind"] == "PyTorchJob"
+    assert job["metadata"]["generateName"] == "kineager-affinity-"
+
+
+def _as_text(value):
+    """Argo 的 `{{...}}` 替换是**文本**替换，替换之后再当 YAML 解析。
+
+    所以未加引号的 `cpu: {{inputs.parameters.cpu}}` 在 pod_nums/cpu 都填数字时会解析
+    成 int，而 `replicas:` 在参数是字符串时会解析成 str。这两种形状在 Kubernetes
+    里都合法，断言因此比较归一化后的文本，而不是 Python 类型。
+    """
+    return str(value)
+
+
+def test_kfp_pipeline_job_is_elastic_and_worker_only():
+    """elastic Worker-only：minReplicas == maxReplicas == pod_nums，且没有 Master。"""
+    job = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "2",
+        "working_dir": "/workspace/kineager",
+    }))
+    spec = job["spec"]
+    assert set(spec["pytorchReplicaSpecs"]) == {"Worker"}, (
+        "这个 pipeline 必须是 Worker-only：有 Master 就不再是 elastic 拓扑"
+    )
+    assert _as_text(spec["pytorchReplicaSpecs"]["Worker"]["replicas"]) == "2"
+
+    policy = spec["elasticPolicy"]
+    assert policy["rdzvBackend"] == "c10d"
+    assert _as_text(policy["minReplicas"]) == "2", "minReplicas 必须等于 pod_nums"
+    assert _as_text(policy["maxReplicas"]) == "2", (
+        "maxReplicas 必须等于 pod_nums；否则算子可以把 replica 数缩到 launcher 校验的"
+        "NNODES 之下，torchrun 会静默等一个永远不会出现的 rank"
+    )
+    assert spec["runPolicy"]["cleanPodPolicy"] == "Running"
+    assert spec["runPolicy"]["ttlSecondsAfterFinished"] == 30
+
+
+def test_kfp_pipeline_elastic_bounds_track_pod_nums():
+    """换个 pod_nums，min/max/replicas 必须跟着动——它们不是写死的 2。"""
+    values = {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "7",
+        "working_dir": "/workspace/kineager",
+    }
+    spec = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), values))["spec"]
+    assert _as_text(spec["pytorchReplicaSpecs"]["Worker"]["replicas"]) == "7"
+    assert _as_text(spec["elasticPolicy"]["minReplicas"]) == "7"
+    assert _as_text(spec["elasticPolicy"]["maxReplicas"]) == "7"
+
+
+def test_kfp_pipeline_keeps_the_reference_pod_placement_verbatim():
+    """nodeSelector / tolerations 必须与参考 pipeline（也就是裸 manifest）逐字一致。
+
+    这些值来自集群上**正在跑**的那个 pipeline：换掉就等于换硬件，配错了只会表现成
+    pod 一直 Pending。
+    """
+    document = _load_yaml(PIPELINE)
+    for template in document["spec"]["templates"]:
+        if "resource" not in template:
+            continue
+        manifest = _substitute_argo_parameters(template["resource"]["manifest"], {
+            "bash_command": "bash bin/train/kineager_k8s.sh",
+            "logpath": "/tmp/rank0.log",
+            "memory": "200Gi",
+            "cpu": "16",
+            "pod_gpus": "1",
+            "image": "example/image:tag",
+            "pod_nums": "2",
+            "working_dir": "/workspace/kineager",
+        })
+        pod = yaml.safe_load(manifest)["spec"]["pytorchReplicaSpecs"]["Worker"]["template"]["spec"]
+        assert pod["nodeSelector"] == {"gpu.device": "a100"}
+        assert pod["tolerations"] == [
+            {"effect": "NoSchedule", "key": "role", "operator": "Equal", "value": "mpu"},
+            {"effect": "NoSchedule", "key": "role", "operator": "Equal", "value": "m1b"},
+            {"effect": "NoSchedule", "key": "role", "operator": "Equal", "value": "NBTopic"},
+        ], pod["tolerations"]
+
+    # 裸 manifest 的 nodeSelector / tolerations 不能被这次改动带偏（它仍然是
+    # `kubectl apply` 那条路）。两者的 value 集合本来就不同——pipeline 来自集群上跑的
+    # 那个 reference（mpu / m1b / NBTopic），裸 manifest 来自更早的 xtrimofold3 副本
+    # （NBTopic / 006_mix）——所以这里只钉住「各自都还在、且都是 role 容忍」。
+    bare = _replicas()["Master"]["template"]["spec"]
+    assert bare["nodeSelector"]["gpu.device"] == "a100"
+    assert {item["value"] for item in bare["tolerations"]} == {"NBTopic", "006_mix"}
+    for item in bare["tolerations"]:
+        assert item["key"] == "role" and item["operator"] == "Equal"
+        assert item["effect"] == "NoSchedule"
+
+
+def test_kfp_pipeline_container_keeps_the_reference_security_and_resources():
+    container = _pipeline_container()
+    assert container["name"] == "pytorch"
+    assert container["imagePullPolicy"] == "Always"
+    assert container["securityContext"] == {
+        "privileged": False,
+        "capabilities": {"add": ["IPC_LOCK"]},
+    }
+    assert {key: _as_text(value) for key, value in container["resources"]["limits"].items()} == {
+        "cpu": "16", "memory": "200Gi", "nvidia.com/gpu": "1",
+    }
+    assert "requests" not in container["resources"], (
+        "参考 pipeline 只写 limits；补上 requests 就不是逐字照搬了（也改变 QoS）"
+    )
+    (mount,) = container["volumeMounts"]
+    assert mount == {"mountPath": "/dev/shm", "name": "xumeng"}
+    pod = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "2",
+        "working_dir": "/workspace/kineager",
+    }))["spec"]["pytorchReplicaSpecs"]["Worker"]["template"]["spec"]
+    assert pod["volumes"] == [
+        {"name": "xumeng", "emptyDir": {"medium": "Memory", "sizeLimit": "40Gi"}}
+    ], pod["volumes"]
+
+
+def test_kfp_pipeline_success_condition_tracks_the_worker_replica():
+    """Worker-only 拓扑下 `status.replicaStatuses.Master` 永远不会出现。"""
+    document = _load_yaml(PIPELINE)
+    resource = document["spec"]["templates"][0]["resource"]
+    assert resource["action"] == "create"
+    assert resource["setOwnerReference"] is True
+    assert resource["successCondition"] == "status.replicaStatuses.Worker.succeeded == 1"
+    assert resource["failureCondition"] == "status.replicaStatuses.Worker.failed > 0"
+    assert "Master" not in resource["successCondition"] + resource["failureCondition"]
+
+    # 这些 conditions 只有在**只有一个**副本源时才自洽。
+    (worker,) = yaml.safe_load(_substitute_argo_parameters(_embedded_manifest(), {
+        "bash_command": "bash bin/train/kineager_k8s.sh",
+        "logpath": "/tmp/rank0.log",
+        "memory": "200Gi",
+        "cpu": "16",
+        "pod_gpus": "1",
+        "image": "example/image:tag",
+        "pod_nums": "2",
+        "working_dir": "/workspace/kineager",
+    }))["spec"]["pytorchReplicaSpecs"].values()
+    assert _as_text(worker["replicas"]) == "2"
+
+
+def test_kfp_pipeline_rank_zero_log_gate_substitutes_into_parseable_bash():
+    """容器 args 渲染出来必须是**能过 `bash -n`** 的脚本，且门控形状正确。
+
+    这是「引号有没有活过 YAML 与 Argo 的 `{{...}}` 替换」的直接证据：`logpath` 和
+    `bash_command` 都换成真实值，再把 args 交给 bash 的词法分析器。少了/多了引号、
+    替换把 `>>` 吃掉、`$@` 被展开——都会在这里变成语法错误。
+
+    形状断言（不依赖 bash）先跑，所以本机没有 bash 时这一条仍然能抓到「重定向没引号」
+    「门控被写成 true」这类改动；只有语法那一半会 skip。
+    """
+    argv = _rank0_argv(2)
+    assert 'if [ "${NODE_RANK:-0}" -eq 0 ]; then' in argv, (
+        "rank 门控必须真的按 NODE_RANK 判断"
+    )
+    assert '>> "/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log" 2>&1' in argv, (
+        'rank 0 那一支必须以 >> "<logpath>" 2>&1 结尾（路径在双引号里）'
+    )
+    assert argv.count(">>") == 1, "只有 rank 0 那一支才有重定向"
+    redirect = next(line for line in argv.splitlines() if ">>" in line)
+    assert redirect.count('"') == 2, (
+        f'rank 0 的重定向行必须恰好一对引号（>> "<logpath>" 2>&1），实际: {redirect!r}'
+    )
+    assert "{{" not in argv and "}}" not in argv, "替换之后不能留下 Argo 模板语法"
+
+    if not BASH:
+        pytest.skip("没有可用的 bash，跳过 `bash -n` 那一半（本机 sandbox 下 Git bash 起不来）")
+
+    result = subprocess.run([BASH, "-n"], input=argv, capture_output=True, text=True)
+    assert result.returncode == 0, f"容器 args 不是合法 bash: {result.stderr}"
+    assert subprocess.run([BASH, "-n"], input=_rank0_argv(3),
+                          capture_output=True, text=True).returncode == 0
+
+
+def test_kfp_pipeline_logpath_substitution_cannot_expand_into_extra_words():
+    """`logpath` 被塞进双引号里：去掉引号就会被 word-splitting 拆成两个词。
+
+    这条用「把引号拿掉就得到不同的词数」证明引号真的在起作用，而不是碰巧路径里没有
+    空格。它同时是给操作者的护栏：带空格/引号的路径会在这里被抓住。
+    """
+    if not BASH:
+        pytest.skip("没有可用的 bash，无法做词法检查（本机 sandbox 下 Git bash 起不来）")
+
+    argv = _rank0_argv(2)
+    log_line = next(line for line in argv.splitlines() if "rank0.log" in line)
+    match = re.search(r"bash .*? >> (.*) 2>&1$", log_line)
+    assert match, f"渲染后的 rank 0 命令行形状不对: {log_line!r}"
+    quoted = match.group(1)
+    assert quoted.startswith('"') and quoted.endswith('"'), (
+        f"logpath 没有被引号包住，`>>` 之后就是裸路径: {log_line!r}"
+    )
+
+    def word_count(argument):
+        probe = subprocess.run([BASH, "-c", f'set -- {argument}; printf "%s\\n" "$#"'],
+                               capture_output=True, text=True)
+        assert probe.returncode == 0, probe.stderr
+        return probe.stdout.strip()
+
+    assert word_count(quoted) == "1", f"重定向目标被拆开了: {quoted}"
+    assert word_count(quoted[1:-1]) == "2", (
+        "引号必须真的起作用：去掉引号后这个路径应该被拆成 2 个词，否则这条断言什么都没证明"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 运维脚本：elastic 拓扑下没有 master pod
+# ---------------------------------------------------------------------------
+
+def test_launch_wrapper_discovers_the_rank0_pod_instead_of_hardcoding_master_0():
+    """`${JOB}-master-0` 在 elastic Worker-only 下不存在，必须改成查询。"""
+    text = LAUNCH_WRAPPER.read_text(encoding="utf-8")
+    assert "-master-0" in text, "仍然要认识 master 形状（裸 manifest 有 Master）"
+    assert "-worker-0" in text, "没有 Master 的 elastic 拓扑下 rank 0 是 worker-0"
+    assert 'MASTER_POD="${JOB}-master-0"' not in text, (
+        "pod 名不能再硬编码：elastic 作业的 pod 名带随机后缀，且根本没有 master"
+    )
+
+    # pod 查询本身必须带算子的 label —— 只看「文件里出现过这个字符串」不够：错误
+    # 消息里也有它，把查询改成 `kubectl get pods` 会恰好落进那个盲区。
+    query = text.split("pod_names() {", 1)[1].split("\n}", 1)[0]
+    assert _JOB_LABEL in query, f"pod 查询必须按 {_JOB_LABEL} 过滤: {query!r}"
+    assert re.search(r"kubectl get pods\b", query), "查询必须调 kubectl get pods"
+    assert re.search(r'-l\s+"' + re.escape(_JOB_LABEL) + r'=\$JOB"', query), (
+        f"label selector 形状不对: {query!r}"
+    )
+
+    # 「找不到」那一支必须真的失败，并把看到的东西列出来
+    assert "no rank-0 pod found" in text
+    assert "(none)" in text, "失败消息必须列出实际找到的 pod（一个都没有时要说明）"
+    assert "exit 1" in text
+
+
+def test_launch_wrapper_keeps_its_flags_and_exit_codes():
+    """四个开关都必须还是**被解析**的 case 分支，而不是只出现在帮助注释里。"""
+    text = LAUNCH_WRAPPER.read_text(encoding="utf-8")
+    for flag in ("--no-delete", "--no-follow", "--dry-run", "--wait-timeout"):
+        assert re.search(rf"^\s*{re.escape(flag)}\)", text, re.M), (
+            f"launch wrapper 的 case 分支里少了 {flag}"
+        )
+    assert "exit 2" in text, "未知选项必须仍然 exit 2"
+    assert "exit 1" in text, "无法连接集群 / 等不到 pod 必须仍然 exit 1"
+    # 重新运行先删旧 job 的逻辑必须留着：固定 metadata.name + 长 TTL 的组合下，
+    # 第二次 apply 会「成功」但什么都不启动。
+    assert "delete pytorchjob" in text
+    assert "kubectl apply -f" in text
+
+
+def _wrapper_case_patterns():
+    """wrapper 里 `pick_rank0` 的 case 模式（按出现顺序）。
+
+    bash 在本机起不来，所以把模式从源码里取出来、在 Python 里按同样的顺序重放。
+    这样「master 优先、worker-0 兜底」这条选择规则是被**执行**验证的，不是被读着
+    确认的：删掉任一模式、把两者顺序对调，或把两趟循环并成一趟，重放结果都会变。
+    """
+    text = LAUNCH_WRAPPER.read_text(encoding="utf-8")
+    body = text.split("pick_rank0() {", 1)[1].split("\n}", 1)[0]
+    return re.findall(r"^\s*([^\s()]+)\)\s*chosen=", body, re.M)
+
+
+def _pick_rank0(patterns, pods):
+    """复现 `pick_rank0` 的两趟扫描：每个模式各扫一遍整份 pod 名单。"""
+    import fnmatch
+
+    for pattern in patterns:
+        for pod in pods:
+            if fnmatch.fnmatchcase(pod, pattern):
+                return pod
+    return ""
+
+
+def test_launch_wrapper_prefers_the_master_pod_and_falls_back_to_worker_0():
+    patterns = _wrapper_case_patterns()
+    assert patterns == ["*-master-0", "*-worker-0"], (
+        f"rank-0 的选择必须是「先 master-0，再 worker-0」，实际 {patterns}"
+    )
+
+    bare = "kineager-affinity-master-0"
+    elastic0 = "kineager-affinity-abc12-worker-0"
+    elastic1 = "kineager-affinity-abc12-worker-1"
+
+    # 裸 manifest（Master + Worker）：master-0 就是 rank 0
+    assert _pick_rank0(patterns, [bare, "kineager-affinity-worker-0"]) == bare
+    # elastic Worker-only：名单里根本没有 master，必须落到 worker-0
+    assert _pick_rank0(patterns, [elastic0, elastic1]) == elastic0
+    # 两种 pod 同时存在（迁移中/名字带 worker 前缀的旧对象）：仍然优先 master-0
+    assert _pick_rank0(patterns, [bare, elastic0]) == bare
+    assert _pick_rank0(patterns, [elastic0, elastic1, bare]) == bare
+    # 一个都不是 rank 0（都还没建出来）：返回空串 → wrapper 报错退出
+    assert _pick_rank0(patterns, ["kineager-affinity-abc12-worker-1"]) == ""
+    assert _pick_rank0(patterns, []) == ""
+
+
+def test_all_k8s_artifacts_parse_and_are_committed_as_lf():
+    """新交付物也要满足仓库的编码卫生：可解析、UTF-8、结尾换行、无孤立 CR。"""
+    for path in (PIPELINE, LAUNCH_WRAPPER):
+        raw = path.read_bytes()
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"{path.name} 不是合法 UTF-8：{error}") from error
+        assert raw.endswith(b"\n") and not raw.endswith(b"\n\n"), f"{path.name} 结尾换行不规范"
+        assert b"\r" not in raw.replace(b"\r\n", b""), f"{path.name} 含孤立 CR（混用换行）"
+    assert _load_yaml(PIPELINE)["kind"] == "Workflow"
