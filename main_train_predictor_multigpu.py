@@ -1883,6 +1883,333 @@ def train_step(model, batch, optimizer, scaler, recorder=None,
     return float(total_loss / steps)
 
 
+# ---------------------------------------------------------------------------
+# 一次性显存/形状探针（KINEAGER_MEMPROBE，默认开，rank0，每进程一次）
+#
+# 目的：用**一次真实训练**回答「batch 还能不能更大」。挂在第一批末尾，因为那时
+# max_memory_allocated 已经把 forward/backward/optimizer step 的峰值都算进去了。
+#
+# 契约（改动前请先读）：
+#   * 只读计数器与属性：不额外 forward/backward、不做同步、不碰 loss/调度/RNG，
+#     所以对训练行为是 no-op；
+#   * 每进程一次：train_epoch 会被调用很多次，探针只在第一批印一次；
+#   * rank0 + 有 CUDA 时才有显存数字；没有 CUDA 时印一行短说明，其余（dtype、
+#     参数计数、长度分布、attention 实现）照印 —— 那些事实在 CPU 上同样成立；
+#   * 走 print(..., flush=True)，不走 swanlab：swanlab 服务器连不上时也要留痕。
+# ---------------------------------------------------------------------------
+MEMPROBE_PREFIX = "[MEMPROBE]"
+MEMPROBE_ENV_VAR = "KINEAGER_MEMPROBE"
+_MEMPROBE_PRINTED = False   # 每进程一次的闩锁；测试用 monkeypatch 重置
+_MEMPROBE_BACKBONE_ATTRS = ("esm", "protein", "backbone")
+
+
+def memprobe_enabled() -> bool:
+    """默认开：只有显式 KINEAGER_MEMPROBE=0/false/no/off 才关掉。
+
+    默认开是刻意的 —— 「等我想起来再加开关」等于永远不测量。
+    """
+    raw = str(os.environ.get(MEMPROBE_ENV_VAR, "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def memprobe_gib(num_bytes) -> float:
+    """字节 → GiB（2**30）。用 1e9 会把 headroom 高估约 7%，而 headroom 正是结论本身。"""
+    return float(num_bytes) / float(1024 ** 3)
+
+
+def bucket_backbone_param_dtypes(backbone) -> dict:
+    """按 (dtype 名, requires_grad) 给骨干的参数张量分桶。
+
+    回答的问题：冻结的 6B 权重是被按 bf16（≈12 GiB）还是 fp32（≈24 GiB）加载的
+    —— 这是 12 GB 的差别，直接决定 batch 能不能翻倍。autocast 只影响算子输入，
+    不改参数本身的 dtype，所以只能看 weight 张量本身。
+    """
+    buckets: dict = {}
+    for _name, param in backbone.named_parameters():
+        key = (str(param.dtype).replace("torch.", ""), bool(param.requires_grad))
+        entry = buckets.setdefault(key, {"tensors": 0, "params": 0, "size_gib": 0.0})
+        entry["tensors"] += 1
+        entry["params"] += int(param.numel())
+        entry["size_gib"] += memprobe_gib(int(param.numel()) * int(param.element_size()))
+    return buckets
+
+
+def count_params_by_top_module(model) -> dict:
+    """{顶层模块名: {"trainable": n, "frozen": n}}。
+
+    可训练侧按 lora/proj/interactions/head 关键字的细分**故意留给 main() 里的
+    `[DDP] trainable params` 那一行**（见 main() 中 DDP 包装之后），本函数不重复
+    它，只补两件它没有的事：冻结侧的规模，以及按**顶层模块**（esm / ligand /
+    interactions / multi_head ...）的划分。
+
+    顶层名剥掉 DDP 的 "module." 前缀，否则整张表会退化成一个叫 module 的桶。
+    """
+    counts: dict = {}
+    for name, param in model.named_parameters():
+        while name.startswith("module."):
+            name = name[len("module."):]
+        top = name.split(".", 1)[0] if "." in name else name
+        entry = counts.setdefault(top, {"trainable": 0, "frozen": 0})
+        entry["trainable" if param.requires_grad else "frozen"] += int(param.numel())
+    return counts
+
+
+def resolve_backbone_for_memprobe(model):
+    """返回 (属性名, 骨干模块)：predictor 上是 `esm`；找不到时 (None, None)。
+
+    找不到不是错误：单测里的假模型就没有骨干，探针必须照样把其余事实印出来。
+    """
+    for attr in _MEMPROBE_BACKBONE_ATTRS:
+        backbone = getattr(model, attr, None)
+        if isinstance(backbone, nn.Module):
+            return attr, backbone
+    return None, None
+
+
+def resolve_attn_implementation(backbone) -> tuple:
+    """读骨干 config 上的 `_attn_implementation`，返回 (实现名|None, 来源说明)。
+
+    ESMC 用 trust_remote_code=True 加载，它的 config 来自 hub 上的 remote code，
+    不一定带 transformers 近年默认写入的这个字段 —— 所以「属性不存在」也要能
+    打印出来，不能抛异常。
+    """
+    if backbone is None:
+        return None, "no backbone attribute on the model (looked for esm / protein / backbone)"
+    config = getattr(backbone, "config", None)
+    if config is None:
+        return None, "backbone exposes no .config (a trust_remote_code backbone may not)"
+    impl = getattr(config, "_attn_implementation", None)
+    if impl is None:
+        return None, "config has no _attn_implementation"
+    return str(impl), "config._attn_implementation"
+
+
+def _attn_impl_is_efficient(impl: str) -> bool:
+    lowered = str(impl).strip().lower()
+    return lowered == "sdpa" or "flash" in lowered
+
+
+def sequence_length_stats(seq_lengths) -> dict:
+    """一批蛋白序列的 min / median / max（残基）与 padding 浪费比 = max / median。
+
+    这一条回答「长度分桶值不值」：tokenizer 用 padding=True，一个 batch 会被补齐
+    到自己最长的成员，于是每一行的显存和算力都由最长的序列决定。比值贴近 1 说明
+    batch 本来就同质、分桶没用；远大于 1 说明一条长序列在抬整批的成本。
+    """
+    lengths = sorted(int(length) for length in (seq_lengths or []))
+    if not lengths:
+        return {}
+    median = float(np.median(lengths))
+    stats = {
+        "n": len(lengths),
+        "min": int(lengths[0]),
+        "median": median,
+        "max": int(lengths[-1]),
+        "padding_waste_ratio": (float(lengths[-1]) / median) if median > 0 else float("nan"),
+    }
+    return stats
+
+
+def format_memprobe_lines(facts: dict) -> list:
+    """把采集到的数字装配成 [MEMPROBE] 文本行。
+
+    纯函数（只看 facts，不碰 CUDA / 模型），所以 CPU 单测可以注入数字直接断言
+    每一处算术：padding 浪费比、headroom、naive 外推倍数、dtype 分桶、参数计数。
+    """
+    lines = [f"{MEMPROBE_PREFIX} ===== one-shot memory & shape probe "
+             f"(rank 0, first training batch of this process) ====="]
+
+    # (1) 显存：峰值/保留/当前 与卡的总量，全部 GiB。headroom 用 total - reserved
+    # （reserved 才是"这块卡还能不能再要"的真实口径），naive 倍数则是
+    # headroom / (max_memory_allocated / batch_size)：线性外推，明确标成 naive。
+    if facts.get("cuda"):
+        mem = facts.get("memory_gib") or {}
+        total = float(mem.get("total_memory", 0.0))
+        reserved = float(mem.get("max_memory_reserved", 0.0))
+        max_alloc = float(mem.get("max_memory_allocated", 0.0))
+        device_index = facts.get("device_index")
+        device_name = facts.get("device_name")
+        if device_name:
+            lines.append(f"{MEMPROBE_PREFIX} device={device_index} name={device_name!r}")
+        lines.append(
+            f"{MEMPROBE_PREFIX} memory_gib: "
+            f"max_memory_allocated={max_alloc:.2f} "
+            f"max_memory_reserved={reserved:.2f} "
+            f"memory_allocated={float(mem.get('memory_allocated', 0.0)):.2f} "
+            f"total_memory={total:.2f}")
+        headroom = total - reserved
+        lines.append(f"{MEMPROBE_PREFIX} headroom_gib={headroom:.2f} "
+                     f"(total_memory - max_memory_reserved)")
+        batch_size = int(facts.get("batch_size") or 0)
+        if batch_size > 0 and max_alloc > 0.0:
+            per_sample = max_alloc / float(batch_size)
+            multiple = headroom / per_sample
+            lines.append(
+                f"{MEMPROBE_PREFIX} naive_batch_multiple={multiple:.2f}x "
+                f"naive_batch_estimate={int(batch_size * multiple)} samples "
+                f"(headroom_gib / (max_memory_allocated / batch_size={batch_size})) "
+                f"-- NAIVE: assumes per-sample cost is linear and ignores attention's "
+                f"quadratic term plus allocator behaviour; use it as an order-of-magnitude "
+                f"ceiling, not a promise. The real answer is a run at the target batch size.")
+        else:
+            lines.append(f"{MEMPROBE_PREFIX} naive_batch_multiple=unavailable "
+                         f"(batch_size={batch_size} or max_memory_allocated=0)")
+    else:
+        note = facts.get("cuda_note") or "torch.cuda.is_available() is False"
+        lines.append(f"{MEMPROBE_PREFIX} no CUDA device: memory counters unavailable "
+                     f"({note}); printing the non-CUDA facts below")
+
+    # (2) 骨干 dtype：bf16(12GiB) vs fp32(24GiB) 就是这 12 GB 的问题。
+    backbone_attr = facts.get("backbone_attr")
+    buckets = facts.get("dtype_buckets") or {}
+    if backbone_attr is None:
+        lines.append(f"{MEMPROBE_PREFIX} backbone dtype: no backbone attribute found "
+                     f"(looked for {' / '.join(_MEMPROBE_BACKBONE_ATTRS)}) "
+                     f"-- cannot answer the bf16(~12GiB)-vs-fp32(~24GiB) question on this model")
+    else:
+        lines.append(f"{MEMPROBE_PREFIX} backbone dtype buckets (walked attribute "
+                     f"'{backbone_attr}'; a frozen 6B backbone is ~12 GiB in bf16 vs "
+                     f"~24 GiB in fp32):")
+        for (dtype_name, requires_grad) in sorted(buckets, key=lambda key: (str(key[0]), bool(key[1]))):
+            entry = buckets[(dtype_name, requires_grad)]
+            lines.append(f"{MEMPROBE_PREFIX}   dtype={dtype_name} "
+                         f"requires_grad={bool(requires_grad)} "
+                         f"tensors={entry['tensors']} params={entry['params']:,} "
+                         f"size_gib={float(entry['size_gib']):.2f}")
+
+    # (3) 可训练/冻结计数（总数 + 每顶层模块）。可训练侧的 lora/proj/head 关键字
+    # 细分由 main() 的 `[DDP] trainable params` 负责，此处故意不重复。
+    total_counts = facts.get("param_counts_total") or {}
+    by_module = facts.get("param_counts_by_module") or {}
+    if total_counts:
+        trainable = int(total_counts.get("trainable", 0))
+        frozen = int(total_counts.get("frozen", 0))
+        lines.append(f"{MEMPROBE_PREFIX} params: trainable={trainable:,} "
+                     f"frozen={frozen:,} total={trainable + frozen:,}")
+    if by_module:
+        rendered = ", ".join(
+            f"{name}=(trainable={int(entry.get('trainable', 0)):,}, "
+            f"frozen={int(entry.get('frozen', 0)):,})"
+            for name, entry in sorted(by_module.items()))
+        lines.append(f"{MEMPROBE_PREFIX} params per top-level module: {rendered}")
+
+    # (4) 长度分布：本批的 padding 代价，以及长度分桶值不值。
+    stats = sequence_length_stats(facts.get("seq_lengths"))
+    if stats:
+        source = facts.get("seq_source") or "batch"
+        lines.append(
+            f"{MEMPROBE_PREFIX} batch sequence lengths (residues, from {source}): "
+            f"n={stats['n']} min={stats['min']} median={stats['median']:g} "
+            f"max={stats['max']} padding_waste_ratio={stats['padding_waste_ratio']:.2f} "
+            f"(max/median; ~1 = homogeneous batch, >1 = one long sequence pads every "
+            f"row, so length bucketing would pay)")
+    else:
+        lines.append(f"{MEMPROBE_PREFIX} batch sequence lengths: unavailable "
+                     f"(no sized protein sequences in this batch)")
+
+    # (5) attention 实现：Ampere 上它就是显存的二次项，非 sdpa / 非 flash 必须告警。
+    impl = facts.get("attn_impl")
+    source = facts.get("attn_impl_source") or "unknown source"
+    if impl is None:
+        lines.append(f"{MEMPROBE_PREFIX} attn_implementation: not exposed ({source}) "
+                     f"-- ESMC is loaded with trust_remote_code=True, so it need not "
+                     f"follow the transformers default; the attention path stays "
+                     f"unconfirmed instead of assumed")
+    elif _attn_impl_is_efficient(impl):
+        lines.append(f"{MEMPROBE_PREFIX} attn_implementation: '{impl}' ({source}) "
+                     f"-- OK: on Ampere this is the cheap path for the quadratic term")
+    else:
+        lines.append(f"{MEMPROBE_PREFIX} attn_implementation: '{impl}' ({source}) "
+                     f"-- WARNING: not sdpa and not a flash-attention variant; on Ampere "
+                     f"the attention path IS the quadratic term in memory, so this is "
+                     f"where a larger batch will bite first")
+    return lines
+
+
+def _memprobe_batch_sequence_lengths(batch):
+    """从 batch 里取蛋白序列长度，返回 (长度列表|None, 来源说明)。
+
+    走 utils.unpack_batch 的既有解包约定，所以 affinity 与 kinetics 两条通路共用。
+    """
+    try:
+        seqs = unpack_batch(batch)[0]
+    except Exception as error:      # 解包约定之外的 batch：报缺席，不抛
+        return None, f"batch could not be unpacked ({type(error).__name__})"
+    if seqs is None:
+        return None, "batch carries no protein sequences"
+    lengths = []
+    for seq in seqs:
+        try:
+            lengths.append(len(seq))
+        except TypeError:
+            return None, "protein sequences are not sized (tokenized batch?)"
+    if not lengths:
+        return None, "empty batch"
+    return lengths, "unpack_batch(batch)[0]"
+
+
+def collect_memprobe_facts(model, batch, batch_size: int = 0) -> dict:
+    """只读采集：CUDA 计数器 + 骨干 dtype 桶 + 参数计数 + 长度分布 + attention 实现。
+
+    不 reset 峰值统计（那会毁掉别人要看的 max_memory_allocated），也不调用任何
+    会同步的 CUDA API。
+    """
+    facts = {"cuda": bool(torch.cuda.is_available())}
+    if facts["cuda"]:
+        try:
+            index = int(torch.cuda.current_device())
+            properties = torch.cuda.get_device_properties(index)
+            facts["device_index"] = index
+            facts["device_name"] = str(getattr(properties, "name", "unknown"))
+            facts["memory_gib"] = {
+                "max_memory_allocated": memprobe_gib(torch.cuda.max_memory_allocated()),
+                "max_memory_reserved": memprobe_gib(torch.cuda.max_memory_reserved()),
+                "memory_allocated": memprobe_gib(torch.cuda.memory_allocated()),
+                "total_memory": memprobe_gib(properties.total_memory),
+            }
+        except Exception as error:  # 探针永远不能把训练弄挂
+            facts["cuda"] = False
+            facts["cuda_note"] = f"CUDA counter read failed ({type(error).__name__}: {error})"
+
+    real_model = getattr(model, "module", model)
+    backbone_attr, backbone = resolve_backbone_for_memprobe(real_model)
+    facts["backbone_attr"] = backbone_attr
+    facts["dtype_buckets"] = bucket_backbone_param_dtypes(backbone) if backbone is not None else {}
+    counts = count_params_by_top_module(real_model)
+    facts["param_counts_by_module"] = counts
+    facts["param_counts_total"] = {
+        "trainable": sum(entry["trainable"] for entry in counts.values()),
+        "frozen": sum(entry["frozen"] for entry in counts.values()),
+    }
+    facts["attn_impl"], facts["attn_impl_source"] = resolve_attn_implementation(backbone)
+
+    seq_lengths, seq_source = _memprobe_batch_sequence_lengths(batch)
+    facts["seq_lengths"] = seq_lengths
+    facts["seq_source"] = seq_source
+    # batch_size 用**本批实际样本数**（每 rank）：args.batch_size 会把最后一批
+    # 少数几个样本也算满，naive 外推的分母就偏小。
+    facts["batch_size"] = (len(seq_lengths) if seq_lengths else int(batch_size or 0))
+    return facts
+
+
+def maybe_print_memprobe(model, batch, batch_size: int = 0) -> bool:
+    """三道门（每进程一次 / 环境开关 / rank0）之后打印探针，返回是否真的打印了。
+
+    闩锁在采集**之前**就置位：即使采集炸了也只印一次，不会变成每批一次。
+    """
+    global _MEMPROBE_PRINTED
+    if _MEMPROBE_PRINTED or (not memprobe_enabled()) or (not is_main_process()):
+        return False
+    _MEMPROBE_PRINTED = True
+    try:
+        facts = collect_memprobe_facts(model, batch, batch_size=batch_size)
+        lines = format_memprobe_lines(facts)
+    except Exception as error:  # 诊断代码不许把训练带崩
+        lines = [f"{MEMPROBE_PREFIX} probe failed: {type(error).__name__}: {error}"]
+    for line in lines:
+        print(line, flush=True)
+    return True
+
 
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, ema, ep, args, esm_layers, molt5_layers,global_step, sanity_check=True, sanity_verbose=True, sanity_diff_thresh=1e-6, sanity_interval=500,last_ckpt_time=None, weights_dir=None, use_onecycle=False, onecycle=None,
 final_contact_store=None):
@@ -1986,8 +2313,15 @@ final_contact_store=None):
             for g in optimizer.param_groups:
                 if g.get("tag","") not in {"head", "lora", "lora_prot", "lora_lig"}:
                     g["lr"] = g.get("base_lr", g["lr"])
-        
-        
+
+        # 一次性显存/形状探针（见 maybe_print_memprobe 的说明）：挂在本进程第一批的
+        # 末尾 —— 此时 forward/backward 已跑完（accum=1 时 optimizer step 也做完了），
+        # max_memory_allocated 最有信息量。闩锁保证每进程只印一次，所以写在循环里
+        # 也只是「第一批」这一个触发点；它只读计数器，不改变任何训练行为。
+        if i == 0:
+            maybe_print_memprobe(real_model, batch,
+                                 batch_size=int(getattr(args, "batch_size", 0) or 0))
+
         if (i+1) % 10 == 0:  # 每10步打印一次（可调）
             lr_summary = [f"g{gi}:{g.get('tag','?')}={g['lr']:.10e}" 
                           for gi, g in enumerate(optimizer.param_groups)]

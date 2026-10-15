@@ -1445,3 +1445,341 @@ def test_main_infer_predictor_kinetics_task_keeps_three_head_columns(monkeypatch
     assert np.allclose(out["pred_kcat_div_Km"], 1e7)
     assert np.allclose(out["true_kcat"], 1.0)
     assert out["source_id"].tolist() == [0, 0]
+
+
+# ---------------------------------------------------------------------------
+# 一次性显存/形状探针（KINEAGER_MEMPROBE，默认开）。
+#
+# 探针要回答的问题（bf16 还是 fp32 的 6B 权重、padding 浪费比、attention 实现）
+# 只有在真实 A100 上跑一次才有数据，所以这里测的是**与 CUDA 无关的那一半**：
+# 装配 / 格式化函数吃注入的数字产出文本，dtype 分桶与参数计数在 CPU 上本来就是
+# 真的。每条断言都写明了「改哪一行生产代码会让它变红」。
+# ---------------------------------------------------------------------------
+
+def _memprobe_facts(**overrides):
+    """注入式 facts（默认值是一组自洽的 A100-80GB / batch 4 数字）。"""
+    facts = {
+        "cuda": True,
+        "device_index": 0,
+        "device_name": "NVIDIA A100-SXM4-80GB",
+        "memory_gib": {
+            "max_memory_allocated": 20.0,
+            "max_memory_reserved": 52.0,
+            "memory_allocated": 18.0,
+            "total_memory": 80.0,
+        },
+        "batch_size": 4,
+        "backbone_attr": "esm",
+        "dtype_buckets": {
+            ("bfloat16", False): {"tensors": 552, "params": 6_000_000_000, "size_gib": 11.18},
+            ("float32", True): {"tensors": 560, "params": 40_000_000, "size_gib": 0.15},
+        },
+        "param_counts_total": {"trainable": 40_000_000, "frozen": 6_000_000_000},
+        "param_counts_by_module": {"esm": {"trainable": 40_000_000,
+                                           "frozen": 6_000_000_000}},
+        "seq_lengths": [1024, 100, 50],
+        "seq_source": "batch",
+        "attn_impl": "sdpa",
+        "attn_impl_source": "config._attn_implementation",
+    }
+    facts.update(overrides)
+    return facts
+
+
+def _memprobe_block(**overrides):
+    from main_train_predictor_multigpu import format_memprobe_lines
+
+    return "\n".join(format_memprobe_lines(_memprobe_facts(**overrides)))
+
+
+def test_memprobe_is_on_by_default_and_silenced_by_env_zero(monkeypatch):
+    """默认开：要显式 KINEAGER_MEMPROBE=0 才关。
+
+    把默认值改成 "0"（opt-in）会让第一条断言变红 —— 这正是「有人忘了加开关
+    于是永远没测量」的那个失败模式。
+    """
+    from main_train_predictor_multigpu import memprobe_enabled
+
+    monkeypatch.delenv("KINEAGER_MEMPROBE", raising=False)
+    assert memprobe_enabled() is True
+    monkeypatch.setenv("KINEAGER_MEMPROBE", "1")
+    assert memprobe_enabled() is True
+    for off in ("0", "false", "FALSE", "off", "no"):
+        monkeypatch.setenv("KINEAGER_MEMPROBE", off)
+        assert memprobe_enabled() is False, f"KINEAGER_MEMPROBE={off} 应该关闭探针"
+
+
+def test_memprobe_padding_waste_ratio_is_max_over_median():
+    """padding 浪费比 = max / median。1024/100 = 10.24。
+
+    改成 median/max（0.10）或把 median 算成均值（391.33 → 2.62）都会变红。
+    """
+    block = _memprobe_block(seq_lengths=[1024, 100, 50])
+
+    assert "min=50" in block and "median=100" in block and "max=1024" in block
+    assert "padding_waste_ratio=10.24" in block
+
+
+def test_memprobe_naive_batch_multiple_is_headroom_over_per_sample_cost():
+    """headroom = total - reserved = 80 - 52 = 28 GiB；每样本 = 20/4 = 5 GiB → 5.60×。
+
+    用 memory_allocated 代替 total_memory（(80-18)/5 = 12.40×）或用
+    memory_allocated 代替 reserved 当被减数都会变红。
+    """
+    block = _memprobe_block()
+
+    assert "headroom_gib=28.00" in block
+    assert "naive_batch_multiple=5.60x" in block
+    assert "NAIVE" in block, "线性外推必须被明确标注为 naive"
+
+
+def test_memprobe_dtype_buckets_split_on_dtype_and_requires_grad():
+    """bf16 vs fp32 的 6B 骨干差 12 GB：分桶键必须同时含 dtype 与 requires_grad。
+
+    键里丢掉 requires_grad 时两个 float32 桶会合并成 (1, 8)，断言变红。
+    """
+    from main_train_predictor_multigpu import bucket_backbone_param_dtypes
+
+    class _Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen_bf16 = nn.Parameter(torch.zeros(2, dtype=torch.bfloat16),
+                                            requires_grad=False)
+            self.frozen_fp32 = nn.Parameter(torch.zeros(5), requires_grad=False)
+            self.lora = nn.Parameter(torch.zeros(3), requires_grad=True)
+
+    buckets = bucket_backbone_param_dtypes(_Backbone())
+    assert {key: (value["tensors"], value["params"])
+            for key, value in buckets.items()} == {
+        ("bfloat16", False): (1, 2),
+        ("float32", False): (1, 5),
+        ("float32", True): (1, 3),
+    }
+
+    block = _memprobe_block(dtype_buckets={
+        ("float32", False): {"tensors": 1, "params": 5, "size_gib": 0.0},
+    })
+    assert "dtype=float32 requires_grad=False tensors=1 params=5" in block
+
+
+def test_memprobe_gib_conversion_is_binary():
+    """GiB 是 2**30，不是 1e9：差 7% 会让「还剩多少显存」判断偏乐观。"""
+    from main_train_predictor_multigpu import memprobe_gib
+
+    assert memprobe_gib(2 * 1024 ** 3) == 2.0
+    assert memprobe_gib(0) == 0.0
+
+
+def test_memprobe_param_counts_split_trainable_from_frozen_per_top_module():
+    """[DDP] trainable params 只报可训练侧，冻结侧与顶层模块划分是本探针新增的。
+
+    跳过 requires_grad=False 的参数（frozen 变 0）或不分顶层模块都会变红。
+    """
+    from main_train_predictor_multigpu import count_params_by_top_module
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.esm = nn.Module()
+            self.esm.frozen = nn.Parameter(torch.zeros(6), requires_grad=False)
+            self.esm.lora = nn.Parameter(torch.zeros(2))
+            self.head = nn.Linear(2, 1)          # weight 2 + bias 1
+
+    counts = count_params_by_top_module(_Model())
+    assert counts == {"esm": {"trainable": 2, "frozen": 6},
+                      "head": {"trainable": 3, "frozen": 0}}
+
+    block = _memprobe_block(param_counts_by_module=counts,
+                            param_counts_total={"trainable": 5, "frozen": 6})
+    assert "esm=(trainable=2, frozen=6)" in block
+    assert "trainable=5 frozen=6" in block
+
+
+def test_memprobe_param_counts_ignore_the_ddp_module_prefix():
+    """DDP 包装后参数名带 module. 前缀：不剥掉就会把整张表压成一个叫 module 的桶。"""
+
+    from main_train_predictor_multigpu import count_params_by_top_module
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.esm = nn.Module()
+            self.esm.frozen = nn.Parameter(torch.zeros(6), requires_grad=False)
+            self.head = nn.Linear(2, 1)
+
+    class _DDP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = _Inner()
+
+    assert count_params_by_top_module(_DDP()) == {"esm": {"trainable": 0, "frozen": 6},
+                                                  "head": {"trainable": 3, "frozen": 0}}
+
+
+def test_memprobe_block_is_prefixed_and_greppable():
+    """运维只 grep '[MEMPROBE]'：每行都要带前缀，且标签名要固定。"""
+    block = _memprobe_block()
+    lines = block.splitlines()
+
+    assert lines and all(line.startswith("[MEMPROBE]") for line in lines)
+    for label in ("max_memory_allocated", "max_memory_reserved", "memory_allocated",
+                  "total_memory", "headroom_gib", "naive_batch_multiple",
+                  "padding_waste_ratio", "attn_implementation", "trainable", "frozen"):
+        assert label in block, label
+
+
+def test_memprobe_attn_implementation_is_read_and_non_sdpa_is_flagged():
+    """Ampere 上 attention 是显存的二次项：非 sdpa / 非 flash 必须显式告警。
+
+    读错属性（例如读 config.attn_implementation 而真实字段是 _attn_implementation）
+    时 impl 变 None、告警消失，最后两条断言变红。
+    """
+    from main_train_predictor_multigpu import format_memprobe_lines, resolve_attn_implementation
+
+    class _Config:
+        pass
+
+    class _Backbone(nn.Module):
+        def __init__(self, impl):
+            super().__init__()
+            self.config = _Config()
+            if impl is not None:
+                self.config._attn_implementation = impl
+
+    assert resolve_attn_implementation(_Backbone("sdpa"))[0] == "sdpa"
+    assert resolve_attn_implementation(_Backbone("eager"))[0] == "eager"
+
+    ok = "\n".join(format_memprobe_lines(_memprobe_facts(attn_impl="sdpa")))
+    assert "attn_implementation: 'sdpa'" in ok
+    assert "WARNING" not in ok
+
+    flash = "\n".join(format_memprobe_lines(_memprobe_facts(attn_impl="flash_attention_2")))
+    assert "WARNING" not in flash
+
+    eager = "\n".join(format_memprobe_lines(_memprobe_facts(attn_impl="eager")))
+    assert "attn_implementation: 'eager'" in eager
+    assert "WARNING" in eager and "not sdpa" in eager
+
+
+def test_memprobe_attn_implementation_absent_does_not_raise():
+    """ESMC 走 trust_remote_code，config 上可能根本没有这个属性 —— 缺席不是异常。"""
+    from main_train_predictor_multigpu import resolve_attn_implementation
+
+    impl, source = resolve_attn_implementation(None)
+    assert impl is None and source
+
+    class _NoConfig(nn.Module):
+        pass
+
+    impl, source = resolve_attn_implementation(_NoConfig())
+    assert impl is None and source
+
+    block = _memprobe_block(attn_impl=None, attn_impl_source="no _attn_implementation")
+    assert "attn_implementation" in block
+    assert "not exposed" in block
+
+
+def test_memprobe_without_cuda_reports_the_short_line_and_the_non_cuda_facts():
+    """没有 CUDA 时不能崩，也不能只印一句 no CUDA 就丢掉其余事实。"""
+    block = _memprobe_block(cuda=False, memory_gib=None, device_name=None,
+                            device_index=None)
+
+    assert "[MEMPROBE] no CUDA" in block
+    assert "headroom_gib" not in block
+    assert "max_memory_allocated" not in block
+    assert "padding_waste_ratio=10.24" in block
+    assert "attn_implementation" in block
+    assert "frozen" in block
+
+
+def test_memprobe_reads_sequence_lengths_from_a_kinetics_batch_too():
+    """探针是通用的：--task kinetics 走同一个 train_epoch，只是 batch 布局不同。
+
+    按 affinity 的 3 元组硬解（或在 len(batch) != 3 时放弃）会让这条变红 ——
+    kinetics 的 batch 是 5 元组起步。
+    """
+    from main_train_predictor_multigpu import collect_memprobe_facts
+
+    batch = _kinetics_batch()
+    assert len(batch) > 3, "kinetics batch 不再是 3 元组时本测试的前提要重看"
+
+    facts = collect_memprobe_facts(nn.Linear(2, 1), batch, batch_size=4)
+
+    assert facts["seq_lengths"] == [3, 3, 3, 3]
+    assert facts["batch_size"] == 4
+
+
+def test_maybe_print_memprobe_is_once_per_process_and_rank0_only(monkeypatch, capsys):
+    """每进程一次 + 只在 rank 0：去掉闩锁会印两遍，去掉 RANK 判断会在 rank 1 漏印。"""
+    import main_train_predictor_multigpu as training
+
+    monkeypatch.delenv("KINEAGER_MEMPROBE", raising=False)
+    monkeypatch.setattr(training, "_MEMPROBE_PRINTED", False)
+    model = nn.Linear(2, 1)
+    batch = (("MKT", "MKTL"), ("CCO", "CCO"), torch.zeros(2))
+
+    assert training.maybe_print_memprobe(model, batch, 2) is True
+    assert training.maybe_print_memprobe(model, batch, 2) is False
+    assert capsys.readouterr().out.count("[MEMPROBE] =====") == 1
+
+    monkeypatch.setattr(training, "_MEMPROBE_PRINTED", False)
+    monkeypatch.setenv("RANK", "1")
+    assert training.maybe_print_memprobe(model, batch, 2) is False
+    assert "[MEMPROBE]" not in capsys.readouterr().out
+
+    monkeypatch.setenv("KINEAGER_MEMPROBE", "0")
+    monkeypatch.setattr(training, "_MEMPROBE_PRINTED", False)
+    monkeypatch.setenv("RANK", "0")
+    assert training.maybe_print_memprobe(model, batch, 2) is False
+    assert "[MEMPROBE]" not in capsys.readouterr().out
+
+
+@pytest.mark.filterwarnings("ignore:CUDA is not available:UserWarning")
+def test_train_epoch_prints_the_memprobe_block_for_the_first_batch(monkeypatch, capsys):
+    """钩子必须在 train_epoch 的第一批末尾：读到的是第一批的长度分布，且只印一次。
+
+    第一批 = 长度 50/100/1024（median 100 → 10.24×）。钩子挂在循环外或挂到最后
+    一批时 min/max 变成 7/7，断言变红；每批都印时 header 计数变 2。
+    """
+    import pathlib
+    import shutil
+
+    import main_train_predictor_multigpu as training
+    from data_affinity import AffinityDataset
+    from main_train_predictor_multigpu import train_epoch
+    from torch.utils.data import DataLoader
+
+    frame = pd.DataFrame({
+        "Sequence": ["A" * 50, "A" * 100, "A" * 1024, "A" * 7, "A" * 7, "A" * 7],
+        "Smiles": ["CCO"] * 6,
+        "pKaffinity": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    })
+    loader = DataLoader(AffinityDataset(frame, label_col="pKaffinity",
+                                        scaler=_affinity_scaler(6)),
+                        batch_size=3, shuffle=False)
+
+    class _NoOpEMA:
+        def update(self, module):
+            return None
+
+    monkeypatch.delenv("KINEAGER_MEMPROBE", raising=False)
+    monkeypatch.setattr(training, "_MEMPROBE_PRINTED", False)
+    monkeypatch.setattr(training.swanlab, "log", lambda payload: None)
+    scratch = pathlib.Path("_scratch_memprobe_epoch")
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setitem(training.RUNTIME_PATHS, "train_data_dir", scratch)
+    try:
+        model = _VaryingAffinity()
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        train_epoch(model, loader, optimizer, None, _NoOpScaler(), _NoOpEMA(),
+                    0, _AffinityArgs(), None, None, 0)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    out = capsys.readouterr().out
+    block = "\n".join(line for line in out.splitlines() if line.startswith("[MEMPROBE]"))
+    assert out.count("[MEMPROBE] =====") == 1
+    assert "min=50" in block and "median=100" in block and "max=1024" in block
+    assert "padding_waste_ratio=10.24" in block
+    # 测试用的假模型没有骨干：该分支只报告缺席，不抛异常。
+    assert "backbone" in block
