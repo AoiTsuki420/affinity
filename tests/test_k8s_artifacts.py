@@ -109,22 +109,36 @@ def _bash_word_count(argument):
 
 
 def _find_usable_bash():
-    candidates = [shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe",
-                  r"C:\Program Files\Git\usr\bin\bash.exe"]
+    """挑一个**既能解析、又能执行**的 bash。
+
+    只探测 `bash -n` 是不够的：本机 `shutil.which("bash")` 解析到 WSL 转发器
+    （`...\\WindowsApps\\bash.EXE`），它能通过 `-n`，但真正执行脚本时什么也不输出。
+    于是语法检查那半边看着正常，而需要**运行**脚本的词数探测永远拿到空 stdout——
+    断言比较的是 `''` 和 `'1'`。所以探测脚本要真的跑一遍并核对输出。
+    """
+    # 顺序有讲究：Git for Windows 的 bash 放在 shutil.which 之前。本机
+    # `shutil.which("bash")` 解析到 `...\WindowsApps\bash.EXE`，那是 **WSL 转发器**：
+    # 它能通过简单探测，但路径语义与脚本执行行为都与这个仓库用的解释器不同（同一个
+    # 脚本经它执行可能什么都不输出）。仓库自己的 `bash -n <file>` 检查一直是用 Git
+    # bash 跑通的，所以就以它为先。
+    candidates = [r"C:\Program Files\Git\bin\bash.exe",
+                  r"C:\Program Files\Git\usr\bin\bash.exe",
+                  shutil.which("bash")]
     for candidate in candidates:
         if not candidate:
             continue
         probe = REPO_ROOT / f".bash_usable_probe_{os.getpid()}.sh"
         try:
-            probe.write_text("true\n", encoding="utf-8", newline="\n")
-            result = subprocess.run([candidate, "-n", probe.name],
+            probe.write_text("printf 'bash-probe-ok\\n'\n", encoding="utf-8", newline="\n")
+            result = subprocess.run([candidate, probe.name],
                                     capture_output=True, text=True, timeout=30,
                                     cwd=str(REPO_ROOT))
         except (OSError, subprocess.SubprocessError):
             continue
         finally:
             probe.unlink(missing_ok=True)
-        if result.returncode == 0:
+        # 必须真的执行出结果，能解析但跑不起来的转发器不算数。
+        if result.returncode == 0 and result.stdout.strip() == "bash-probe-ok":
             return candidate
     return None
 
@@ -212,11 +226,15 @@ def _embedded_manifest(path=PIPELINE):
     return manifest
 
 
-def _rank0_argv(pod_nums):
-    """按 pod_nums 渲染出 rank 0 pod 上真正执行的容器 argv。"""
+def _rank0_argv(pod_nums, logpath="/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log"):
+    """按 pod_nums 渲染出 rank 0 pod 上真正执行的容器 argv。
+
+    `logpath` 可覆盖：判别「引号真的在起作用」的那条测试必须用一个**含空格**的路径，
+    否则去掉引号也是 1 个词，断言不可满足、也就什么都没证明。
+    """
     values = {
         "bash_command": "bash bin/train/kineager_k8s.sh -epochs 30",
-        "logpath": "/pfs_beijing/xinran_2026/kineager_runs/kineager_affinity/rank0.log",
+        "logpath": logpath,
         "memory": "200Gi",
         "cpu": "16",
         "pod_gpus": "1",
@@ -1159,11 +1177,14 @@ def test_kfp_pipeline_rank_zero_log_gate_substitutes_into_parseable_bash():
 def test_kfp_pipeline_logpath_substitution_cannot_expand_into_extra_words():
     """`logpath` 被塞进双引号里：去掉引号就会被 word-splitting 拆成两个词。
 
-    这条用「把引号拿掉就得到不同的词数」证明引号真的在起作用，而不是碰巧路径里没有
-    空格。它同时是给操作者的护栏：带空格/引号的路径会在这里被抓住。词数探测同样走
-    文件（见 `_run_bash_syntax_check`）。
+    判别力**要求路径里真的有空格**。早先这条用的是 fixture 的默认 logpath
+    （`/pfs_beijing/.../rank0.log`，没有空格），于是「去掉引号应该拆成 2 个词」永远不可
+    满足——断言写成了 `== "2"` 而实测恒为 1。现在显式传入一个含空格的路径，引号的作用
+    才真的被证明；顺带它也是给操作者的护栏：带空格的路径会在这里被抓住。
     """
-    argv = _rank0_argv(2)
+    spaced_logpath = "/pfs_beijing/xinran_2026/kineager runs/rank0.log"
+
+    argv = _rank0_argv(2, logpath=spaced_logpath)
     log_line = next(line for line in argv.splitlines() if "rank0.log" in line)
     match = re.search(r"bash .*? >> (.*) 2>&1$", log_line)
     assert match, f"渲染后的 rank 0 命令行形状不对: {log_line!r}"
@@ -1177,7 +1198,8 @@ def test_kfp_pipeline_logpath_substitution_cannot_expand_into_extra_words():
 
     assert _bash_word_count(quoted) == "1", f"重定向目标被拆开了: {quoted}"
     assert _bash_word_count(quoted[1:-1]) == "2", (
-        "引号必须真的起作用：去掉引号后这个路径应该被拆成 2 个词，否则这条断言什么都没证明"
+        "引号必须真的起作用：去掉引号后这个含空格的路径应该被拆成 2 个词，"
+        f"否则这条断言什么都没证明（实际 {_bash_word_count(quoted[1:-1])!r}）"
     )
 
 
